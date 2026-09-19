@@ -5,9 +5,19 @@ const app = express();
 const HTTP_PORT = Number(process.env.PORT || 10000);
 
 const MAX_LOGS = 100;
-const RECONNECT_DELAY = 10000;
+const RECONNECT_DELAY = 3000;
 const STATUS_POLL_MS = 1000;
 const UPTIME_UPDATE_MS = 250;
+
+// KingMC AFK flow timing.
+const DN_TO_AFK_DELAY = 1000;
+const AFK_MENU_DELAY = 1800;
+const AFK_MENU_CLICK_DELAY = 700;
+
+// Background inventory / survival managers.
+const AUTO_EAT_INTERVAL_MS = 2000;
+const AUTO_TOTEM_INTERVAL_MS = 1500;
+const INVENTORY_SCAN_INTERVAL_MS = 1000;
 
 const MC_VERSION = '1.20.1';
 const HOSTS = (process.env.MC_SERVER_HOSTS || 'sgp.kingmc.vn,kingmc.vn')
@@ -83,8 +93,49 @@ function createBotState() {
         afkTimers: [],
         lastAuthTime: 0,
 
+        inventoryState: {
+            revision: 0,
+            health: 20,
+            food: 20,
+            saturation: 20,
+            foodCount: 0,
+            goldenAppleCount: 0,
+            totemCount: 0,
+            offhand: null,
+            selectedHotbar: 0,
+            selectedSlot: 0,
+            armor: {
+                head: null,
+                torso: null,
+                legs: null,
+                feet: null
+            },
+            hotbar: [],
+            inventory: [],
+            slots: {}
+        },
+
+        isEating: false,
+        inventoryScanTimer: null,
+        totemTimer: null,
+        eatTimer: null,
+
+        inventoryLogSignature: '',
+        previousInventorySnapshot: null,
+        inventoryRevision: 0,
+        inventoryActionBusy: false,
+        foodMissingLogged: false,
+        totemLogState: null,
+        isEquippingTotem: false,
+
         logs: [],
-        logRevision: 0
+        logRevision: 0,
+
+        chatLogs: [],
+        chatLogRevision: 0,
+        recentChatMessages: [],
+        lastWebChatText: '',
+        lastWebChatAt: 0
     };
 }
 
@@ -111,6 +162,61 @@ function addLog(state, message) {
     console.log(`[BOT ${state.id}] ${message}`);
 }
 
+
+function addChatLog(state, username, message) {
+    const time = new Date().toLocaleTimeString('vi-VN', {
+        timeZone: 'Asia/Ho_Chi_Minh',
+        hour12: false
+    });
+
+    const cleanMessage = cleanMinecraftText(message);
+    const cleanUsername = cleanMinecraftText(username);
+
+    const line = cleanUsername
+        ? `${time} <${cleanUsername}> ${cleanMessage}`
+        : `${time} ${cleanMessage}`;
+
+    state.chatLogs.push(line);
+    state.chatLogRevision++;
+
+    if (state.chatLogs.length > 200) {
+        state.chatLogs.splice(
+            0,
+            state.chatLogs.length - 200
+        );
+    }
+
+    state.recentChatMessages.push({
+        text: cleanMinecraftText(message),
+        rawText: cleanMinecraftText(message),
+        at: Date.now()
+    });
+
+    if (state.recentChatMessages.length > 30) {
+        state.recentChatMessages.splice(
+            0,
+            state.recentChatMessages.length - 30
+        );
+    }
+
+    console.log(`[BOT ${state.id}] [CHAT] ${line}`);
+}
+
+function isRecentChatMessage(state, cleanMsg) {
+    const now = Date.now();
+
+    state.recentChatMessages =
+        state.recentChatMessages.filter(
+            entry => now - entry.at <= 2500
+        );
+
+    return state.recentChatMessages.some(
+        entry =>
+            entry.text === cleanMsg ||
+            cleanMsg.endsWith(entry.text)
+    );
+}
+
 function clearAfkTimers(state) {
     for (const timer of state.afkTimers) {
         clearTimeout(timer);
@@ -126,9 +232,1039 @@ function clearReconnectTimer(state) {
     }
 }
 
+function clearManagerTimers(state) {
+    if (state.eatTimer) {
+        clearInterval(state.eatTimer);
+        state.eatTimer = null;
+    }
+
+    if (state.totemTimer) {
+        clearInterval(state.totemTimer);
+        state.totemTimer = null;
+    }
+
+    if (state.inventoryScanTimer) {
+        clearInterval(state.inventoryScanTimer);
+        state.inventoryScanTimer = null;
+    }
+
+    state.isEating = false;
+    state.isEquippingTotem = false;
+}
+
 function clearAllTimers(state) {
     clearAfkTimers(state);
     clearReconnectTimer(state);
+    clearManagerTimers(state);
+}
+
+const FOOD_PRIORITY = [
+    'golden_apple',
+    'steak',
+    'cooked_porkchop',
+    'cooked_beef',
+    'cooked_chicken',
+    'baked_potato',
+    'bread',
+    'cooked_mutton',
+    'cooked_salmon'
+];
+
+function rememberSelectedSlot(state) {
+    if (
+        !state.bot ||
+        !Number.isInteger(state.bot.quickBarSlot)
+    ) {
+        return 0;
+    }
+
+    const slot = state.bot.quickBarSlot;
+
+    if (slot < 0 || slot > 8) {
+        return 0;
+    }
+
+    return slot;
+}
+
+function restoreSelectedSlot(state, slot) {
+    if (
+        !state.bot ||
+        !Number.isInteger(slot) ||
+        slot < 0 ||
+        slot > 8 ||
+        typeof state.bot.setQuickBarSlot !== 'function'
+    ) {
+        return false;
+    }
+
+    try {
+        state.bot.setQuickBarSlot(slot);
+        return true;
+    } catch (err) {
+        addLog(
+            state,
+            `[HOTBAR] Không thể khôi phục slot ${slot}: ${err.message}`
+        );
+        return false;
+    }
+}
+
+function selectHotbarSlot(state, slot) {
+    if (
+        !state.bot ||
+        !Number.isInteger(slot) ||
+        slot < 0 ||
+        slot > 8 ||
+        typeof state.bot.setQuickBarSlot !== 'function'
+    ) {
+        return false;
+    }
+
+    try {
+        state.bot.setQuickBarSlot(slot);
+        return true;
+    } catch (err) {
+        addLog(
+            state,
+            `[HOTBAR] Không thể chọn slot ${slot}: ${err.message}`
+        );
+        return false;
+    }
+}
+
+function resetInventoryState(state) {
+    state.inventoryState = {
+        revision: state.inventoryRevision || 0,
+        health: 20,
+        food: 20,
+        saturation: 20,
+        foodCount: 0,
+        goldenAppleCount: 0,
+        totemCount: 0,
+        offhand: null,
+        selectedHotbar: 0,
+        selectedSlot: 0,
+        armor: {
+            head: null,
+            torso: null,
+            legs: null,
+            feet: null
+        },
+        hotbar: [],
+        inventory: [],
+        slots: {}
+    };
+
+    state.inventoryLogSignature = '';
+    state.previousInventorySnapshot = null;
+    state.inventoryActionBusy = false;
+    state.foodMissingLogged = false;
+    state.totemLogState = null;
+    state.isEquippingTotem = false;
+}
+
+function getOffhandSlot(bot) {
+    if (
+        bot &&
+        typeof bot.getEquipmentDestSlot === 'function'
+    ) {
+        try {
+            return bot.getEquipmentDestSlot('off-hand');
+        } catch (_) {
+        }
+    }
+
+    return 45;
+}
+
+function itemToInventoryData(item, slot = null) {
+    if (!item) {
+        return null;
+    }
+
+    return {
+        slot:
+            Number.isInteger(slot)
+                ? slot
+                : Number.isInteger(item.slot)
+                    ? item.slot
+                    : null,
+        name: item.name || '',
+        displayName:
+            item.displayName ||
+            item.name ||
+            '',
+        count:
+            Number(item.count || 0),
+        metadata:
+            item.metadata ?? null
+    };
+}
+
+function getSlotLabel(slot) {
+    if (slot >= 36 && slot <= 44) {
+        return `HOTBAR ${slot - 35}`;
+    }
+
+    if (slot >= 9 && slot <= 35) {
+        return `INV ${slot}`;
+    }
+
+    if (slot === 5) return 'ARMOR head';
+    if (slot === 6) return 'ARMOR torso';
+    if (slot === 7) return 'ARMOR legs';
+    if (slot === 8) return 'ARMOR feet';
+    if (slot === 45) return 'OFFHAND';
+
+    return `SLOT ${slot}`;
+}
+
+function itemSummary(item) {
+    if (!item) {
+        return 'empty';
+    }
+
+    const count =
+        Number(item.count || 0);
+
+    return `${item.displayName || item.name || 'unknown'} x${count}`;
+}
+
+function itemSignature(item) {
+    if (!item) {
+        return 'empty';
+    }
+
+    return [
+        item.name || '',
+        Number(item.count || 0),
+        item.metadata ?? ''
+    ].join('|');
+}
+
+function buildSlotState(slots) {
+    const slotState = {};
+
+    for (let slot = 5; slot <= 45; slot++) {
+        slotState[String(slot)] =
+            itemToInventoryData(
+                slots[slot] || null,
+                slot
+            );
+    }
+
+    return slotState;
+}
+
+function logInventoryDifferences(state, previous, next) {
+    if (!previous) {
+        addLog(
+            state,
+            '[INV] Inventory đã đồng bộ.'
+        );
+        return;
+    }
+
+    const previousHealth =
+        Number(previous.health ?? 20);
+    const nextHealth =
+        Number(next.health ?? 20);
+
+    if (previousHealth !== nextHealth) {
+        addLog(
+            state,
+            `[HEALTH] ${previousHealth} → ${nextHealth}.`
+        );
+    }
+
+    const previousFood =
+        Number(previous.food ?? 20);
+    const nextFood =
+        Number(next.food ?? 20);
+
+    if (previousFood !== nextFood) {
+        addLog(
+            state,
+            `[FOOD] Hunger ${previousFood} → ${nextFood}.`
+        );
+    }
+
+    const previousSaturation =
+        Number(previous.saturation ?? 20);
+    const nextSaturation =
+        Number(next.saturation ?? 20);
+
+    if (previousSaturation !== nextSaturation) {
+        addLog(
+            state,
+            `[FOOD] Saturation ${previousSaturation} → ${nextSaturation}.`
+        );
+    }
+
+    const previousFoodCount =
+        Number(previous.foodCount ?? 0);
+    const nextFoodCount =
+        Number(next.foodCount ?? 0);
+
+    if (previousFoodCount !== nextFoodCount) {
+        addLog(
+            state,
+            `[INV] Tổng thức ăn ${previousFoodCount} → ${nextFoodCount}.`
+        );
+    }
+
+    const previousGolden =
+        Number(previous.goldenAppleCount ?? 0);
+    const nextGolden =
+        Number(next.goldenAppleCount ?? 0);
+
+    if (previousGolden !== nextGolden) {
+        addLog(
+            state,
+            `[INV] Golden Apple ${previousGolden} → ${nextGolden}.`
+        );
+    }
+
+    const previousTotem =
+        Number(previous.totemCount ?? 0);
+    const nextTotem =
+        Number(next.totemCount ?? 0);
+
+    if (previousTotem !== nextTotem) {
+        addLog(
+            state,
+            `[TOTEM] Số Totem ${previousTotem} → ${nextTotem}.`
+        );
+    }
+
+    const previousSelected =
+        Number(previous.selectedSlot ?? 0);
+    const nextSelected =
+        Number(next.selectedSlot ?? 0);
+
+    if (previousSelected !== nextSelected) {
+        addLog(
+            state,
+            `[HOTBAR] Selected slot ${previousSelected + 1} → ${nextSelected + 1}.`
+        );
+    }
+
+    const previousSlots =
+        previous.slots || {};
+    const nextSlots =
+        next.slots || {};
+
+    for (let slot = 5; slot <= 45; slot++) {
+        const key = String(slot);
+
+        const previousItem =
+            previousSlots[key] || null;
+
+        const nextItem =
+            nextSlots[key] || null;
+
+        if (
+            itemSignature(previousItem) ===
+            itemSignature(nextItem)
+        ) {
+            continue;
+        }
+
+        const oldText =
+            itemSummary(previousItem);
+
+        const newText =
+            itemSummary(nextItem);
+
+        const label =
+            getSlotLabel(slot);
+
+        if (slot >= 5 && slot <= 8) {
+            addLog(
+                state,
+                `[EQUIP] ${label}: ${oldText} → ${newText}.`
+            );
+        } else if (slot === 45) {
+            addLog(
+                state,
+                `[EQUIP] Offhand: ${oldText} → ${newText}.`
+            );
+        } else {
+            addLog(
+                state,
+                `[INV] ${label}: ${oldText} → ${newText}.`
+            );
+        }
+    }
+}
+
+function scanInventory(state, bot = state.bot, forceLog = false) {
+    if (
+        !bot ||
+        state.bot !== bot ||
+        !bot.inventory ||
+        !Array.isArray(bot.inventory.slots)
+    ) {
+        return false;
+    }
+
+    const slots = bot.inventory.slots;
+    const offhandSlot = getOffhandSlot(bot);
+
+    const allMainItems = [];
+
+    for (let slot = 9; slot <= 35; slot++) {
+        const item = slots[slot];
+
+        allMainItems.push(
+            itemToInventoryData(
+                item || null,
+                slot
+            )
+        );
+    }
+
+    const hotbar = [];
+
+    for (let quickSlot = 0; quickSlot < 9; quickSlot++) {
+        const inventorySlot = 36 + quickSlot;
+        const item = slots[inventorySlot];
+
+        hotbar.push(
+            itemToInventoryData(
+                item || null,
+                inventorySlot
+            )
+        );
+    }
+
+    const armor = {
+        head:
+            itemToInventoryData(
+                slots[5] || null,
+                5
+            ),
+        torso:
+            itemToInventoryData(
+                slots[6] || null,
+                6
+            ),
+        legs:
+            itemToInventoryData(
+                slots[7] || null,
+                7
+            ),
+        feet:
+            itemToInventoryData(
+                slots[8] || null,
+                8
+            )
+    };
+
+    const offhandItem =
+        slots[offhandSlot] || null;
+
+    let foodCount = 0;
+    let goldenAppleCount = 0;
+    let totemCount = 0;
+
+    for (let slot = 9; slot <= 45; slot++) {
+        const item = slots[slot];
+
+        if (!item || !item.name) {
+            continue;
+        }
+
+        if (FOOD_PRIORITY.includes(item.name)) {
+            foodCount += Number(item.count || 0);
+        }
+
+        if (item.name === 'golden_apple') {
+            goldenAppleCount += Number(item.count || 0);
+        }
+
+        if (item.name === 'totem_of_undying') {
+            totemCount += Number(item.count || 0);
+        }
+    }
+
+    const selectedSlot =
+        Number.isInteger(bot.quickBarSlot) &&
+        bot.quickBarSlot >= 0 &&
+        bot.quickBarSlot <= 8
+            ? bot.quickBarSlot
+            : 0;
+
+    const slotState =
+        buildSlotState(slots);
+
+    const nextState = {
+        revision: state.inventoryRevision || 0,
+        health:
+            Number.isFinite(bot.health)
+                ? Math.max(0, Math.min(Number(bot.health), 20))
+                : 20,
+        food:
+            Number.isFinite(bot.food)
+                ? Math.max(0, Math.min(Number(bot.food), 20))
+                : 20,
+        saturation:
+            Number.isFinite(bot.foodSaturation)
+                ? Math.max(0, Number(bot.foodSaturation))
+                : 20,
+        foodCount,
+        goldenAppleCount,
+        totemCount,
+        offhand:
+            offhandItem && offhandItem.name
+                ? offhandItem.name
+                : null,
+        selectedHotbar: selectedSlot,
+        selectedSlot,
+        armor,
+        hotbar,
+        inventory: allMainItems,
+        slots: slotState
+    };
+
+    const signature = JSON.stringify(nextState);
+    const previous =
+        state.previousInventorySnapshot;
+
+    const changed =
+        signature !== state.inventoryLogSignature;
+
+    if (changed) {
+        state.inventoryRevision++;
+        nextState.revision =
+            state.inventoryRevision;
+
+        state.inventoryState =
+            nextState;
+
+        logInventoryDifferences(
+            state,
+            previous,
+            nextState
+        );
+
+        state.inventoryLogSignature =
+            JSON.stringify(nextState);
+
+        state.previousInventorySnapshot =
+            JSON.parse(
+                JSON.stringify(nextState)
+            );
+    } else {
+        nextState.revision =
+            state.inventoryRevision;
+
+        state.inventoryState.revision =
+            state.inventoryRevision;
+    }
+
+    if (forceLog && !changed) {
+        addLog(
+            state,
+            '[INV] Inventory đã đồng bộ.'
+        );
+    }
+
+    return true;
+}
+
+function findFoodItem(bot) {
+    if (
+        !bot ||
+        !bot.inventory ||
+        !Array.isArray(bot.inventory.slots)
+    ) {
+        return null;
+    }
+
+    const slots = bot.inventory.slots;
+
+    for (const foodName of FOOD_PRIORITY) {
+        for (let slot = 9; slot <= 44; slot++) {
+            const item = slots[slot];
+
+            if (item && item.name === foodName) {
+                return item;
+            }
+        }
+    }
+
+    return null;
+}
+
+function findTotemItem(bot) {
+    if (
+        !bot ||
+        !bot.inventory ||
+        !Array.isArray(bot.inventory.slots)
+    ) {
+        return null;
+    }
+
+    const offhandSlot = getOffhandSlot(bot);
+
+    for (let slot = 9; slot <= 44; slot++) {
+        if (slot === offhandSlot) {
+            continue;
+        }
+
+        const item = bot.inventory.slots[slot];
+
+        if (item && item.name === 'totem_of_undying') {
+            return item;
+        }
+    }
+
+    return null;
+}
+
+async function autoEatTick(state) {
+    const bot = state.bot;
+
+    if (
+        state.manuallyStopped ||
+        !bot ||
+        state.bot !== bot ||
+        !bot.player ||
+        state.isEating ||
+        state.inventoryActionBusy
+    ) {
+        return;
+    }
+
+    if (
+        state.status === 'offline' ||
+        state.status === 'connecting' ||
+        state.status === 'authenticating' ||
+        state.status === 'entering'
+    ) {
+        return;
+    }
+
+    if (bot.currentWindow || bot.usingHeldItem) {
+        return;
+    }
+
+    const food =
+        Number.isFinite(bot.food)
+            ? Number(bot.food)
+            : 20;
+
+    if (food >= 18) {
+        state.foodMissingLogged = false;
+        return;
+    }
+
+    const foodItem = findFoodItem(bot);
+
+    if (!foodItem) {
+        if (!state.foodMissingLogged) {
+            addLog(
+                state,
+                '[FOOD] Không tìm thấy thức ăn.'
+            );
+            state.foodMissingLogged = true;
+        }
+        return;
+    }
+
+    state.foodMissingLogged = false;
+    state.isEating = true;
+    state.inventoryActionBusy = true;
+
+    const oldBot = bot;
+    const oldSelectedSlot =
+        rememberSelectedSlot(state);
+
+    const foodName =
+        foodItem.displayName ||
+        foodItem.name;
+
+    const oldHeldItem =
+        bot.heldItem ||
+        (
+            bot.inventory &&
+            Array.isArray(bot.inventory.slots)
+                ? bot.inventory.slots[36 + oldSelectedSlot] || null
+                : null
+        );
+
+    try {
+        addLog(
+            state,
+            `[FOOD] Bắt đầu ăn ${foodName}.`
+        );
+
+        if (
+            !selectHotbarSlot(
+                state,
+                oldSelectedSlot
+            )
+        ) {
+            return;
+        }
+
+        addLog(
+            state,
+            `[FOOD] Equip ${foodName} vào tay.`
+        );
+
+        await bot.equip(
+            foodItem,
+            'hand'
+        );
+
+        if (
+            state.manuallyStopped ||
+            state.bot !== oldBot ||
+            !oldBot.player ||
+            oldBot.currentWindow
+        ) {
+            return;
+        }
+
+        addLog(
+            state,
+            `[FOOD] Bắt đầu Consume ${foodName}.`
+        );
+
+        await bot.consume();
+
+        if (state.bot === oldBot) {
+            addLog(
+                state,
+                `[FOOD] Đã ăn xong ${foodName}.`
+            );
+        }
+    } catch (err) {
+        if (state.bot === oldBot) {
+            addLog(
+                state,
+                `[FOOD] Lỗi khi ăn ${foodName}: ${err.message}`
+            );
+        }
+    } finally {
+        state.isEating = false;
+
+        if (
+            state.bot !== oldBot ||
+            state.manuallyStopped
+        ) {
+            state.inventoryActionBusy = false;
+            return;
+        }
+
+        try {
+            if (
+                oldHeldItem &&
+                bot.inventory &&
+                Array.isArray(bot.inventory.slots)
+            ) {
+                let oldItemStillExists = false;
+
+                for (const item of bot.inventory.slots) {
+                    if (item === oldHeldItem) {
+                        oldItemStillExists = true;
+                        break;
+                    }
+                }
+
+                if (oldItemStillExists) {
+                    await bot.equip(
+                        oldHeldItem,
+                        'hand'
+                    );
+
+                    addLog(
+                        state,
+                        `[FOOD] Đã khôi phục item cũ: ${oldHeldItem.displayName || oldHeldItem.name}.`
+                    );
+                }
+            }
+        } catch (err) {
+            addLog(
+                state,
+                `[HOTBAR] Không thể restore item cũ: ${err.message}`
+            );
+        }
+
+        restoreSelectedSlot(
+            state,
+            oldSelectedSlot
+        );
+
+        scanInventory(
+            state,
+            bot,
+            false
+        );
+
+        state.inventoryActionBusy = false;
+    }
+}
+
+async function autoTotemTick(state) {
+    const bot = state.bot;
+
+    if (
+        state.manuallyStopped ||
+        !bot ||
+        state.bot !== bot ||
+        !bot.player ||
+        !bot.entity ||
+        state.isEating ||
+        state.isEquippingTotem ||
+        state.inventoryActionBusy
+    ) {
+        return;
+    }
+
+    if (
+        state.status === 'offline' ||
+        state.status === 'connecting' ||
+        state.status === 'authenticating' ||
+        state.status === 'entering'
+    ) {
+        return;
+    }
+
+    if (bot.currentWindow || bot.usingHeldItem) {
+        return;
+    }
+
+    const offhandSlot =
+        getOffhandSlot(bot);
+
+    const offhandItem =
+        bot.inventory &&
+        Array.isArray(bot.inventory.slots)
+            ? bot.inventory.slots[offhandSlot]
+            : null;
+
+    if (
+        offhandItem &&
+        offhandItem.name === 'totem_of_undying'
+    ) {
+        if (state.totemLogState !== 'has') {
+            addLog(
+                state,
+                '[TOTEM] Offhand đã có Totem.'
+            );
+            state.totemLogState = 'has';
+        }
+        return;
+    }
+
+    if (
+        state.totemLogState === 'has'
+    ) {
+        addLog(
+            state,
+            '[TOTEM] Totem offhand đã mất hoặc đã được kích hoạt.'
+        );
+        state.totemLogState = null;
+    }
+
+    const totem =
+        findTotemItem(bot);
+
+    if (!totem) {
+        if (
+            state.totemLogState !== 'empty'
+        ) {
+            addLog(
+                state,
+                '[TOTEM] Hết Totem.'
+            );
+            state.totemLogState = 'empty';
+        }
+        return;
+    }
+
+    state.isEquippingTotem = true;
+    state.inventoryActionBusy = true;
+    state.totemLogState = 'equipping';
+
+    const oldBot = bot;
+
+    try {
+        addLog(
+            state,
+            '[TOTEM] Đang equip Totem vào offhand.'
+        );
+
+        await bot.equip(
+            totem,
+            'off-hand'
+        );
+
+        if (
+            state.bot === oldBot &&
+            !state.manuallyStopped
+        ) {
+            addLog(
+                state,
+                '[TOTEM] Đã trang bị Totem vào offhand.'
+            );
+
+            state.totemLogState = 'has';
+
+            scanInventory(
+                state,
+                bot,
+                false
+            );
+        }
+    } catch (err) {
+        if (state.bot === oldBot) {
+            addLog(
+                state,
+                `[TOTEM] Lỗi trang bị Totem: ${err.message}`
+            );
+            state.totemLogState = null;
+        }
+    } finally {
+        state.isEquippingTotem = false;
+        state.inventoryActionBusy = false;
+    }
+}
+
+function startBackgroundManagers(state, bot) {
+    clearManagerTimers(state);
+
+    scanInventory(
+        state,
+        bot,
+        true
+    );
+
+    state.inventoryScanTimer =
+        setInterval(
+            () => {
+                if (
+                    state.manuallyStopped ||
+                    state.bot !== bot
+                ) {
+                    return;
+                }
+
+                scanInventory(
+                    state,
+                    bot,
+                    false
+                );
+            },
+            INVENTORY_SCAN_INTERVAL_MS
+        );
+
+    state.eatTimer =
+        setInterval(
+            () => {
+                if (
+                    state.manuallyStopped ||
+                    state.bot !== bot
+                ) {
+                    return;
+                }
+
+                autoEatTick(state)
+                    .catch(err => {
+                        if (state.bot === bot) {
+                            addLog(
+                                state,
+                                `[FOOD] Lỗi manager: ${err.message}`
+                            );
+                        }
+                    });
+            },
+            AUTO_EAT_INTERVAL_MS
+        );
+
+    state.totemTimer =
+        setInterval(
+            () => {
+                if (
+                    state.manuallyStopped ||
+                    state.bot !== bot
+                ) {
+                    return;
+                }
+
+                autoTotemTick(state)
+                    .catch(err => {
+                        if (state.bot === bot) {
+                            addLog(
+                                state,
+                                `[TOTEM] Lỗi manager: ${err.message}`
+                            );
+                        }
+                    });
+            },
+            AUTO_TOTEM_INTERVAL_MS
+        );
+}
+
+function publicInventoryState(state) {
+    const inventory = state.inventoryState || {};
+
+    return {
+        revision:
+            Number(inventory.revision ?? state.inventoryRevision ?? 0),
+
+        health:
+            Number(inventory.health ?? 20),
+
+        food:
+            Number(inventory.food ?? 20),
+
+        saturation:
+            Number(inventory.saturation ?? 20),
+
+        foodCount:
+            Number(inventory.foodCount ?? 0),
+
+        goldenAppleCount:
+            Number(inventory.goldenAppleCount ?? 0),
+
+        totemCount:
+            Number(inventory.totemCount ?? 0),
+
+        offhand:
+            inventory.offhand ?? null,
+
+        selectedHotbar:
+            Number(inventory.selectedHotbar ?? 0),
+
+        selectedSlot:
+            Number(inventory.selectedSlot ?? 0),
+
+        armor:
+            inventory.armor || {
+                head: null,
+                torso: null,
+                legs: null,
+                feet: null
+            },
+
+        hotbar:
+            Array.isArray(inventory.hotbar)
+                ? inventory.hotbar
+                : [],
+
+        inventory:
+            Array.isArray(inventory.inventory)
+                ? inventory.inventory
+                : [],
+
+        slots:
+            inventory.slots || {}
+    };
 }
 
 function currentHost(state) {
@@ -260,7 +1396,10 @@ function publicBotState(state) {
             state.connectedAt,
 
         logRevision:
-            state.logRevision
+            state.logRevision,
+
+        chatLogRevision:
+            state.chatLogRevision
     };
 }
 
@@ -304,6 +1443,7 @@ function disconnectBot(
     const currentBot = state.bot;
 
     state.bot = null;
+    resetInventoryState(state);
 
     if (!currentBot) {
         return;
@@ -375,7 +1515,70 @@ function startBot(state) {
 
     return true;
 }
+
 function registerEvents(state, bot) {
+    bot.on('chat', (username, message, translate, jsonMsg) => {
+        if (
+            !message ||
+            state.bot !== bot
+        ) {
+            return;
+        }
+
+        const cleanMessage =
+            cleanMinecraftText(message);
+
+        if (!cleanMessage) {
+            return;
+        }
+
+        if (
+            username === bot.username &&
+            state.lastWebChatText === cleanMessage &&
+            Date.now() - state.lastWebChatAt <= 1500
+        ) {
+            return;
+        }
+
+        addChatLog(
+            state,
+            username,
+            cleanMessage
+        );
+    });
+
+    bot.on('heldItemChanged', newItem => {
+        if (state.bot !== bot) {
+            return;
+        }
+
+        addLog(
+            state,
+            `[HOTBAR] Held item: ${newItem ? itemSummary(newItem) : 'empty'}.`
+        );
+    });
+
+    bot.on('health', () => {
+        if (
+            state.bot === bot &&
+            Number.isFinite(bot.health)
+        ) {
+            addLog(
+                state,
+                `[HEALTH] ${Number(bot.health)} HP.`
+            );
+        }
+    });
+
+    bot.on('death', () => {
+        if (state.bot === bot) {
+            addLog(
+                state,
+                '[LIFE] Bot đã chết.'
+            );
+        }
+    });
+
     bot.on('error', err => {
         addLog(
             state,
@@ -446,6 +1649,11 @@ function registerEvents(state, bot) {
         setBotStatus(state, 'online');
         state.ready = false;
         state.connectedAt = Date.now();
+
+        startBackgroundManagers(
+            state,
+            bot
+        );
     });
 
     bot.on('message', jsonMsg => {
@@ -611,7 +1819,15 @@ function handleServerMessage(
                 lowerMsg.includes(pattern)
         );
 
-    if (shouldShowMcLog) {
+    if (
+        shouldShowMcLog &&
+        !isRecentChatMessage(state, cleanMsg) &&
+        !(
+            /^<[^>]{1,32}>\s/.test(cleanMsg) ||
+            /^\[[^\]]{1,24}\]\s*\S{1,32}\s*[>:»]\s*/.test(cleanMsg) ||
+            /^\S{1,32}\s*[>:»]\s+/.test(cleanMsg)
+        )
+    ) {
         addLog(
             state,
             `[MC] ${cleanMsg}`
@@ -696,7 +1912,7 @@ function handleServerMessage(
                                 state
                             );
                         }
-                    }, 2500);
+                    }, DN_TO_AFK_DELAY);
 
                 state.afkTimers.push(
                     timer
@@ -822,6 +2038,7 @@ function startAfkRoutine(state) {
                     ) {
                         return;
                     }
+
                     const currentWindow =
                         state.bot.currentWindow;
 
@@ -866,12 +2083,12 @@ function startAfkRoutine(state) {
                             `Lỗi click slot 24: ${err.message}`
                         );
                     }
-                }, 4000);
+                }, AFK_MENU_CLICK_DELAY);
 
             state.afkTimers.push(
                 clickTimer
             );
-        }, 6000);
+        }, AFK_MENU_DELAY);
 
     state.afkTimers.push(
         menuTimer
@@ -1116,7 +2333,8 @@ label{
   padding:11px 13px;
   border:1px solid var(--border);
   border-radius:10px;
-  background:#18222d
+  background:#18222d;
+  z-index:20
 }
 
 .dot{
@@ -1141,6 +2359,203 @@ label{
 
 .dot.blue{
   background:var(--blue)
+}
+
+.inventory-grid{
+   display:grid;
+   grid-template-columns:repeat(2,minmax(0,1fr));
+   gap:9px;
+   margin-bottom:13px
+}
+
+.inventory-stat{
+   padding:10px 11px;
+   border-radius:10px;
+   background:var(--card2)
+}
+
+.inventory-stat .info-label{
+   margin-bottom:4px
+}
+
+.inventory-stat .info-value{
+   font-size:14px
+}
+
+.bar{
+   width:100%;
+   height:9px;
+   border-radius:999px;
+   background:#26313b;
+   overflow:hidden;
+   margin-top:6px
+}
+
+.bar > span{
+   display:block;
+   height:100%;
+   width:0%;
+   transition:width .2s ease
+}
+
+.health-bar > span{
+   background:var(--red)
+}
+
+.hunger-bar > span{
+   background:var(--yellow)
+}
+
+.equipment-row{
+   display:grid;
+   grid-template-columns:repeat(5,minmax(0,1fr));
+   gap:7px;
+   margin-bottom:12px
+}
+
+.equipment-slot{
+   min-width:0;
+   min-height:70px;
+   border:1px solid var(--border);
+   border-radius:9px;
+   background:#0d1319;
+   display:flex;
+   flex-direction:column;
+   align-items:center;
+   justify-content:center;
+   text-align:center;
+   padding:6px;
+   cursor:pointer
+}
+
+.equipment-slot.dragover,
+.inventory-slot.dragover{
+   border-color:var(--blue);
+   box-shadow:0 0 0 1px var(--blue) inset
+}
+
+.equipment-slot .equip-label{
+   color:var(--muted);
+   font-size:9px;
+   margin-bottom:4px
+}
+
+.inventory-area{
+   margin-top:12px
+}
+
+.slot-grid{
+   display:grid;
+   grid-template-columns:repeat(9,minmax(0,1fr));
+   gap:5px
+}
+
+.inventory-slot{
+   min-width:0;
+   min-height:55px;
+   padding:5px 4px;
+   border:1px solid var(--border);
+   border-radius:8px;
+   background:#0d1319;
+   display:flex;
+   flex-direction:column;
+   align-items:center;
+   justify-content:center;
+   text-align:center;
+   overflow:hidden;
+   cursor:grab;
+   user-select:none
+}
+
+.inventory-slot:active{
+   cursor:grabbing
+}
+
+.inventory-slot.selected{
+   border-color:var(--green);
+   box-shadow:0 0 0 1px var(--green) inset
+}
+
+.inventory-slot.empty{
+   opacity:.7
+}
+
+.slot-index{
+   color:var(--muted);
+   font-size:9px;
+   margin-bottom:3px
+}
+
+.slot-name{
+   font-size:9px;
+   line-height:1.2;
+   word-break:break-word
+}
+
+.slot-count{
+   font-size:10px;
+   margin-top:3px
+}
+
+.inventory-list{
+   display:grid;
+   gap:5px;
+   max-height:180px;
+   overflow:auto;
+   margin-top:9px
+}
+
+.inventory-item-row{
+   display:flex;
+   align-items:center;
+   justify-content:space-between;
+   gap:10px;
+   padding:7px 9px;
+   border-radius:8px;
+   background:var(--card2);
+   font-size:11px
+}
+
+.inventory-item-name{
+   min-width:0;
+   overflow:hidden;
+   text-overflow:ellipsis;
+   white-space:nowrap
+}
+
+.chat-panel{
+   display:flex;
+   flex-direction:column
+}
+
+.chat-log{
+   height:310px
+}
+
+.chat-form{
+   margin-top:10px
+}
+
+.chat-title-row{
+   display:flex;
+   justify-content:space-between;
+   align-items:center;
+   gap:8px
+}
+
+.revision{
+   color:var(--muted);
+   font-size:10px
+}
+
+@media(max-width:520px){
+   .inventory-grid{
+     grid-template-columns:1fr
+   }
+
+   .equipment-row{
+     grid-template-columns:repeat(5,minmax(48px,1fr))
+   }
 }
 
 @media(max-width:820px){
@@ -1288,17 +2703,25 @@ label{
 
     <div class="panel">
 
-      <h3>Chat / Command</h3>
+      <div class="chat-title-row">
+        <h3>Chat</h3>
+        <div id="chatRevision" class="revision">revision 0</div>
+      </div>
+
+      <div
+        id="chatLogs"
+        class="log chat-log"
+      ></div>
 
       <form
-        class="chat-row"
+        class="chat-row chat-form"
         onsubmit="sendMessage(event)"
       >
 
         <input
           id="messageInput"
           autocomplete="off"
-          placeholder="Nhập gì gửi y nguyên lên Minecraft..."
+          placeholder="Nhập chat hoặc command..."
         >
 
         <button
@@ -1311,20 +2734,145 @@ label{
       </form>
 
       <div class="note">
-        Không phân biệt chat hay command.
-        Nhập gì sẽ gửi nguyên văn bằng Mineflayer.
+        Tin nhắn Minecraft và tin gửi từ web được tách riêng khỏi Event Log.
       </div>
 
     </div>
 
     <div class="panel">
 
-      <h3>Log</h3>
+      <div class="chat-title-row">
+        <h3>Event Log</h3>
+        <div id="eventRevision" class="revision">revision 0</div>
+      </div>
 
       <div
         id="logs"
         class="log"
       ></div>
+
+    </div>
+
+    <div class="panel">
+
+      <div class="chat-title-row">
+        <h3>Inventory Manager</h3>
+        <div id="inventoryRevision" class="revision">revision 0</div>
+      </div>
+
+      <div class="inventory-grid">
+
+        <div class="inventory-stat">
+          <div class="info-label">HEALTH</div>
+          <div id="inventoryHealth" class="info-value">20 / 20</div>
+          <div class="bar health-bar"><span id="inventoryHealthBar"></span></div>
+        </div>
+
+        <div class="inventory-stat">
+          <div class="info-label">HUNGER</div>
+          <div id="inventoryFood" class="info-value">20 / 20</div>
+          <div class="bar hunger-bar"><span id="inventoryFoodBar"></span></div>
+        </div>
+
+        <div class="inventory-stat">
+          <div class="info-label">GOLDEN APPLE</div>
+          <div id="inventoryGoldenApple" class="info-value">0</div>
+        </div>
+
+        <div class="inventory-stat">
+          <div class="info-label">TOTEM</div>
+          <div id="inventoryTotem" class="info-value">0</div>
+        </div>
+
+        <div class="inventory-stat">
+          <div class="info-label">OFFHAND</div>
+          <div id="inventoryOffhand" class="info-value">-</div>
+        </div>
+
+        <div class="inventory-stat">
+          <div class="info-label">FOOD COUNT</div>
+          <div id="inventoryFoodCount" class="info-value">0</div>
+        </div>
+
+      </div>
+
+      <div class="info-label">EQUIPMENT / OFFHAND</div>
+
+      <div class="equipment-row">
+
+        <div
+          class="equipment-slot"
+          data-destination="head"
+          ondragover="allowDrop(event)"
+          ondragleave="clearDragOver(event)"
+          ondrop="dropEquip(event,'head')"
+          ondblclick="unequipEquipment('head')"
+        >
+          <div class="equip-label">HEAD</div>
+          <div id="equipHead">-</div>
+        </div>
+
+        <div
+          class="equipment-slot"
+          data-destination="torso"
+          ondragover="allowDrop(event)"
+          ondragleave="clearDragOver(event)"
+          ondrop="dropEquip(event,'torso')"
+          ondblclick="unequipEquipment('torso')"
+        >
+          <div class="equip-label">CHEST</div>
+          <div id="equipTorso">-</div>
+        </div>
+
+        <div
+          class="equipment-slot"
+          data-destination="legs"
+          ondragover="allowDrop(event)"
+          ondragleave="clearDragOver(event)"
+          ondrop="dropEquip(event,'legs')"
+          ondblclick="unequipEquipment('legs')"
+        >
+          <div class="equip-label">LEGS</div>
+          <div id="equipLegs">-</div>
+        </div>
+
+        <div
+          class="equipment-slot"
+          data-destination="feet"
+          ondragover="allowDrop(event)"
+          ondragleave="clearDragOver(event)"
+          ondrop="dropEquip(event,'feet')"
+          ondblclick="unequipEquipment('feet')"
+        >
+          <div class="equip-label">FEET</div>
+          <div id="equipFeet">-</div>
+        </div>
+
+        <div
+          class="equipment-slot"
+          data-destination="off-hand"
+          ondragover="allowDrop(event)"
+          ondragleave="clearDragOver(event)"
+          ondrop="dropEquip(event,'off-hand')"
+          ondblclick="unequipEquipment('off-hand')"
+        >
+          <div class="equip-label">OFFHAND</div>
+          <div id="equipOffhand">-</div>
+        </div>
+
+      </div>
+
+      <div class="info-label">INVENTORY 27 SLOTS</div>
+      <div id="mainInventory" class="slot-grid inventory-area"></div>
+
+      <div class="info-label" style="margin-top:12px;">HOTBAR 9 SLOTS</div>
+      <div id="inventoryHotbar" class="slot-grid inventory-area"></div>
+
+      <div class="note">
+        Kéo-thả item để di chuyển. Kéo item vào Head/Chest/Legs/Feet/Offhand để trang bị.
+        Click hotbar để chọn slot. Double-click ô trang bị để tháo.
+        Inventory được đồng bộ với bot mỗi 1 giây và dùng revision để tránh thao tác trên dữ liệu cũ.
+      </div>
 
     </div>
 
@@ -1389,12 +2937,18 @@ label{
 <script>
 
 let bot = null;
+let inventory = null;
 
 let lastLogRevision = -1;
+let lastChatRevision = -1;
 
 let logRequestInFlight = false;
+let chatRequestInFlight = false;
 
 let uptimeSyncAt = Date.now();
+
+let draggedSlot = null;
+let inventoryActionInFlight = false;
 
 function statusMeta(status) {
 
@@ -1468,6 +3022,842 @@ async function getBot() {
   return bot;
 }
 
+async function getInventory() {
+
+  const response =
+    await fetch(
+      '/api/inventory',
+      {
+        cache:'no-store'
+      }
+    );
+
+  if (!response.ok) {
+    throw new Error(
+      'Không lấy được inventory.'
+    );
+  }
+
+  inventory =
+    await response.json();
+
+  return inventory;
+}
+
+function formatInventoryName(name) {
+
+  if (!name) {
+    return '-';
+  }
+
+  return String(name)
+    .replace(/_/g, ' ');
+}
+
+function itemLabel(item) {
+
+  if (!item) {
+    return '-';
+  }
+
+  const name =
+    item.displayName ||
+    item.name ||
+    '-';
+
+  const count =
+    Number(item.count || 0);
+
+  return count > 1
+    ? formatInventoryName(name) + ' x' + count
+    : formatInventoryName(name);
+}
+
+function createInventorySlotElement(
+  item,
+  slot,
+  selected
+) {
+
+  const element =
+    document.createElement('div');
+
+  element.className =
+    'inventory-slot' +
+    (
+      selected
+        ? ' selected'
+        : ''
+    ) +
+    (
+      item
+        ? ''
+        : ' empty'
+    );
+
+  element.draggable =
+    !!item;
+
+  element.dataset.slot =
+    String(slot);
+
+  element.ondragstart =
+    function(event) {
+      draggedSlot =
+        slot;
+
+      try {
+        event.dataTransfer.setData(
+          'text/plain',
+          String(slot)
+        );
+        event.dataTransfer.effectAllowed =
+          'move';
+      } catch (_) {
+      }
+    };
+
+  element.ondragover =
+    allowDrop;
+
+  element.ondragleave =
+    clearDragOver;
+
+  element.ondrop =
+    function(event) {
+      dropInventory(
+        event,
+        slot
+      );
+    };
+
+  element.onclick =
+    function() {
+
+      if (
+        slot >= 36 &&
+        slot <= 44
+      ) {
+        selectHotbar(
+          slot - 36
+        );
+      }
+    };
+
+  const index =
+    document.createElement('div');
+
+  index.className =
+    'slot-index';
+
+  if (
+    slot >= 36 &&
+    slot <= 44
+  ) {
+    index.textContent =
+      String(slot - 35);
+  } else if (
+    slot >= 9 &&
+    slot <= 35
+  ) {
+    index.textContent =
+      String(slot - 8);
+  } else {
+    index.textContent =
+      String(slot);
+  }
+
+  const name =
+    document.createElement('div');
+
+  name.className =
+    'slot-name';
+
+  name.textContent =
+    itemLabel(item);
+
+  const count =
+    document.createElement('div');
+
+  count.className =
+    'slot-count';
+
+  count.textContent =
+    item && Number(item.count || 0) > 1
+      ? String(item.count)
+      : '';
+
+  element.appendChild(
+    index
+  );
+
+  element.appendChild(
+    name
+  );
+
+  element.appendChild(
+    count
+  );
+
+  return element;
+}
+
+function renderEquipment(inventoryData) {
+
+  const armor =
+    inventoryData.armor || {};
+
+  document.getElementById('equipHead').textContent =
+    itemLabel(armor.head);
+
+  document.getElementById('equipTorso').textContent =
+    itemLabel(armor.torso);
+
+  document.getElementById('equipLegs').textContent =
+    itemLabel(armor.legs);
+
+  document.getElementById('equipFeet').textContent =
+    itemLabel(armor.feet);
+
+  document.getElementById('equipOffhand').textContent =
+    itemLabel(
+      inventoryData.slots
+        ? inventoryData.slots['45']
+        : null
+    );
+}
+
+function renderInventory() {
+
+  if (!inventory) {
+    return;
+  }
+
+  const health =
+    Math.max(
+      0,
+      Math.min(
+        20,
+        Number(inventory.health || 0)
+      )
+    );
+
+  const food =
+    Math.max(
+      0,
+      Math.min(
+        20,
+        Number(inventory.food || 0)
+      )
+    );
+
+  document.getElementById('inventoryHealth').textContent =
+    health.toFixed(1) + ' / 20';
+
+  document.getElementById('inventoryFood').textContent =
+    String(food) + ' / 20';
+
+  document.getElementById('inventoryHealthBar').style.width =
+    String(
+      (health / 20) * 100
+    ) + '%';
+
+  document.getElementById('inventoryFoodBar').style.width =
+    String(
+      (food / 20) * 100
+    ) + '%';
+
+  document.getElementById('inventoryGoldenApple').textContent =
+    String(
+      inventory.goldenAppleCount || 0
+    );
+
+  document.getElementById('inventoryTotem').textContent =
+    String(
+      inventory.totemCount || 0
+    );
+
+  document.getElementById('inventoryFoodCount').textContent =
+    String(
+      inventory.foodCount || 0
+    );
+
+  document.getElementById('inventoryOffhand').textContent =
+    formatInventoryName(
+      inventory.offhand
+    );
+
+  document.getElementById('inventoryRevision').textContent =
+    'revision ' +
+    String(
+      inventory.revision || 0
+    );
+
+  renderEquipment(
+    inventory
+  );
+
+  const slots =
+    inventory.slots || {};
+
+  const mainInventory =
+    document.getElementById(
+      'mainInventory'
+    );
+
+  mainInventory.innerHTML = '';
+
+  for (
+    let slot = 9;
+    slot <= 35;
+    slot++
+  ) {
+
+    const item =
+      slots[String(slot)] ||
+      null;
+
+    mainInventory.appendChild(
+      createInventorySlotElement(
+        item,
+        slot,
+        false
+      )
+    );
+  }
+
+  const hotbar =
+    document.getElementById(
+      'inventoryHotbar'
+    );
+
+  hotbar.innerHTML = '';
+
+  const selected =
+    Number(
+      inventory.selectedHotbar ??
+      inventory.selectedSlot ??
+      0
+    );
+
+  for (
+    let slot = 36;
+    slot <= 44;
+    slot++
+  ) {
+
+    const item =
+      slots[String(slot)] ||
+      null;
+
+    hotbar.appendChild(
+      createInventorySlotElement(
+        item,
+        slot,
+        (slot - 36) === selected
+      )
+    );
+  }
+}
+
+function allowDrop(event) {
+
+  event.preventDefault();
+
+  try {
+    event.dataTransfer.dropEffect =
+      'move';
+  } catch (_) {
+  }
+
+  if (
+    event.currentTarget &&
+    event.currentTarget.classList
+  ) {
+    event.currentTarget.classList.add(
+      'dragover'
+    );
+  }
+}
+
+function clearDragOver(event) {
+
+  if (
+    event.currentTarget &&
+    event.currentTarget.classList
+  ) {
+    event.currentTarget.classList.remove(
+      'dragover'
+    );
+  }
+}
+
+async function dropInventory(
+  event,
+  destinationSlot
+) {
+
+  event.preventDefault();
+
+  clearDragOver(event);
+
+  let sourceSlot =
+    draggedSlot;
+
+  try {
+
+    const fromData =
+      event.dataTransfer.getData(
+        'text/plain'
+      );
+
+    if (
+      fromData !== ''
+    ) {
+      sourceSlot =
+        Number(fromData);
+    }
+
+  } catch (_) {
+  }
+
+  draggedSlot = null;
+
+  if (
+    !Number.isInteger(sourceSlot) ||
+    sourceSlot === destinationSlot
+  ) {
+    return;
+  }
+
+  await moveInventoryItem(
+    sourceSlot,
+    destinationSlot
+  );
+}
+
+async function moveInventoryItem(
+  sourceSlot,
+  destSlot
+) {
+
+  if (
+    inventoryActionInFlight
+  ) {
+    showToast(
+      'Đang thực hiện thao tác inventory khác.'
+    );
+    return;
+  }
+
+  if (!inventory) {
+    return;
+  }
+
+  inventoryActionInFlight =
+    true;
+
+  try {
+
+    const response =
+      await fetch(
+        '/api/inventory/move',
+        {
+          method:'POST',
+
+          headers:{
+            'Content-Type':
+              'application/json'
+          },
+
+          body:
+            JSON.stringify({
+              sourceSlot,
+              destSlot,
+              revision:
+                inventory.revision
+            })
+        }
+      );
+
+    const data =
+      await response.json();
+
+    if (!response.ok) {
+
+      if (
+        data.inventory
+      ) {
+        inventory =
+          data.inventory;
+
+        renderInventory();
+      }
+
+      showToast(
+        data.error ||
+        'Di chuyển thất bại.'
+      );
+
+      await refreshInventoryOnly();
+
+      return;
+    }
+
+    if (
+      data.inventory
+    ) {
+      inventory =
+        data.inventory;
+
+      renderInventory();
+    }
+
+    showToast(
+      data.message ||
+      'Đã di chuyển item.'
+    );
+
+  } catch (_) {
+
+    showToast(
+      'Không thể kết nối tới server web.'
+    );
+
+  } finally {
+
+    inventoryActionInFlight =
+      false;
+  }
+}
+
+async function dropEquip(
+  event,
+  destination
+) {
+
+  event.preventDefault();
+
+  clearDragOver(event);
+
+  let sourceSlot =
+    draggedSlot;
+
+  try {
+
+    const fromData =
+      event.dataTransfer.getData(
+        'text/plain'
+      );
+
+    if (
+      fromData !== ''
+    ) {
+      sourceSlot =
+        Number(fromData);
+    }
+
+  } catch (_) {
+  }
+
+  draggedSlot = null;
+
+  if (
+    !Number.isInteger(sourceSlot)
+  ) {
+    return;
+  }
+
+  await equipInventoryItem(
+    sourceSlot,
+    destination
+  );
+}
+
+async function equipInventoryItem(
+  sourceSlot,
+  destination
+) {
+
+  if (
+    inventoryActionInFlight
+  ) {
+    showToast(
+      'Đang thực hiện thao tác inventory khác.'
+    );
+    return;
+  }
+
+  if (!inventory) {
+    return;
+  }
+
+  inventoryActionInFlight =
+    true;
+
+  try {
+
+    const response =
+      await fetch(
+        '/api/inventory/equip',
+        {
+          method:'POST',
+
+          headers:{
+            'Content-Type':
+              'application/json'
+          },
+
+          body:
+            JSON.stringify({
+              sourceSlot,
+              destination,
+              revision:
+                inventory.revision
+            })
+        }
+      );
+
+    const data =
+      await response.json();
+
+    if (!response.ok) {
+
+      if (
+        data.inventory
+      ) {
+        inventory =
+          data.inventory;
+
+        renderInventory();
+      }
+
+      showToast(
+        data.error ||
+        'Trang bị thất bại.'
+      );
+
+      await refreshInventoryOnly();
+
+      return;
+    }
+
+    if (
+      data.inventory
+    ) {
+      inventory =
+        data.inventory;
+
+      renderInventory();
+    }
+
+    showToast(
+      data.message ||
+      'Đã trang bị item.'
+    );
+
+  } catch (_) {
+
+    showToast(
+      'Không thể kết nối tới server web.'
+    );
+
+  } finally {
+
+    inventoryActionInFlight =
+      false;
+  }
+}
+
+async function unequipEquipment(
+  destination
+) {
+
+  if (
+    inventoryActionInFlight
+  ) {
+    showToast(
+      'Đang thực hiện thao tác inventory khác.'
+    );
+    return;
+  }
+
+  if (!inventory) {
+    return;
+  }
+
+  inventoryActionInFlight =
+    true;
+
+  try {
+
+    const response =
+      await fetch(
+        '/api/inventory/unequip',
+        {
+          method:'POST',
+
+          headers:{
+            'Content-Type':
+              'application/json'
+          },
+
+          body:
+            JSON.stringify({
+              destination,
+              revision:
+                inventory.revision
+            })
+        }
+      );
+
+    const data =
+      await response.json();
+
+    if (!response.ok) {
+
+      if (
+        data.inventory
+      ) {
+        inventory =
+          data.inventory;
+
+        renderInventory();
+      }
+
+      showToast(
+        data.error ||
+        'Tháo trang bị thất bại.'
+      );
+
+      await refreshInventoryOnly();
+
+      return;
+    }
+
+    if (
+      data.inventory
+    ) {
+      inventory =
+        data.inventory;
+
+      renderInventory();
+    }
+
+    showToast(
+      data.message ||
+      'Đã tháo trang bị.'
+    );
+
+  } catch (_) {
+
+    showToast(
+      'Không thể kết nối tới server web.'
+    );
+
+  } finally {
+
+    inventoryActionInFlight =
+      false;
+  }
+}
+
+async function selectHotbar(slot) {
+
+  if (
+    inventoryActionInFlight
+  ) {
+    return;
+  }
+
+  if (!inventory) {
+    return;
+  }
+
+  inventoryActionInFlight =
+    true;
+
+  try {
+
+    const response =
+      await fetch(
+        '/api/inventory/select',
+        {
+          method:'POST',
+
+          headers:{
+            'Content-Type':
+              'application/json'
+          },
+
+          body:
+            JSON.stringify({
+              slot,
+              revision:
+                inventory.revision
+            })
+        }
+      );
+
+    const data =
+      await response.json();
+
+    if (!response.ok) {
+
+      if (
+        data.inventory
+      ) {
+        inventory =
+          data.inventory;
+
+        renderInventory();
+      }
+
+      showToast(
+        data.error ||
+        'Không thể chọn hotbar.'
+      );
+
+      await refreshInventoryOnly();
+
+      return;
+    }
+
+    if (
+      data.inventory
+    ) {
+      inventory =
+        data.inventory;
+
+      renderInventory();
+    }
+
+  } catch (_) {
+
+    showToast(
+      'Không thể kết nối tới server web.'
+    );
+
+  } finally {
+
+    inventoryActionInFlight =
+      false;
+  }
+}
+
+async function refreshInventoryOnly() {
+
+  try {
+
+    await getInventory();
+
+    renderInventory();
+
+  } catch (_) {
+
+  }
+}
+
 function renderDetail() {
 
   if (!bot) return;
@@ -1521,7 +3911,8 @@ function renderDetail() {
       'detailUptime'
     )
     .textContent =
-      bot.uptime || '0h 0m 0s';
+      bot.uptime ||
+      '0h 0m 0s';
 
   document
     .getElementById(
@@ -1531,9 +3922,6 @@ function renderDetail() {
       String(
         bot.reconnectCount ?? 0
       );
-
-  // Intentionally do not pre-fill usernameInput.
-  // This prevents refresh() from rolling back what the user is typing.
 
   document
     .getElementById(
@@ -1573,9 +3961,13 @@ function isNearLogBottom(box) {
   ) < 24;
 }
 
-async function loadLogs(force = false) {
+async function loadLogs(
+  force = false
+) {
 
-  if (logRequestInFlight) {
+  if (
+    logRequestInFlight
+  ) {
     return;
   }
 
@@ -1626,6 +4018,14 @@ async function loadLogs(force = false) {
       lastLogRevision =
         data.revision ?? 0;
 
+      document.getElementById(
+        'eventRevision'
+      ).textContent =
+        'revision ' +
+        String(
+          data.revision ?? 0
+        );
+
       return;
     }
 
@@ -1643,6 +4043,14 @@ async function loadLogs(force = false) {
       data.revision ??
       lastLogRevision;
 
+    document.getElementById(
+      'eventRevision'
+    ).textContent =
+      'revision ' +
+      String(
+        data.revision ?? 0
+      );
+
     if (keepAtBottom) {
       box.scrollTop =
         box.scrollHeight;
@@ -1657,6 +4065,93 @@ async function loadLogs(force = false) {
 
   }
 }
+
+async function loadChatLogs(
+  force = false
+) {
+
+  if (
+    chatRequestInFlight
+  ) {
+    return;
+  }
+
+  if (
+    !force &&
+    lastChatRevision >= 0 &&
+    bot &&
+    bot.chatLogRevision ===
+      lastChatRevision
+  ) {
+    return;
+  }
+
+  chatRequestInFlight = true;
+
+  try {
+
+    const response =
+      await fetch(
+        '/api/bot/chat-logs',
+        {
+          cache:'no-store'
+        }
+      );
+
+    if (!response.ok) {
+      return;
+    }
+
+    const data =
+      await response.json();
+
+    const box =
+      document.getElementById(
+        'chatLogs'
+      );
+
+    const keepAtBottom =
+      isNearLogBottom(box);
+
+    box.innerHTML =
+      Array.isArray(data.logs)
+        ? data.logs
+            .map(
+              line =>
+                '<div class="line">' +
+                escapeHtml(line) +
+                '</div>'
+            )
+            .join('')
+        : '';
+
+    lastChatRevision =
+      data.revision ??
+      lastChatRevision;
+
+    document.getElementById(
+      'chatRevision'
+    ).textContent =
+      'revision ' +
+      String(
+        data.revision ?? 0
+      );
+
+    if (keepAtBottom) {
+      box.scrollTop =
+        box.scrollHeight;
+    }
+
+  } catch (_) {
+
+  } finally {
+
+    chatRequestInFlight =
+      false;
+
+  }
+}
+
 function escapeHtml(value) {
 
   return String(
@@ -1692,7 +4187,13 @@ async function refresh() {
 
     renderDetail();
 
+    await getInventory();
+
+    renderInventory();
+
     await loadLogs();
+
+    await loadChatLogs();
 
   } catch (_) {
 
@@ -1818,7 +4319,7 @@ async function sendMessage(event) {
 
     await getBot();
 
-    await loadLogs(true);
+    await loadChatLogs(true);
 
   } catch (_) {
 
@@ -1833,13 +4334,17 @@ async function saveAccount() {
 
   const username =
     document
-      .getElementById('usernameInput')
+      .getElementById(
+        'usernameInput'
+      )
       .value
       .trim();
 
   const password =
     document
-      .getElementById('passwordInput')
+      .getElementById(
+        'passwordInput'
+      )
       .value;
 
   if (!username && !password) {
@@ -1855,9 +4360,9 @@ async function saveAccount() {
       await fetch(
         '/api/bot/account',
         {
-          method: 'POST',
+          method:'POST',
 
-          headers: {
+          headers:{
             'Content-Type':
               'application/json'
           },
@@ -1940,10 +4445,11 @@ function showToast(message) {
 
 setInterval(
   refresh,
-  ${STATUS_POLL_MS}
+  1000
 );
 
 function updateUptimeDisplay() {
+
   if (!bot) {
     return;
   }
@@ -1979,15 +4485,6 @@ function updateUptimeDisplay() {
   const seconds =
     uptimeSeconds % 60;
 
-  const hoursText =
-    hours + 'h ';
-
-  const minutesText =
-    minutes + 'm ';
-
-  const secondsText =
-    seconds + 's';
-
   const element =
     document.getElementById(
       'detailUptime'
@@ -1995,15 +4492,15 @@ function updateUptimeDisplay() {
 
   if (element) {
     element.textContent =
-      hoursText +
-      minutesText +
-      secondsText;
+      hours + 'h ' +
+      minutes + 'm ' +
+      seconds + 's';
   }
 }
 
 setInterval(
   updateUptimeDisplay,
-  ${UPTIME_UPDATE_MS}
+  250
 );
 
 </script>
@@ -2038,6 +4535,21 @@ app.get(
             id: botState.id,
             revision: botState.logRevision,
             logs: botState.logs
+        });
+    }
+);
+
+// -----------------------------------------------------------------------------
+// Chat logs
+// -----------------------------------------------------------------------------
+
+app.get(
+    '/api/bot/chat-logs',
+    (req, res) => {
+        res.json({
+            id: botState.id,
+            revision: botState.chatLogRevision,
+            logs: botState.chatLogs
         });
     }
 );
@@ -2154,6 +4666,7 @@ app.post(
         });
     }
 );
+
 // -----------------------------------------------------------------------------
 // Chat / command
 // -----------------------------------------------------------------------------
@@ -2195,9 +4708,16 @@ app.post(
                 text
             );
 
-            addLog(
+            botState.lastWebChatText =
+                cleanMinecraftText(text);
+
+            botState.lastWebChatAt =
+                Date.now();
+
+            addChatLog(
                 botState,
-                `[WEB] → ${text}`
+                'WEB',
+                `→ ${text}`
             );
 
             res.json({
@@ -2267,6 +4787,592 @@ app.post(
             ok: true,
             message:
                 `Đã lưu ${changed.join(' + ')}.`
+        });
+    }
+);
+
+// -----------------------------------------------------------------------------
+// Inventory API
+// -----------------------------------------------------------------------------
+
+app.get(
+    '/api/inventory',
+    (req, res) => {
+        res.json(
+            publicInventoryState(
+                botState
+            )
+        );
+    }
+);
+
+// -----------------------------------------------------------------------------
+// Inventory manager helpers
+// -----------------------------------------------------------------------------
+
+function validateInventoryRevision(state, requestedRevision) {
+    const revision =
+        Number(requestedRevision);
+
+    if (
+        !Number.isInteger(revision) ||
+        revision !== Number(state.inventoryRevision)
+    ) {
+        return false;
+    }
+
+    return true;
+}
+
+function isValidPlayerInventorySlot(slot) {
+    return (
+        Number.isInteger(slot) &&
+        slot >= 5 &&
+        slot <= 45
+    );
+}
+
+function canUseInventoryAction(state) {
+    return (
+        !state.manuallyStopped &&
+        !!state.bot &&
+        !!state.bot.player &&
+        !!state.bot.inventory &&
+        !state.bot.currentWindow &&
+        state.status !== 'offline' &&
+        state.status !== 'connecting' &&
+        state.status !== 'authenticating' &&
+        state.status !== 'entering'
+    );
+}
+
+async function finishInventoryAction(state, bot) {
+    await new Promise(
+        resolve => setTimeout(resolve, 75)
+    );
+
+    if (
+        state.bot === bot &&
+        !state.manuallyStopped
+    ) {
+        scanInventory(
+            state,
+            bot,
+            false
+        );
+    }
+}
+
+app.get(
+    '/api/inventory',
+    (req, res) => {
+        if (botState.bot) {
+            scanInventory(
+                botState,
+                botState.bot,
+                false
+            );
+        }
+
+        res.json(
+            publicInventoryState(
+                botState
+            )
+        );
+    }
+);
+
+app.post(
+    '/api/inventory/move',
+    async (req, res) => {
+        const sourceSlot =
+            Number(req.body?.sourceSlot);
+
+        const destSlot =
+            Number(req.body?.destSlot);
+
+        const requestedRevision =
+            Number(req.body?.revision);
+
+        if (
+            !isValidPlayerInventorySlot(sourceSlot) ||
+            !isValidPlayerInventorySlot(destSlot)
+        ) {
+            return res.status(400).json({
+                error:
+                    'Slot không hợp lệ.'
+            });
+        }
+
+        if (sourceSlot === destSlot) {
+            return res.json({
+                ok: true,
+                message:
+                    'Không có thay đổi.'
+            });
+        }
+
+        if (
+            !validateInventoryRevision(
+                botState,
+                requestedRevision
+            )
+        ) {
+            return res.status(409).json({
+                error:
+                    'Inventory đã thay đổi. Đang đồng bộ lại...',
+                revision:
+                    botState.inventoryRevision,
+                inventory:
+                    publicInventoryState(
+                        botState
+                    )
+            });
+        }
+
+        if (
+            botState.inventoryActionBusy
+        ) {
+            return res.status(409).json({
+                error:
+                    'Bot đang thực hiện thao tác inventory khác.'
+            });
+        }
+
+        if (
+            !canUseInventoryAction(botState)
+        ) {
+            return res.status(409).json({
+                error:
+                    'Bot chưa sẵn sàng thao tác inventory.'
+            });
+        }
+
+        const bot =
+            botState.bot;
+
+        const sourceItem =
+            bot.inventory.slots[sourceSlot] ||
+            null;
+
+        if (!sourceItem) {
+            return res.status(400).json({
+                error:
+                    'Ô nguồn đang trống.'
+            });
+        }
+
+        botState.inventoryActionBusy = true;
+
+        try {
+            const beforeSource =
+                itemSummary(sourceItem);
+
+            const beforeDest =
+                itemSummary(
+                    bot.inventory.slots[destSlot] ||
+                    null
+                );
+
+            addLog(
+                botState,
+                `[INV] Web move: ${getSlotLabel(sourceSlot)} → ${getSlotLabel(destSlot)} | ${beforeSource}.`
+            );
+
+            await bot.moveSlotItem(
+                sourceSlot,
+                destSlot
+            );
+
+            await finishInventoryAction(
+                botState,
+                bot
+            );
+
+            addLog(
+                botState,
+                `[INV] Web move hoàn tất: ${getSlotLabel(sourceSlot)} → ${getSlotLabel(destSlot)}.`
+            );
+
+            if (
+                beforeDest !== 'empty'
+            ) {
+                addLog(
+                    botState,
+                    `[INV] Ô đích trước thao tác: ${beforeDest}.`
+                );
+            }
+
+            res.json({
+                ok: true,
+                message:
+                    'Đã di chuyển item.',
+                revision:
+                    botState.inventoryRevision,
+                inventory:
+                    publicInventoryState(
+                        botState
+                    )
+            });
+        } catch (err) {
+            addLog(
+                botState,
+                `[INV] Web move lỗi: ${err.message}`
+            );
+
+            res.status(500).json({
+                error:
+                    `Di chuyển thất bại: ${err.message}`,
+                revision:
+                    botState.inventoryRevision
+            });
+        } finally {
+            botState.inventoryActionBusy = false;
+        }
+    }
+);
+
+app.post(
+    '/api/inventory/equip',
+    async (req, res) => {
+        const sourceSlot =
+            Number(req.body?.sourceSlot);
+
+        const destination =
+            typeof req.body?.destination === 'string'
+                ? req.body.destination
+                : '';
+
+        const requestedRevision =
+            Number(req.body?.revision);
+
+        const validDestinations = [
+            'head',
+            'torso',
+            'legs',
+            'feet',
+            'off-hand'
+        ];
+
+        if (
+            !isValidPlayerInventorySlot(sourceSlot) ||
+            !validDestinations.includes(destination)
+        ) {
+            return res.status(400).json({
+                error:
+                    'Nguồn hoặc vị trí trang bị không hợp lệ.'
+            });
+        }
+
+        if (
+            !validateInventoryRevision(
+                botState,
+                requestedRevision
+            )
+        ) {
+            return res.status(409).json({
+                error:
+                    'Inventory đã thay đổi. Đang đồng bộ lại...',
+                revision:
+                    botState.inventoryRevision,
+                inventory:
+                    publicInventoryState(
+                        botState
+                    )
+            });
+        }
+
+        if (
+            botState.inventoryActionBusy
+        ) {
+            return res.status(409).json({
+                error:
+                    'Bot đang thực hiện thao tác inventory khác.'
+            });
+        }
+
+        if (
+            !canUseInventoryAction(botState)
+        ) {
+            return res.status(409).json({
+                error:
+                    'Bot chưa sẵn sàng thao tác inventory.'
+            });
+        }
+
+        const bot =
+            botState.bot;
+
+        const item =
+            bot.inventory.slots[sourceSlot] ||
+            null;
+
+        if (!item) {
+            return res.status(400).json({
+                error:
+                    'Ô nguồn đang trống.'
+            });
+        }
+
+        botState.inventoryActionBusy = true;
+
+        try {
+            addLog(
+                botState,
+                `[EQUIP] Web: ${itemSummary(item)} → ${destination}.`
+            );
+
+            await bot.equip(
+                item,
+                destination
+            );
+
+            await finishInventoryAction(
+                botState,
+                bot
+            );
+
+            addLog(
+                botState,
+                `[EQUIP] Hoàn tất: ${itemSummary(item)} → ${destination}.`
+            );
+
+            res.json({
+                ok: true,
+                message:
+                    'Đã trang bị item.',
+                revision:
+                    botState.inventoryRevision,
+                inventory:
+                    publicInventoryState(
+                        botState
+                    )
+            });
+        } catch (err) {
+            addLog(
+                botState,
+                `[EQUIP] Web lỗi: ${err.message}`
+            );
+
+            res.status(500).json({
+                error:
+                    `Trang bị thất bại: ${err.message}`,
+                revision:
+                    botState.inventoryRevision
+            });
+        } finally {
+            botState.inventoryActionBusy = false;
+        }
+    }
+);
+
+app.post(
+    '/api/inventory/unequip',
+    async (req, res) => {
+        const destination =
+            typeof req.body?.destination === 'string'
+                ? req.body.destination
+                : '';
+
+        const requestedRevision =
+            Number(req.body?.revision);
+
+        const validDestinations = [
+            'head',
+            'torso',
+            'legs',
+            'feet',
+            'off-hand'
+        ];
+
+        if (
+            !validDestinations.includes(destination)
+        ) {
+            return res.status(400).json({
+                error:
+                    'Vị trí unequip không hợp lệ.'
+            });
+        }
+
+        if (
+            !validateInventoryRevision(
+                botState,
+                requestedRevision
+            )
+        ) {
+            return res.status(409).json({
+                error:
+                    'Inventory đã thay đổi. Đang đồng bộ lại...',
+                revision:
+                    botState.inventoryRevision,
+                inventory:
+                    publicInventoryState(
+                        botState
+                    )
+            });
+        }
+
+        if (
+            botState.inventoryActionBusy
+        ) {
+            return res.status(409).json({
+                error:
+                    'Bot đang thực hiện thao tác inventory khác.'
+            });
+        }
+
+        if (
+            !canUseInventoryAction(botState)
+        ) {
+            return res.status(409).json({
+                error:
+                    'Bot chưa sẵn sàng thao tác inventory.'
+            });
+        }
+
+        const bot =
+            botState.bot;
+
+        if (
+            typeof bot.unequip !== 'function'
+        ) {
+            return res.status(501).json({
+                error:
+                    'Mineflayer hiện tại không hỗ trợ unequip.'
+            });
+        }
+
+        botState.inventoryActionBusy = true;
+
+        try {
+            addLog(
+                botState,
+                `[EQUIP] Web: tháo trang bị ${destination}.`
+            );
+
+            await bot.unequip(
+                destination
+            );
+
+            await finishInventoryAction(
+                botState,
+                bot
+            );
+
+            addLog(
+                botState,
+                `[EQUIP] Đã tháo trang bị ${destination}.`
+            );
+
+            res.json({
+                ok: true,
+                message:
+                    'Đã tháo trang bị.',
+                revision:
+                    botState.inventoryRevision,
+                inventory:
+                    publicInventoryState(
+                        botState
+                    )
+            });
+        } catch (err) {
+            addLog(
+                botState,
+                `[EQUIP] Unequip lỗi: ${err.message}`
+            );
+
+            res.status(500).json({
+                error:
+                    `Tháo trang bị thất bại: ${err.message}`,
+                revision:
+                    botState.inventoryRevision
+            });
+        } finally {
+            botState.inventoryActionBusy = false;
+        }
+    }
+);
+
+app.post(
+    '/api/inventory/select',
+    (req, res) => {
+        const slot =
+            Number(req.body?.slot);
+
+        const requestedRevision =
+            Number(req.body?.revision);
+
+        if (
+            !Number.isInteger(slot) ||
+            slot < 0 ||
+            slot > 8
+        ) {
+            return res.status(400).json({
+                error:
+                    'Hotbar slot phải từ 0 đến 8.'
+            });
+        }
+
+        if (
+            !validateInventoryRevision(
+                botState,
+                requestedRevision
+            )
+        ) {
+            return res.status(409).json({
+                error:
+                    'Inventory đã thay đổi. Đang đồng bộ lại...',
+                revision:
+                    botState.inventoryRevision,
+                inventory:
+                    publicInventoryState(
+                        botState
+                    )
+            });
+        }
+
+        if (
+            !canUseInventoryAction(botState)
+        ) {
+            return res.status(409).json({
+                error:
+                    'Bot chưa sẵn sàng.'
+            });
+        }
+
+        if (
+            !selectHotbarSlot(
+                botState,
+                slot
+            )
+        ) {
+            return res.status(500).json({
+                error:
+                    'Không thể chọn hotbar slot.'
+            });
+        }
+
+        scanInventory(
+            botState,
+            botState.bot,
+            false
+        );
+
+        addLog(
+            botState,
+            `[HOTBAR] Web chọn slot ${slot + 1}.`
+        );
+
+        res.json({
+            ok: true,
+            message:
+                `Đã chọn hotbar slot ${slot + 1}.`,
+            revision:
+                botState.inventoryRevision,
+            inventory:
+                publicInventoryState(
+                    botState
+                )
         });
     }
 );
@@ -2423,6 +5529,7 @@ botState.manuallyStopped = true;
 botState.ready = false;
 setBotStatus(botState, 'offline');
 botState.connectedAt = null;
+resetInventoryState(botState);
 
 if (
     botState.username &&
