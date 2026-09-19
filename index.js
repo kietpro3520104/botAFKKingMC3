@@ -4,6 +4,19 @@ const express = require('express');
 const app = express();
 const HTTP_PORT = Number(process.env.PORT || 10000);
 
+const BOT_ID_RAW = String(process.env.BOT || '1').trim() || '1';
+const BOT_ID_NUMBER_PARSED =
+    Number.parseInt(BOT_ID_RAW, 10);
+
+const BOT_ID_NUMBER =
+    Number.isFinite(BOT_ID_NUMBER_PARSED)
+        ? BOT_ID_NUMBER_PARSED
+        : 1;
+
+const BOT_ID =
+    String(BOT_ID_RAW || BOT_ID_NUMBER);
+const BOT_LABEL = `Bot ${BOT_ID}`;
+
 const MAX_LOGS = 100;
 const RECONNECT_DELAY = 3000;
 const STATUS_POLL_MS = 1000;
@@ -35,6 +48,24 @@ const CHECK_TIMEOUT_INTERVAL = Number(
 );
 
 app.use(express.json({ limit: '8kb' }));
+
+// API responses should not be cached. The central dashboard communicates
+// with child bots server-to-server, so wildcard CORS is intentionally disabled.
+app.use((req, res, next) => {
+    if (req.path.startsWith('/api/') || req.path === '/health') {
+        res.setHeader(
+            'Cache-Control',
+            'no-store, no-cache, must-revalidate, proxy-revalidate'
+        );
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+    }
+
+    res.setHeader('X-Bot-ID', BOT_ID);
+    res.setHeader('X-Bot-Protocol', '2');
+
+    next();
+});
 
 function cleanMinecraftText(text) {
     if (!text) return '';
@@ -70,7 +101,8 @@ function createBotState() {
     const credentials = getEnvCredentials();
 
     return {
-        id: 1,
+        id: BOT_ID_NUMBER,
+        botId: BOT_ID,
 
         username: credentials.username,
         password: credentials.password,
@@ -88,6 +120,7 @@ function createBotState() {
         afkElapsedSeconds: 0,
         afkStartedAt: null,
         reconnectCount: 0,
+        reconnectAttempts: 0,
 
         reconnectTimer: null,
         afkTimers: [],
@@ -163,18 +196,42 @@ function addLog(state, message) {
 }
 
 
-function addChatLog(state, username, message) {
+function addChatLog(
+    state,
+    username,
+    message,
+    role = ''
+) {
     const time = new Date().toLocaleTimeString('vi-VN', {
         timeZone: 'Asia/Ho_Chi_Minh',
         hour12: false
     });
 
-    const cleanMessage = cleanMinecraftText(message);
-    const cleanUsername = cleanMinecraftText(username);
+    const cleanMessage =
+        cleanMinecraftText(message);
 
-    const line = cleanUsername
-        ? `${time} <${cleanUsername}> ${cleanMessage}`
-        : `${time} ${cleanMessage}`;
+    const cleanUsername =
+        cleanMinecraftText(username);
+
+    const cleanRole =
+        cleanMinecraftText(role);
+
+    if (!cleanMessage) {
+        return;
+    }
+
+    let line;
+
+    if (cleanRole && cleanUsername) {
+        line =
+            `${time} ${cleanRole}| ${cleanUsername}: ${cleanMessage}`;
+    } else if (cleanUsername) {
+        line =
+            `${time} <${cleanUsername}> ${cleanMessage}`;
+    } else {
+        line =
+            `${time} ${cleanMessage}`;
+    }
 
     state.chatLogs.push(line);
     state.chatLogRevision++;
@@ -187,8 +244,11 @@ function addChatLog(state, username, message) {
     }
 
     state.recentChatMessages.push({
-        text: cleanMinecraftText(message),
-        rawText: cleanMinecraftText(message),
+        key:
+            `${cleanRole}|${cleanUsername}|${cleanMessage}`,
+        role: cleanRole,
+        username: cleanUsername,
+        text: cleanMessage,
         at: Date.now()
     });
 
@@ -199,11 +259,21 @@ function addChatLog(state, username, message) {
         );
     }
 
-    console.log(`[BOT ${state.id}] [CHAT] ${line}`);
+    console.log(
+        `[BOT ${state.id}] [CHAT] ${line}`
+    );
 }
 
-function isRecentChatMessage(state, cleanMsg) {
+function isRecentChatMessage(
+    state,
+    cleanMsg,
+    username = '',
+    role = ''
+) {
     const now = Date.now();
+    const wantedText = cleanMinecraftText(cleanMsg);
+    const wantedUsername = cleanMinecraftText(username);
+    const wantedRole = cleanMinecraftText(role);
 
     state.recentChatMessages =
         state.recentChatMessages.filter(
@@ -211,10 +281,70 @@ function isRecentChatMessage(state, cleanMsg) {
         );
 
     return state.recentChatMessages.some(
-        entry =>
-            entry.text === cleanMsg ||
-            cleanMsg.endsWith(entry.text)
+        entry => {
+            if (entry.text !== wantedText) {
+                return false;
+            }
+
+            if (
+                wantedUsername &&
+                entry.username &&
+                entry.username !== wantedUsername
+            ) {
+                return false;
+            }
+
+            if (
+                wantedRole &&
+                entry.role &&
+                entry.role !== wantedRole
+            ) {
+                return false;
+            }
+
+            return true;
+        }
     );
+}
+
+function parseCustomChatLine(cleanMsg) {
+    const candidate =
+        cleanMsg.replace(
+            /^\[MC\]\s*/i,
+            ''
+        );
+
+    const match =
+        candidate.match(
+            /^(.+?)\|\s*([A-Za-z0-9_]{1,16})\s*:\s*(.+)$/u
+        );
+
+    if (!match) {
+        return null;
+    }
+
+    const role =
+        cleanMinecraftText(match[1]);
+
+    const username =
+        cleanMinecraftText(match[2]);
+
+    const message =
+        cleanMinecraftText(match[3]);
+
+    if (
+        !role ||
+        !username ||
+        !message
+    ) {
+        return null;
+    }
+
+    return {
+        role,
+        username,
+        message
+    };
 }
 
 function clearAfkTimers(state) {
@@ -260,9 +390,8 @@ function clearAllTimers(state) {
 
 const FOOD_PRIORITY = [
     'golden_apple',
-    'steak',
-    'cooked_porkchop',
     'cooked_beef',
+    'cooked_porkchop',
     'cooked_chicken',
     'baked_potato',
     'bread',
@@ -457,57 +586,138 @@ function buildSlotState(slots) {
     return slotState;
 }
 
-function logInventoryDifferences(state, previous, next) {
+function buildInventorySnapshot(
+    nextState
+) {
+    const slotSignatures = {};
+    const slotSummaries = {};
+
+    const slots =
+        nextState.slots || {};
+
+    for (
+        let slot = 5;
+        slot <= 45;
+        slot++
+    ) {
+        const key = String(slot);
+        const item =
+            slots[key] || null;
+
+        slotSignatures[key] =
+            itemSignature(item);
+
+        slotSummaries[key] =
+            itemSummary(item);
+    }
+
+    return {
+        health:
+            Number(nextState.health ?? 20),
+        food:
+            Number(nextState.food ?? 20),
+        saturation:
+            Number(nextState.saturation ?? 20),
+        foodCount:
+            Number(nextState.foodCount ?? 0),
+        goldenAppleCount:
+            Number(nextState.goldenAppleCount ?? 0),
+        totemCount:
+            Number(nextState.totemCount ?? 0),
+        selectedSlot:
+            Number(nextState.selectedSlot ?? 0),
+        slotSignatures,
+        slotSummaries
+    };
+}
+
+function countSlotChanges(
+    previous,
+    next,
+    start,
+    end
+) {
+    let count = 0;
+
+    const previousSignatures =
+        previous?.slotSignatures || {};
+
+    const nextSignatures =
+        next?.slotSignatures || {};
+
+    for (
+        let slot = start;
+        slot <= end;
+        slot++
+    ) {
+        const key = String(slot);
+
+        if (
+            previousSignatures[key] !==
+            nextSignatures[key]
+        ) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+function logInventoryDifferences(
+    state,
+    previous,
+    next
+) {
     if (!previous) {
         addLog(
             state,
-            '[INV] Inventory đã đồng bộ.'
+            '[INV] Inventory đã đồng bộ lần đầu.'
         );
         return;
     }
 
     const previousHealth =
         Number(previous.health ?? 20);
+
     const nextHealth =
         Number(next.health ?? 20);
 
-    if (previousHealth !== nextHealth) {
+    if (
+        previousHealth !==
+        nextHealth
+    ) {
         addLog(
             state,
-            `[HEALTH] ${previousHealth} → ${nextHealth}.`
+            `[HEALTH] ${previousHealth} → ${nextHealth} HP.`
         );
     }
 
     const previousFood =
         Number(previous.food ?? 20);
+
     const nextFood =
         Number(next.food ?? 20);
 
-    if (previousFood !== nextFood) {
+    if (
+        previousFood !==
+        nextFood
+    ) {
         addLog(
             state,
             `[FOOD] Hunger ${previousFood} → ${nextFood}.`
         );
     }
 
-    const previousSaturation =
-        Number(previous.saturation ?? 20);
-    const nextSaturation =
-        Number(next.saturation ?? 20);
-
-    if (previousSaturation !== nextSaturation) {
-        addLog(
-            state,
-            `[FOOD] Saturation ${previousSaturation} → ${nextSaturation}.`
-        );
-    }
-
     const previousFoodCount =
         Number(previous.foodCount ?? 0);
+
     const nextFoodCount =
         Number(next.foodCount ?? 0);
 
-    if (previousFoodCount !== nextFoodCount) {
+    if (
+        previousFoodCount !==
+        nextFoodCount
+    ) {
         addLog(
             state,
             `[INV] Tổng thức ăn ${previousFoodCount} → ${nextFoodCount}.`
@@ -516,10 +726,14 @@ function logInventoryDifferences(state, previous, next) {
 
     const previousGolden =
         Number(previous.goldenAppleCount ?? 0);
+
     const nextGolden =
         Number(next.goldenAppleCount ?? 0);
 
-    if (previousGolden !== nextGolden) {
+    if (
+        previousGolden !==
+        nextGolden
+    ) {
         addLog(
             state,
             `[INV] Golden Apple ${previousGolden} → ${nextGolden}.`
@@ -528,10 +742,14 @@ function logInventoryDifferences(state, previous, next) {
 
     const previousTotem =
         Number(previous.totemCount ?? 0);
+
     const nextTotem =
         Number(next.totemCount ?? 0);
 
-    if (previousTotem !== nextTotem) {
+    if (
+        previousTotem !==
+        nextTotem
+    ) {
         addLog(
             state,
             `[TOTEM] Số Totem ${previousTotem} → ${nextTotem}.`
@@ -540,66 +758,127 @@ function logInventoryDifferences(state, previous, next) {
 
     const previousSelected =
         Number(previous.selectedSlot ?? 0);
+
     const nextSelected =
         Number(next.selectedSlot ?? 0);
 
-    if (previousSelected !== nextSelected) {
+    if (
+        previousSelected !==
+        nextSelected
+    ) {
         addLog(
             state,
             `[HOTBAR] Selected slot ${previousSelected + 1} → ${nextSelected + 1}.`
         );
     }
 
-    const previousSlots =
-        previous.slots || {};
-    const nextSlots =
-        next.slots || {};
+    const inventoryChanges =
+        countSlotChanges(
+            previous,
+            next,
+            9,
+            35
+        );
 
-    for (let slot = 5; slot <= 45; slot++) {
-        const key = String(slot);
+    const hotbarChanges =
+        countSlotChanges(
+            previous,
+            next,
+            36,
+            44
+        );
 
-        const previousItem =
-            previousSlots[key] || null;
+    const equipmentChanges =
+        countSlotChanges(
+            previous,
+            next,
+            5,
+            8
+        );
 
-        const nextItem =
-            nextSlots[key] || null;
+    const previousOffhand =
+        previous?.slotSignatures?.['45'] ||
+        'empty';
 
-        if (
-            itemSignature(previousItem) ===
-            itemSignature(nextItem)
-        ) {
-            continue;
-        }
+    const nextOffhand =
+        next?.slotSignatures?.['45'] ||
+        'empty';
 
+    if (
+        inventoryChanges > 0
+    ) {
+        addLog(
+            state,
+            `[INV] Inventory cập nhật: ${inventoryChanges} ô thay đổi.`
+        );
+    }
+
+    if (
+        hotbarChanges > 0
+    ) {
+        addLog(
+            state,
+            `[HOTBAR] Hotbar cập nhật: ${hotbarChanges} ô thay đổi.`
+        );
+    }
+
+    if (
+        equipmentChanges > 0
+    ) {
+        addLog(
+            state,
+            `[EQUIP] Trang bị cập nhật: ${equipmentChanges} ô thay đổi.`
+        );
+    }
+
+    if (
+        previousOffhand !==
+        nextOffhand
+    ) {
         const oldText =
-            itemSummary(previousItem);
+            previous?.slotSummaries?.['45'] ||
+            'empty';
 
         const newText =
-            itemSummary(nextItem);
+            next?.slotSummaries?.['45'] ||
+            'empty';
 
-        const label =
-            getSlotLabel(slot);
-
-        if (slot >= 5 && slot <= 8) {
-            addLog(
-                state,
-                `[EQUIP] ${label}: ${oldText} → ${newText}.`
-            );
-        } else if (slot === 45) {
-            addLog(
-                state,
-                `[EQUIP] Offhand: ${oldText} → ${newText}.`
-            );
-        } else {
-            addLog(
-                state,
-                `[INV] ${label}: ${oldText} → ${newText}.`
-            );
-        }
+        addLog(
+            state,
+            `[EQUIP] Offhand: ${oldText} → ${newText}.`
+        );
     }
 }
 
-function scanInventory(state, bot = state.bot, forceLog = false) {
+function buildInventorySignature(
+    snapshot
+) {
+    const slotSignatures =
+        snapshot.slotSignatures || {};
+
+    const slotParts = [];
+
+    for (
+        let slot = 5;
+        slot <= 45;
+        slot++
+    ) {
+        slotParts.push(
+            `${slot}:${slotSignatures[String(slot)] || 'empty'}`
+        );
+    }
+
+    return [
+        snapshot.selectedSlot,
+        slotParts.join(';')
+    ].join('|');
+}
+
+function scanInventory(
+    state,
+    bot = state.bot,
+    forceLog = false
+) {
     if (
         !bot ||
         state.bot !== bot ||
@@ -615,11 +894,9 @@ function scanInventory(state, bot = state.bot, forceLog = false) {
     const allMainItems = [];
 
     for (let slot = 9; slot <= 35; slot++) {
-        const item = slots[slot];
-
         allMainItems.push(
             itemToInventoryData(
-                item || null,
+                slots[slot] || null,
                 slot
             )
         );
@@ -629,41 +906,22 @@ function scanInventory(state, bot = state.bot, forceLog = false) {
 
     for (let quickSlot = 0; quickSlot < 9; quickSlot++) {
         const inventorySlot = 36 + quickSlot;
-        const item = slots[inventorySlot];
-
         hotbar.push(
             itemToInventoryData(
-                item || null,
+                slots[inventorySlot] || null,
                 inventorySlot
             )
         );
     }
 
     const armor = {
-        head:
-            itemToInventoryData(
-                slots[5] || null,
-                5
-            ),
-        torso:
-            itemToInventoryData(
-                slots[6] || null,
-                6
-            ),
-        legs:
-            itemToInventoryData(
-                slots[7] || null,
-                7
-            ),
-        feet:
-            itemToInventoryData(
-                slots[8] || null,
-                8
-            )
+        head: itemToInventoryData(slots[5] || null, 5),
+        torso: itemToInventoryData(slots[6] || null, 6),
+        legs: itemToInventoryData(slots[7] || null, 7),
+        feet: itemToInventoryData(slots[8] || null, 8)
     };
 
-    const offhandItem =
-        slots[offhandSlot] || null;
+    const offhandItem = slots[offhandSlot] || null;
 
     let foodCount = 0;
     let goldenAppleCount = 0;
@@ -696,80 +954,73 @@ function scanInventory(state, bot = state.bot, forceLog = false) {
             ? bot.quickBarSlot
             : 0;
 
-    const slotState =
-        buildSlotState(slots);
-
     const nextState = {
-        revision: state.inventoryRevision || 0,
-        health:
-            Number.isFinite(bot.health)
-                ? Math.max(0, Math.min(Number(bot.health), 20))
-                : 20,
-        food:
-            Number.isFinite(bot.food)
-                ? Math.max(0, Math.min(Number(bot.food), 20))
-                : 20,
-        saturation:
-            Number.isFinite(bot.foodSaturation)
-                ? Math.max(0, Number(bot.foodSaturation))
-                : 20,
+        revision: state.inventoryRevision,
+        health: Number.isFinite(bot.health)
+            ? Math.max(0, Math.min(Number(bot.health), 20))
+            : 20,
+        food: Number.isFinite(bot.food)
+            ? Math.max(0, Math.min(Number(bot.food), 20))
+            : 20,
+        saturation: Number.isFinite(bot.foodSaturation)
+            ? Math.max(0, Number(bot.foodSaturation))
+            : 20,
         foodCount,
         goldenAppleCount,
         totemCount,
-        offhand:
-            offhandItem && offhandItem.name
-                ? offhandItem.name
-                : null,
+        offhand: offhandItem && offhandItem.name
+            ? offhandItem.name
+            : null,
         selectedHotbar: selectedSlot,
         selectedSlot,
         armor,
         hotbar,
         inventory: allMainItems,
-        slots: slotState
+        slots: buildSlotState(slots)
     };
 
-    const signature = JSON.stringify(nextState);
-    const previous =
-        state.previousInventorySnapshot;
+    const nextSnapshot = buildInventorySnapshot(nextState);
+    const previous = state.previousInventorySnapshot;
 
-    const changed =
-        signature !== state.inventoryLogSignature;
+    const nextSignature = buildInventorySignature(nextSnapshot);
+    const previousSignature = previous
+        ? buildInventorySignature(previous)
+        : '';
 
-    if (changed) {
+    const slotOrSelectionChanged =
+        !previous ||
+        previousSignature !== nextSignature;
+
+    const displayStateChanged =
+        !previous ||
+        previous.health !== nextSnapshot.health ||
+        previous.food !== nextSnapshot.food ||
+        previous.saturation !== nextSnapshot.saturation;
+
+    if (slotOrSelectionChanged) {
         state.inventoryRevision++;
-        nextState.revision =
-            state.inventoryRevision;
+        nextState.revision = state.inventoryRevision;
+    } else {
+        nextState.revision = state.inventoryRevision;
+    }
 
-        state.inventoryState =
-            nextState;
+    state.inventoryState = nextState;
 
+    if (slotOrSelectionChanged || displayStateChanged) {
         logInventoryDifferences(
             state,
             previous,
-            nextState
+            nextSnapshot
         );
-
-        state.inventoryLogSignature =
-            JSON.stringify(nextState);
-
-        state.previousInventorySnapshot =
-            JSON.parse(
-                JSON.stringify(nextState)
-            );
-    } else {
-        nextState.revision =
-            state.inventoryRevision;
-
-        state.inventoryState.revision =
-            state.inventoryRevision;
-    }
-
-    if (forceLog && !changed) {
+    } else if (forceLog) {
         addLog(
             state,
             '[INV] Inventory đã đồng bộ.'
         );
     }
+
+    state.inventoryLogSignature = nextSignature;
+    state.previousInventorySnapshot = nextSnapshot;
 
     return true;
 }
@@ -842,7 +1093,8 @@ async function autoEatTick(state) {
         state.status === 'offline' ||
         state.status === 'connecting' ||
         state.status === 'authenticating' ||
-        state.status === 'entering'
+        state.status === 'entering' ||
+        state.status === 'kicked'
     ) {
         return;
     }
@@ -1029,7 +1281,8 @@ async function autoTotemTick(state) {
         state.status === 'offline' ||
         state.status === 'connecting' ||
         state.status === 'authenticating' ||
-        state.status === 'entering'
+        state.status === 'entering' ||
+        state.status === 'kicked'
     ) {
         return;
     }
@@ -1373,9 +1626,58 @@ function formatUptime(state) {
     );
 }
 
+function getBotPosition(state) {
+    if (
+        !state.bot ||
+        !state.bot.entity ||
+        !state.bot.entity.position
+    ) {
+        return null;
+    }
+
+    const position =
+        state.bot.entity.position;
+
+    const x = Number(position.x);
+    const y = Number(position.y);
+    const z = Number(position.z);
+
+    if (
+        !Number.isFinite(x) ||
+        !Number.isFinite(y) ||
+        !Number.isFinite(z)
+    ) {
+        return null;
+    }
+
+    return {
+        x: Number(x.toFixed(2)),
+        y: Number(y.toFixed(2)),
+        z: Number(z.toFixed(2))
+    };
+}
+
+function getBotDimension(state) {
+    if (!state.bot) {
+        return null;
+    }
+
+    if (
+        typeof state.bot.game?.dimension ===
+        'string'
+    ) {
+        return state.bot.game.dimension;
+    }
+
+    return null;
+}
+
 function publicBotState(state) {
     return {
         id: state.id,
+        botId: BOT_ID,
+        nodeId: BOT_ID,
+        label: BOT_LABEL,
         username: state.username || '',
         status: state.status,
         ready: state.ready,
@@ -1399,8 +1701,35 @@ function publicBotState(state) {
             state.logRevision,
 
         chatLogRevision:
-            state.chatLogRevision
+            state.chatLogRevision,
+
+        position:
+            getBotPosition(state),
+
+        dimension:
+            getBotDimension(state)
     };
+}
+
+function getReconnectDelay(state) {
+    const attempt =
+        Math.max(
+            Number(state.reconnectAttempts || 0),
+            0
+        );
+
+    const multiplier =
+        Math.min(
+            Math.pow(1.5, attempt),
+            5
+        );
+
+    return Math.min(
+        Math.round(
+            RECONNECT_DELAY * multiplier
+        ),
+        15000
+    );
 }
 
 function scheduleReconnect(state) {
@@ -1416,17 +1745,22 @@ function scheduleReconnect(state) {
     state.ready = false;
     setBotStatus(state, 'connecting');
 
+    const reconnectDelay =
+        getReconnectDelay(state);
+
+    state.reconnectAttempts++;
+
     state.reconnectTimer = setTimeout(() => {
         state.reconnectTimer = null;
 
         if (!state.manuallyStopped) {
             connectBot(state);
         }
-    }, RECONNECT_DELAY);
+    }, reconnectDelay);
 
     addLog(
         state,
-        `Sẽ reconnect sau ${RECONNECT_DELAY / 1000}s.`
+        `Sẽ reconnect sau ${reconnectDelay / 1000}s.`
     );
 }
 
@@ -1500,6 +1834,7 @@ function startBot(state) {
     state.hostIndex = 0;
     state.ready = false;
     state.connectedAt = null;
+    state.reconnectAttempts = 0;
     setBotStatus(state, 'connecting');
 
     if (state.bot) {
@@ -1540,43 +1875,22 @@ function registerEvents(state, bot) {
             return;
         }
 
+        if (
+            isRecentChatMessage(
+                state,
+                cleanMessage,
+                username,
+                ''
+            )
+        ) {
+            return;
+        }
+
         addChatLog(
             state,
             username,
             cleanMessage
         );
-    });
-
-    bot.on('heldItemChanged', newItem => {
-        if (state.bot !== bot) {
-            return;
-        }
-
-        addLog(
-            state,
-            `[HOTBAR] Held item: ${newItem ? itemSummary(newItem) : 'empty'}.`
-        );
-    });
-
-    bot.on('health', () => {
-        if (
-            state.bot === bot &&
-            Number.isFinite(bot.health)
-        ) {
-            addLog(
-                state,
-                `[HEALTH] ${Number(bot.health)} HP.`
-            );
-        }
-    });
-
-    bot.on('death', () => {
-        if (state.bot === bot) {
-            addLog(
-                state,
-                '[LIFE] Bot đã chết.'
-            );
-        }
     });
 
     bot.on('error', err => {
@@ -1594,6 +1908,7 @@ function registerEvents(state, bot) {
 
         setBotStatus(state, 'kicked');
         state.ready = false;
+        clearManagerTimers(state);
 
         addLog(
             state,
@@ -1602,9 +1917,13 @@ function registerEvents(state, bot) {
     });
 
     bot.on('end', () => {
-        if (state.bot === bot) {
+        const isCurrentBot = state.bot === bot;
+
+        if (isCurrentBot) {
             state.bot = null;
         }
+
+        clearManagerTimers(state);
 
         state.ready = false;
         state.connectedAt = null;
@@ -1649,11 +1968,21 @@ function registerEvents(state, bot) {
         setBotStatus(state, 'online');
         state.ready = false;
         state.connectedAt = Date.now();
+        state.reconnectAttempts = 0;
 
         startBackgroundManagers(
             state,
             bot
         );
+    });
+
+    bot.on('death', () => {
+        if (state.bot === bot) {
+            addLog(
+                state,
+                '[LIFE] Bot đã chết.'
+            );
+        }
     });
 
     bot.on('message', jsonMsg => {
@@ -1785,6 +2114,37 @@ function handleServerMessage(
     const lowerMsg =
         cleanMsg.toLowerCase();
 
+    const customChat =
+        parseCustomChatLine(
+            cleanMsg
+        );
+
+    const customChatIsOwnRecentWebMessage =
+        !!(
+            customChat &&
+            customChat.username === bot.username &&
+            cleanMinecraftText(state.lastWebChatText) === customChat.message &&
+            Date.now() - state.lastWebChatAt <= 2500
+        );
+
+    if (
+        customChat &&
+        !customChatIsOwnRecentWebMessage &&
+        !isRecentChatMessage(
+            state,
+            customChat.message,
+            customChat.username,
+            customChat.role
+        )
+    ) {
+        addChatLog(
+            state,
+            customChat.username,
+            customChat.message,
+            customChat.role
+        );
+    }
+
     // Giữ toàn bộ [MC] message trên web,
     // chỉ bỏ những message spam/không cần thiết.
     const blockedMcLogPatterns = [
@@ -1821,7 +2181,11 @@ function handleServerMessage(
 
     if (
         shouldShowMcLog &&
-        !isRecentChatMessage(state, cleanMsg) &&
+        !customChat &&
+        !isRecentChatMessage(
+            state,
+            cleanMsg
+        ) &&
         !(
             /^<[^>]{1,32}>\s/.test(cleanMsg) ||
             /^\[[^\]]{1,24}\]\s*\S{1,32}\s*[>:»]\s*/.test(cleanMsg) ||
@@ -2548,6 +2912,33 @@ label{
    font-size:10px
 }
 
+.drop-zone{
+   margin-top:12px;
+   min-height:48px;
+   border:1px dashed var(--border);
+   border-radius:10px;
+   background:#0d1319;
+   color:var(--muted);
+   display:flex;
+   align-items:center;
+   justify-content:center;
+   text-align:center;
+   padding:10px;
+   transition:
+      border-color .15s ease,
+      background .15s ease
+}
+
+.drop-zone.dragover{
+   border-color:var(--red);
+   background:#241416;
+   color:var(--text)
+}
+
+.position-value{
+   font-variant-numeric:tabular-nums
+}
+
 @media(max-width:520px){
    .inventory-grid{
      grid-template-columns:1fr
@@ -2580,7 +2971,7 @@ label{
         id="detailTitle"
         class="detail-title"
       >
-        BOT 1
+        ${BOT_LABEL}
       </div>
 
       <div
@@ -2668,6 +3059,32 @@ label{
             class="info-value"
           >
             0
+          </div>
+        </div>
+
+        <div class="info-item">
+          <div class="info-label">
+            COORDINATES
+          </div>
+
+          <div
+            id="detailPosition"
+            class="info-value position-value"
+          >
+            -
+          </div>
+        </div>
+
+        <div class="info-item">
+          <div class="info-label">
+            DIMENSION
+          </div>
+
+          <div
+            id="detailDimension"
+            class="info-value"
+          >
+            -
           </div>
         </div>
       </div>
@@ -2803,6 +3220,8 @@ label{
         <div
           class="equipment-slot"
           data-destination="head"
+          draggable="true"
+          ondragstart="startEquipmentDrag(event,'head')"
           ondragover="allowDrop(event)"
           ondragleave="clearDragOver(event)"
           ondrop="dropEquip(event,'head')"
@@ -2815,6 +3234,8 @@ label{
         <div
           class="equipment-slot"
           data-destination="torso"
+          draggable="true"
+          ondragstart="startEquipmentDrag(event,'torso')"
           ondragover="allowDrop(event)"
           ondragleave="clearDragOver(event)"
           ondrop="dropEquip(event,'torso')"
@@ -2827,6 +3248,8 @@ label{
         <div
           class="equipment-slot"
           data-destination="legs"
+          draggable="true"
+          ondragstart="startEquipmentDrag(event,'legs')"
           ondragover="allowDrop(event)"
           ondragleave="clearDragOver(event)"
           ondrop="dropEquip(event,'legs')"
@@ -2839,6 +3262,8 @@ label{
         <div
           class="equipment-slot"
           data-destination="feet"
+          draggable="true"
+          ondragstart="startEquipmentDrag(event,'feet')"
           ondragover="allowDrop(event)"
           ondragleave="clearDragOver(event)"
           ondrop="dropEquip(event,'feet')"
@@ -2851,6 +3276,8 @@ label{
         <div
           class="equipment-slot"
           data-destination="off-hand"
+          draggable="true"
+          ondragstart="startEquipmentDrag(event,'off-hand')"
           ondragover="allowDrop(event)"
           ondragleave="clearDragOver(event)"
           ondrop="dropEquip(event,'off-hand')"
@@ -2867,6 +3294,16 @@ label{
 
       <div class="info-label" style="margin-top:12px;">HOTBAR 9 SLOTS</div>
       <div id="inventoryHotbar" class="slot-grid inventory-area"></div>
+
+      <div
+        id="dropZone"
+        class="drop-zone"
+        ondragover="allowDrop(event)"
+        ondragleave="clearDragOver(event)"
+        ondrop="dropItemToWorld(event)"
+      >
+        Kéo item vào đây để vứt
+      </div>
 
       <div class="note">
         Kéo-thả item để di chuyển. Kéo item vào Head/Chest/Legs/Feet/Offhand để trang bị.
@@ -2949,6 +3386,7 @@ let uptimeSyncAt = Date.now();
 
 let draggedSlot = null;
 let inventoryActionInFlight = false;
+let refreshInFlight = false;
 
 function statusMeta(status) {
 
@@ -3360,6 +3798,42 @@ function renderInventory() {
   }
 }
 
+function startEquipmentDrag(event, destination) {
+  const slotMap = {
+    head: 5,
+    torso: 6,
+    legs: 7,
+    feet: 8,
+    'off-hand': 45
+  };
+
+  const slot = slotMap[destination];
+
+  if (!Number.isInteger(slot)) {
+    return;
+  }
+
+  draggedSlot = slot;
+
+  try {
+    event.dataTransfer.setData(
+      'text/plain',
+      String(slot)
+    );
+    event.dataTransfer.effectAllowed = 'move';
+  } catch (_) {
+  }
+}
+
+function equipmentDestinationFromSlot(slot) {
+  if (slot === 5) return 'head';
+  if (slot === 6) return 'torso';
+  if (slot === 7) return 'legs';
+  if (slot === 8) return 'feet';
+  if (slot === 45) return 'off-hand';
+  return null;
+}
+
 function allowDrop(event) {
 
   event.preventDefault();
@@ -3430,10 +3904,132 @@ async function dropInventory(
     return;
   }
 
+  const equipmentDestination =
+    equipmentDestinationFromSlot(sourceSlot);
+
+  if (equipmentDestination) {
+    await unequipEquipment(
+      equipmentDestination
+    );
+    return;
+  }
+
   await moveInventoryItem(
     sourceSlot,
     destinationSlot
   );
+}
+
+async function dropItemToWorld(
+  event
+) {
+  event.preventDefault();
+
+  clearDragOver(event);
+
+  let sourceSlot =
+    draggedSlot;
+
+  try {
+    const fromData =
+      event.dataTransfer.getData(
+        'text/plain'
+      );
+
+    if (
+      fromData !== ''
+    ) {
+      sourceSlot =
+        Number(fromData);
+    }
+  } catch (_) {
+  }
+
+  draggedSlot = null;
+
+  if (
+    !Number.isInteger(sourceSlot)
+  ) {
+    return;
+  }
+
+  await dropInventoryItem(
+    sourceSlot
+  );
+}
+
+async function dropInventoryItem(
+  sourceSlot
+) {
+  if (
+    inventoryActionInFlight
+  ) {
+    showToast(
+      'Đang thực hiện thao tác inventory khác.'
+    );
+    return;
+  }
+
+  if (!inventory) {
+    return;
+  }
+
+  inventoryActionInFlight = true;
+
+  try {
+    const response =
+      await fetch(
+        '/api/inventory/drop',
+        {
+          method: 'POST',
+
+          headers: {
+            'Content-Type':
+              'application/json'
+          },
+
+          body: JSON.stringify({
+            sourceSlot,
+            revision:
+              inventory.revision
+          })
+        }
+      );
+
+    const data =
+      await response.json();
+
+    if (
+      data.inventory
+    ) {
+      inventory =
+        data.inventory;
+
+      renderInventory();
+    }
+
+    if (!response.ok) {
+      showToast(
+        data.error ||
+        'Không thể vứt item.'
+      );
+
+      await refreshInventoryOnly();
+      return;
+    }
+
+    showToast(
+      data.message ||
+      'Đã vứt item.'
+    );
+  } catch (_) {
+    showToast(
+      'Không thể kết nối tới server web.'
+    );
+  } finally {
+    inventoryActionInFlight =
+      false;
+  }
 }
 
 async function moveInventoryItem(
@@ -3923,6 +4519,38 @@ function renderDetail() {
         bot.reconnectCount ?? 0
       );
 
+  const positionElement =
+    document.getElementById(
+      'detailPosition'
+    );
+
+  if (positionElement) {
+    const position =
+      bot.position;
+
+    positionElement.textContent =
+      position &&
+      Number.isFinite(position.x) &&
+      Number.isFinite(position.y) &&
+      Number.isFinite(position.z)
+        ? String(position.x.toFixed(2)) +
+          ' ' +
+          String(position.y.toFixed(2)) +
+          ' ' +
+          String(position.z.toFixed(2))
+        : '-';
+  }
+
+  const dimensionElement =
+    document.getElementById(
+      'detailDimension'
+    );
+
+  if (dimensionElement) {
+    dimensionElement.textContent =
+      bot.dimension || '-';
+  }
+
   document
     .getElementById(
       'startButton'
@@ -4181,6 +4809,12 @@ function escapeHtml(value) {
 
 async function refresh() {
 
+  if (refreshInFlight) {
+    return;
+  }
+
+  refreshInFlight = true;
+
   try {
 
     await getBot();
@@ -4197,6 +4831,9 @@ async function refresh() {
 
   } catch (_) {
 
+  } finally {
+
+    refreshInFlight = false;
   }
 }
 
@@ -4509,6 +5146,42 @@ setInterval(
 </html>`;
 
 // -----------------------------------------------------------------------------
+// API: node identity / central dashboard capability discovery
+// -----------------------------------------------------------------------------
+
+app.get(
+    '/api/node',
+    (req, res) => {
+        res.json({
+            ok: true,
+            botId: BOT_ID,
+            id: BOT_ID_NUMBER,
+            label: BOT_LABEL,
+            protocol: 2,
+            api: {
+                status: '/api/bot',
+                node: '/api/node',
+                eventLogs: '/api/bot/logs',
+                chatLogs: '/api/bot/chat-logs',
+                inventory: '/api/inventory',
+                health: '/health',
+                lightweightStatus: '/api/status',
+                start: '/api/bot/start',
+                stop: '/api/bot/stop',
+                restart: '/api/bot/restart',
+                send: '/api/bot/send',
+                account: '/api/bot/account',
+                moveInventory: '/api/inventory/move',
+                equip: '/api/inventory/equip',
+                unequip: '/api/inventory/unequip',
+                selectHotbar: '/api/inventory/select',
+                dropInventory: '/api/inventory/drop'
+            }
+        });
+    }
+);
+
+// -----------------------------------------------------------------------------
 // API: current bot state
 // -----------------------------------------------------------------------------
 
@@ -4579,7 +5252,7 @@ app.post(
             return res.json({
                 ok: true,
                 message:
-                    'Bot 1 đang chạy.'
+                    `${BOT_LABEL} đang chạy.`
             });
         }
 
@@ -4590,7 +5263,7 @@ app.post(
         res.json({
             ok: true,
             message:
-                'Đã chạy Bot 1.'
+                `${BOT_LABEL} đã chạy.`
         });
     }
 );
@@ -4610,7 +5283,7 @@ app.post(
         res.json({
             ok: true,
             message:
-                'Đã dừng Bot 1.'
+                `${BOT_LABEL} đã dừng.`
         });
     }
 );
@@ -4648,21 +5321,26 @@ app.post(
             'Restart from web panel'
         );
 
-        setTimeout(() => {
+        const restartTimer =
+            setTimeout(() => {
 
-            botState.manuallyStopped =
-                false;
+                botState.manuallyStopped =
+                    false;
 
-            startBot(
-                botState
-            );
+                startBot(
+                    botState
+                );
 
-        }, 500);
+            }, 500);
+
+        botState.afkTimers.push(
+            restartTimer
+        );
 
         res.json({
             ok: true,
             message:
-                'Đã chạy lại Bot 1 từ đầu.'
+                `${BOT_LABEL} đã chạy lại từ đầu.`
         });
     }
 );
@@ -4697,7 +5375,7 @@ app.post(
 
             return res.status(409).json({
                 error:
-                    'Bot 1 chưa online.'
+                    `${BOT_LABEL} chưa online.`
             });
 
         }
@@ -4795,17 +5473,6 @@ app.post(
 // Inventory API
 // -----------------------------------------------------------------------------
 
-app.get(
-    '/api/inventory',
-    (req, res) => {
-        res.json(
-            publicInventoryState(
-                botState
-            )
-        );
-    }
-);
-
 // -----------------------------------------------------------------------------
 // Inventory manager helpers
 // -----------------------------------------------------------------------------
@@ -4842,13 +5509,31 @@ function canUseInventoryAction(state) {
         state.status !== 'offline' &&
         state.status !== 'connecting' &&
         state.status !== 'authenticating' &&
-        state.status !== 'entering'
+        state.status !== 'entering' &&
+        state.status !== 'kicked'
     );
 }
 
 async function finishInventoryAction(state, bot) {
     await new Promise(
-        resolve => setTimeout(resolve, 75)
+        resolve => setTimeout(resolve, 120)
+    );
+
+    if (
+        state.bot !== bot ||
+        state.manuallyStopped
+    ) {
+        return;
+    }
+
+    scanInventory(
+        state,
+        bot,
+        false
+    );
+
+    await new Promise(
+        resolve => setTimeout(resolve, 80)
     );
 
     if (
@@ -4866,14 +5551,6 @@ async function finishInventoryAction(state, bot) {
 app.get(
     '/api/inventory',
     (req, res) => {
-        if (botState.bot) {
-            scanInventory(
-                botState,
-                botState.bot,
-                false
-            );
-        }
-
         res.json(
             publicInventoryState(
                 botState
@@ -5186,7 +5863,9 @@ app.post(
         ];
 
         if (
-            !validDestinations.includes(destination)
+            !validDestinations.includes(
+                destination
+            )
         ) {
             return res.status(400).json({
                 error:
@@ -5222,7 +5901,9 @@ app.post(
         }
 
         if (
-            !canUseInventoryAction(botState)
+            !canUseInventoryAction(
+                botState
+            )
         ) {
             return res.status(409).json({
                 error:
@@ -5233,26 +5914,90 @@ app.post(
         const bot =
             botState.bot;
 
-        if (
-            typeof bot.unequip !== 'function'
-        ) {
-            return res.status(501).json({
+        const destinationSlotMap = {
+            head: 5,
+            torso: 6,
+            legs: 7,
+            feet: 8,
+            'off-hand':
+                getOffhandSlot(bot)
+        };
+
+        const sourceSlot =
+            destinationSlotMap[destination];
+
+        const equippedItem =
+            bot.inventory.slots[sourceSlot] ||
+            null;
+
+        if (!equippedItem) {
+            return res.status(400).json({
                 error:
-                    'Mineflayer hiện tại không hỗ trợ unequip.'
+                    'Vị trí trang bị đang trống.'
             });
         }
 
-        botState.inventoryActionBusy = true;
+        let emptySlot = null;
+
+        for (
+            let slot = 9;
+            slot <= 35;
+            slot++
+        ) {
+            if (
+                !bot.inventory.slots[slot]
+            ) {
+                emptySlot = slot;
+                break;
+            }
+        }
+
+        if (emptySlot === null) {
+            return res.status(409).json({
+                error:
+                    'Inventory không còn ô trống để tháo trang bị.'
+            });
+        }
+
+        botState.inventoryActionBusy =
+            true;
 
         try {
+            const summary =
+                itemSummary(equippedItem);
+
             addLog(
                 botState,
-                `[EQUIP] Web: tháo trang bị ${destination}.`
+                `[EQUIP] Web tháo ${summary} từ ${destination}.`
             );
 
-            await bot.unequip(
-                destination
-            );
+            let moved = false;
+
+            if (
+                typeof bot.moveSlotItem ===
+                'function'
+            ) {
+                try {
+                    await bot.moveSlotItem(
+                        sourceSlot,
+                        emptySlot
+                    );
+
+                    moved = true;
+                } catch (_) {
+                    moved = false;
+                }
+            }
+
+            if (
+                !moved &&
+                typeof bot.unequip ===
+                'function'
+            ) {
+                await bot.unequip(
+                    destination
+                );
+            }
 
             await finishInventoryAction(
                 botState,
@@ -5261,13 +6006,13 @@ app.post(
 
             addLog(
                 botState,
-                `[EQUIP] Đã tháo trang bị ${destination}.`
+                `[EQUIP] Đã tháo ${summary} khỏi ${destination}.`
             );
 
             res.json({
                 ok: true,
                 message:
-                    'Đã tháo trang bị.',
+                    `Đã tháo trang bị ${destination}.`,
                 revision:
                     botState.inventoryRevision,
                 inventory:
@@ -5288,7 +6033,8 @@ app.post(
                     botState.inventoryRevision
             });
         } finally {
-            botState.inventoryActionBusy = false;
+            botState.inventoryActionBusy =
+                false;
         }
     }
 );
@@ -5378,6 +6124,148 @@ app.post(
 );
 
 // -----------------------------------------------------------------------------
+// Drop item outside inventory
+// -----------------------------------------------------------------------------
+
+app.post(
+    '/api/inventory/drop',
+    async (req, res) => {
+        const sourceSlot =
+            Number(req.body?.sourceSlot);
+
+        const requestedRevision =
+            Number(req.body?.revision);
+
+        if (
+            !isValidPlayerInventorySlot(
+                sourceSlot
+            )
+        ) {
+            return res.status(400).json({
+                error:
+                    'Slot vứt item không hợp lệ.'
+            });
+        }
+
+        if (
+            !validateInventoryRevision(
+                botState,
+                requestedRevision
+            )
+        ) {
+            return res.status(409).json({
+                error:
+                    'Inventory đã thay đổi. Đang đồng bộ lại...',
+                revision:
+                    botState.inventoryRevision,
+                inventory:
+                    publicInventoryState(
+                        botState
+                    )
+            });
+        }
+
+        if (
+            botState.inventoryActionBusy
+        ) {
+            return res.status(409).json({
+                error:
+                    'Bot đang thực hiện thao tác inventory khác.'
+            });
+        }
+
+        if (
+            !canUseInventoryAction(
+                botState
+            )
+        ) {
+            return res.status(409).json({
+                error:
+                    'Bot chưa sẵn sàng thao tác inventory.'
+            });
+        }
+
+        const bot =
+            botState.bot;
+
+        const item =
+            bot.inventory.slots[sourceSlot] ||
+            null;
+
+        if (!item) {
+            return res.status(400).json({
+                error:
+                    'Ô nguồn đang trống.'
+            });
+        }
+
+        if (
+            typeof bot.tossStack !==
+            'function'
+        ) {
+            return res.status(501).json({
+                error:
+                    'Mineflayer hiện tại không hỗ trợ tossStack.'
+            });
+        }
+
+        botState.inventoryActionBusy =
+            true;
+
+        try {
+            const summary =
+                itemSummary(item);
+
+            addLog(
+                botState,
+                `[DROP] Vứt ${summary} từ ${getSlotLabel(sourceSlot)}.`
+            );
+
+            await bot.tossStack(
+                item
+            );
+
+            await finishInventoryAction(
+                botState,
+                bot
+            );
+
+            addLog(
+                botState,
+                `[DROP] Đã vứt ${summary}.`
+            );
+
+            res.json({
+                ok: true,
+                message:
+                    `Đã vứt ${summary}.`,
+                revision:
+                    botState.inventoryRevision,
+                inventory:
+                    publicInventoryState(
+                        botState
+                    )
+            });
+        } catch (err) {
+            addLog(
+                botState,
+                `[DROP] Lỗi vứt item: ${err.message}`
+            );
+
+            res.status(500).json({
+                error:
+                    `Vứt item thất bại: ${err.message}`,
+                revision:
+                    botState.inventoryRevision
+            });
+        } finally {
+            botState.inventoryActionBusy =
+                false;
+        }
+    }
+);
+
+// -----------------------------------------------------------------------------
 // Health endpoint
 // Render / Google Apps Script can call /health.
 // -----------------------------------------------------------------------------
@@ -5447,7 +6335,10 @@ app.get(
             status: botState.status,
             ready: botState.ready,
             ping: getPing(botState),
-            connectedAt: botState.connectedAt
+            connectedAt: botState.connectedAt,
+            botId: BOT_ID,
+            position: getBotPosition(botState),
+            dimension: getBotDimension(botState)
         });
     }
 );
@@ -5574,6 +6465,8 @@ if (
 // - Log scroll position preservation
 // - View distance tuning
 // - Graceful shutdown
+// - BOT environment identity
+// - CORS + /api/node central dashboard discovery
 //
 // Lưu ý:
 // Phần này chỉ là marker kết thúc file.
