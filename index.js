@@ -2,7 +2,17 @@ const mineflayer = require('mineflayer');
 const express = require('express');
 
 const app = express();
-const HTTP_PORT = Number(process.env.PORT || 10000);
+function readPositiveInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
+    if (value === undefined || value === null || String(value).trim() === '') {
+        return fallback;
+    }
+
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(Math.max(Math.trunc(parsed), min), max);
+}
+
+const HTTP_PORT = readPositiveInt(process.env.PORT, 10000, 1, 65535);
 
 const BOT_ID_RAW = String(process.env.BOT || '1').trim() || '1';
 const BOT_ID_NUMBER_PARSED =
@@ -19,8 +29,10 @@ const BOT_LABEL = `Bot ${BOT_ID}`;
 
 const MAX_LOGS = 100;
 const RECONNECT_DELAY = 3000;
-const STATUS_POLL_MS = 1000;
-const UPTIME_UPDATE_MS = 250;
+const INVENTORY_ACTION_TIMEOUT_MS = 15000;
+const AUTO_START_ON_BOOT = !['0', 'false', 'no', 'off'].includes(
+    String(process.env.AUTO_START ?? 'true').trim().toLowerCase()
+);
 
 // KingMC AFK flow timing.
 const DN_TO_AFK_DELAY = 1000;
@@ -37,14 +49,17 @@ const HOSTS = (process.env.MC_SERVER_HOSTS || 'sgp.kingmc.vn,kingmc.vn')
     .split(',')
     .map(host => host.trim())
     .filter(Boolean);
-const PORT = Number(process.env.MC_SERVER_PORT || 25565);
+const PORT = readPositiveInt(process.env.MC_SERVER_PORT, 25565, 1, 65535);
 
 // Network / client-load tuning.
 // Mineflayer officially supports far / normal / short / tiny / numeric view distance.
 // tiny is the lowest named setting and is appropriate for an AFK bot.
 const VIEW_DISTANCE = process.env.MC_VIEW_DISTANCE || 'tiny';
-const CHECK_TIMEOUT_INTERVAL = Number(
-    process.env.MC_CHECK_TIMEOUT_MS || 30000
+const CHECK_TIMEOUT_INTERVAL = readPositiveInt(
+    process.env.MC_CHECK_TIMEOUT_MS,
+    30000,
+    5000,
+    300000
 );
 
 app.use(express.json({ limit: '8kb' }));
@@ -86,9 +101,11 @@ function cleanMinecraftText(text) {
 function getEnvCredentials() {
     return {
         username:
-            process.env.BOT1_USERNAME ||
-            process.env.MC_USERNAME ||
-            '',
+            String(
+                process.env.BOT1_USERNAME ||
+                process.env.MC_USERNAME ||
+                ''
+            ).trim(),
 
         password:
             process.env.BOT1_PASSWORD ||
@@ -114,6 +131,10 @@ function createBotState() {
         ready: false,
         manuallyStopped: true,
         connectedAt: null,
+        stateRevision: 0,
+        connectionGeneration: 0,
+        restartTimer: null,
+        shuttingDown: false,
 
         // AFK uptime statistics.
         // Uptime counts only while status === 'afk'.
@@ -157,6 +178,8 @@ function createBotState() {
         previousInventorySnapshot: null,
         inventoryRevision: 0,
         inventoryActionBusy: false,
+        inventoryActionBot: null,
+        inventoryActionToken: 0,
         foodMissingLogged: false,
         totemLogState: null,
         isEquippingTotem: false,
@@ -347,6 +370,90 @@ function parseCustomChatLine(cleanMsg) {
     };
 }
 
+function isCurrentBot(state, bot) {
+    return !!bot && state.bot === bot;
+}
+
+function beginInventoryAction(state, bot) {
+    state.inventoryActionBusy = true;
+    state.inventoryActionBot = bot;
+    state.inventoryActionToken++;
+    return state.inventoryActionToken;
+}
+
+function endInventoryAction(state, bot, token) {
+    if (
+        state.inventoryActionBot === bot &&
+        state.inventoryActionToken === token
+    ) {
+        state.inventoryActionBusy = false;
+        state.inventoryActionBot = null;
+    }
+}
+
+function isInventoryActionCurrent(state, bot, token) {
+    return (
+        state.bot === bot &&
+        state.inventoryActionBot === bot &&
+        state.inventoryActionToken === token &&
+        !state.manuallyStopped
+    );
+}
+
+function invalidateInventoryAction(state) {
+    state.inventoryActionToken++;
+    state.inventoryActionBusy = false;
+    state.inventoryActionBot = null;
+}
+
+function cleanupBotResources(bot) {
+    if (!bot) return;
+
+    try {
+        bot.removeAllListeners();
+        // Keep a no-op error listener so a late EventEmitter 'error' from a
+        // fully disconnected client can never become an uncaught exception.
+        bot.on('error', () => {});
+    } catch (_) {
+    }
+
+    const client = bot._client;
+
+    if (!client) return;
+
+    try {
+        if (typeof client.removeAllListeners === 'function') {
+            client.removeAllListeners();
+        }
+        if (typeof client.on === 'function') {
+            client.on('error', () => {});
+        }
+    } catch (_) {
+    }
+
+    try {
+        const socket = client.socket;
+        if (socket && typeof socket.destroy === 'function' && !socket.destroyed) {
+            socket.destroy();
+        }
+    } catch (_) {
+    }
+}
+
+function withTimeout(promise, timeoutMs, label = 'Thao tác') {
+    let timer = null;
+
+    const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+            reject(new Error(`${label} quá thời gian chờ.`));
+        }, timeoutMs);
+    });
+
+    return Promise.race([promise, timeoutPromise]).finally(() => {
+        if (timer) clearTimeout(timer);
+    });
+}
+
 function clearAfkTimers(state) {
     for (const timer of state.afkTimers) {
         clearTimeout(timer);
@@ -382,9 +489,17 @@ function clearManagerTimers(state) {
     state.isEquippingTotem = false;
 }
 
+function clearRestartTimer(state) {
+    if (state.restartTimer) {
+        clearTimeout(state.restartTimer);
+        state.restartTimer = null;
+    }
+}
+
 function clearAllTimers(state) {
     clearAfkTimers(state);
     clearReconnectTimer(state);
+    clearRestartTimer(state);
     clearManagerTimers(state);
 }
 
@@ -463,8 +578,11 @@ function selectHotbarSlot(state, slot) {
 }
 
 function resetInventoryState(state) {
+    state.inventoryRevision++;
+    invalidateInventoryAction(state);
+
     state.inventoryState = {
-        revision: state.inventoryRevision || 0,
+        revision: state.inventoryRevision,
         health: 20,
         food: 20,
         saturation: 20,
@@ -1128,7 +1246,7 @@ async function autoEatTick(state) {
 
     state.foodMissingLogged = false;
     state.isEating = true;
-    state.inventoryActionBusy = true;
+    const actionToken = beginInventoryAction(state, bot);
 
     const oldBot = bot;
     const oldSelectedSlot =
@@ -1167,9 +1285,10 @@ async function autoEatTick(state) {
             `[FOOD] Equip ${foodName} vào tay.`
         );
 
-        await bot.equip(
-            foodItem,
-            'hand'
+        await withTimeout(
+            bot.equip(foodItem, 'hand'),
+            INVENTORY_ACTION_TIMEOUT_MS,
+            'Equip thức ăn'
         );
 
         if (
@@ -1186,7 +1305,11 @@ async function autoEatTick(state) {
             `[FOOD] Bắt đầu Consume ${foodName}.`
         );
 
-        await bot.consume();
+        await withTimeout(
+            bot.consume(),
+            INVENTORY_ACTION_TIMEOUT_MS,
+            'Ăn thức ăn'
+        );
 
         if (state.bot === oldBot) {
             addLog(
@@ -1208,7 +1331,7 @@ async function autoEatTick(state) {
             state.bot !== oldBot ||
             state.manuallyStopped
         ) {
-            state.inventoryActionBusy = false;
+            endInventoryAction(state, oldBot, actionToken);
             return;
         }
 
@@ -1228,9 +1351,10 @@ async function autoEatTick(state) {
                 }
 
                 if (oldItemStillExists) {
-                    await bot.equip(
-                        oldHeldItem,
-                        'hand'
+                    await withTimeout(
+                        bot.equip(oldHeldItem, 'hand'),
+                        INVENTORY_ACTION_TIMEOUT_MS,
+                        'Khôi phục item cũ'
                     );
 
                     addLog(
@@ -1257,7 +1381,7 @@ async function autoEatTick(state) {
             false
         );
 
-        state.inventoryActionBusy = false;
+        endInventoryAction(state, oldBot, actionToken);
     }
 }
 
@@ -1341,7 +1465,7 @@ async function autoTotemTick(state) {
     }
 
     state.isEquippingTotem = true;
-    state.inventoryActionBusy = true;
+    const actionToken = beginInventoryAction(state, bot);
     state.totemLogState = 'equipping';
 
     const oldBot = bot;
@@ -1352,9 +1476,10 @@ async function autoTotemTick(state) {
             '[TOTEM] Đang equip Totem vào offhand.'
         );
 
-        await bot.equip(
-            totem,
-            'off-hand'
+        await withTimeout(
+            bot.equip(totem, 'off-hand'),
+            INVENTORY_ACTION_TIMEOUT_MS,
+            'Equip Totem'
         );
 
         if (
@@ -1384,7 +1509,7 @@ async function autoTotemTick(state) {
         }
     } finally {
         state.isEquippingTotem = false;
-        state.inventoryActionBusy = false;
+        endInventoryAction(state, oldBot, actionToken);
     }
 }
 
@@ -1579,7 +1704,10 @@ function setBotStatus(state, status) {
         state.afkStartedAt = Date.now();
     }
 
-    state.status = status;
+    if (state.status !== status) {
+        state.status = status;
+        state.stateRevision++;
+    }
 }
 
 function getUptimeSeconds(state) {
@@ -1651,9 +1779,9 @@ function getBotPosition(state) {
     }
 
     return {
-        x: Number(x.toFixed(2)),
-        y: Number(y.toFixed(2)),
-        z: Number(z.toFixed(2))
+        x: Math.round(x),
+        y: Math.round(y),
+        z: Math.round(z)
     };
 }
 
@@ -1703,6 +1831,15 @@ function publicBotState(state) {
         chatLogRevision:
             state.chatLogRevision,
 
+        stateRevision:
+            state.stateRevision,
+
+        autoStartOnBoot:
+            AUTO_START_ON_BOOT,
+
+        hasCredentials:
+            !!(state.username && state.password),
+
         position:
             getBotPosition(state),
 
@@ -1734,6 +1871,7 @@ function getReconnectDelay(state) {
 
 function scheduleReconnect(state) {
     if (
+        state.shuttingDown ||
         state.manuallyStopped ||
         state.reconnectTimer
     ) {
@@ -1769,13 +1907,14 @@ function disconnectBot(
     reason = 'Stopped'
 ) {
     clearAllTimers(state);
+    invalidateInventoryAction(state);
 
+    state.connectionGeneration++;
     state.ready = false;
     setBotStatus(state, 'offline');
     state.connectedAt = null;
 
     const currentBot = state.bot;
-
     state.bot = null;
     resetInventoryState(state);
 
@@ -1784,17 +1923,15 @@ function disconnectBot(
     }
 
     try {
-        currentBot.removeAllListeners();
-
-        if (
-            typeof currentBot.quit === 'function'
-        ) {
+        if (typeof currentBot.quit === 'function') {
             currentBot.quit(reason);
         }
     } catch (err) {
         console.log(
             `[BOT ${state.id}] Shutdown error: ${err.message}`
         );
+    } finally {
+        cleanupBotResources(currentBot);
     }
 }
 
@@ -1813,6 +1950,10 @@ function stopBot(state) {
 }
 
 function startBot(state) {
+    if (state.shuttingDown) {
+        return false;
+    }
+
     if (
         !state.username ||
         !state.password
@@ -1830,6 +1971,10 @@ function startBot(state) {
     state.manuallyStopped = false;
 
     clearAllTimers(state);
+    if (state.restartTimer) {
+        clearTimeout(state.restartTimer);
+        state.restartTimer = null;
+    }
 
     state.hostIndex = 0;
     state.ready = false;
@@ -1851,7 +1996,7 @@ function startBot(state) {
     return true;
 }
 
-function registerEvents(state, bot) {
+function registerEvents(state, bot, connectionGeneration = state.connectionGeneration) {
     bot.on('chat', (username, message, translate, jsonMsg) => {
         if (
             !message ||
@@ -1894,6 +2039,13 @@ function registerEvents(state, bot) {
     });
 
     bot.on('error', err => {
+        if (
+            state.bot !== bot ||
+            state.connectionGeneration !== connectionGeneration
+        ) {
+            return;
+        }
+
         addLog(
             state,
             `Lỗi kết nối: ${err.message}`
@@ -1901,6 +2053,13 @@ function registerEvents(state, bot) {
     });
 
     bot.on('kicked', reason => {
+        if (
+            state.bot !== bot ||
+            state.connectionGeneration !== connectionGeneration
+        ) {
+            return;
+        }
+
         const reasonText =
             typeof reason === 'string'
                 ? reason
@@ -1917,39 +2076,37 @@ function registerEvents(state, bot) {
     });
 
     bot.on('end', () => {
-        const isCurrentBot = state.bot === bot;
+        const isCurrentBot =
+            state.bot === bot &&
+            state.connectionGeneration === connectionGeneration;
 
         if (isCurrentBot) {
             state.bot = null;
+            clearManagerTimers(state);
+            clearAfkTimers(state);
+            invalidateInventoryAction(state);
+            state.ready = false;
+            state.connectedAt = null;
+            resetInventoryState(state);
         }
 
-        clearManagerTimers(state);
+        // Ended/stale Mineflayer instances must not retain listeners or sockets.
+        cleanupBotResources(bot);
 
-        state.ready = false;
-        state.connectedAt = null;
+        if (!isCurrentBot) {
+            return;
+        }
 
         if (state.manuallyStopped) {
             setBotStatus(state, 'offline');
-
-            addLog(
-                state,
-                'Đã ngắt kết nối.'
-            );
-
+            addLog(state, 'Đã ngắt kết nối.');
             return;
         }
 
         setBotStatus(state, 'offline');
+        addLog(state, 'Mất kết nối.');
 
-        addLog(
-            state,
-            'Mất kết nối.'
-        );
-
-        // Unexpected disconnect: count reconnect.
-        // AFK uptime is frozen because status is no longer AFK.
         state.reconnectCount++;
-
         addLog(
             state,
             `Reconnect #${state.reconnectCount}.`
@@ -1957,14 +2114,21 @@ function registerEvents(state, bot) {
 
         if (HOSTS.length > 1) {
             state.hostIndex =
-                (state.hostIndex + 1) %
-                HOSTS.length;
+                (state.hostIndex + 1) % HOSTS.length;
         }
 
         scheduleReconnect(state);
     });
 
     bot.once('spawn', () => {
+        if (
+            state.bot !== bot ||
+            state.connectionGeneration !== connectionGeneration ||
+            state.manuallyStopped
+        ) {
+            return;
+        }
+
         setBotStatus(state, 'online');
         state.ready = false;
         state.connectedAt = Date.now();
@@ -1977,7 +2141,10 @@ function registerEvents(state, bot) {
     });
 
     bot.on('death', () => {
-        if (state.bot === bot) {
+        if (
+            state.bot === bot &&
+            state.connectionGeneration === connectionGeneration
+        ) {
             addLog(
                 state,
                 '[LIFE] Bot đã chết.'
@@ -1986,6 +2153,13 @@ function registerEvents(state, bot) {
     });
 
     bot.on('message', jsonMsg => {
+        if (
+            state.bot !== bot ||
+            state.connectionGeneration !== connectionGeneration
+        ) {
+            return;
+        }
+
         handleServerMessage(
             state,
             bot,
@@ -1994,6 +2168,13 @@ function registerEvents(state, bot) {
     });
 
     bot.on('windowOpen', window => {
+        if (
+            state.bot !== bot ||
+            state.connectionGeneration !== connectionGeneration
+        ) {
+            return;
+        }
+
         let title = '';
 
         try {
@@ -2041,12 +2222,20 @@ function registerEvents(state, bot) {
 }
 
 function connectBot(state) {
-    if (state.manuallyStopped) {
+    if (state.shuttingDown || state.manuallyStopped) {
         return;
     }
 
     clearAfkTimers(state);
     clearReconnectTimer(state);
+
+    if (state.bot) {
+        disconnectBot(state, 'Replacing stale connection');
+        state.manuallyStopped = false;
+    }
+
+    state.connectionGeneration++;
+    const connectionGeneration = state.connectionGeneration;
 
     state.ready = false;
     setBotStatus(state, 'connecting');
@@ -2099,15 +2288,47 @@ function connectBot(state) {
 
     registerEvents(
         state,
-        bot
+        bot,
+        connectionGeneration
     );
 }
+
+const BLOCKED_MC_LOG_PATTERNS = [
+        'đăng nhập bằng lệnh',
+        'đăng nhập thành công',
+        'phiên đăng nhập đã được kết nối trở lại',
+        'dùng lệnh /rtp để dịch chuyển ngẫu nhiên tới nơi sinh tồn và xây căn cứ',
+        'donate sẽ góp phần giúp Server',
+        'xin lưu ý: giá bán item có thể tăng hoặc giảm để cân bằng server tránh lạm phát',
+        'chơi server dưới 180 phút mỗi ngày để đảm bảo sức khỏe...',
+        'server nghiêm cấm mọi hành vi',
+        'để có rank plus và key (/warp crate), dùng lệnh /key hoặc /donate',
+        'có kinh phí để phát triển hơn',
+        'những người Donate sẽ nhận được',
+        'hack cheat',
+        'nếu bị phát hiện sẽ phạt theo luật',
+        'xu, Money, Danh vọng được dùng để',
+        'mua 1 số vật phẩm trong map',
+        'hãy là 1 người chơi văn minh',
+        'bạn đã đăng nhập!',
+        'đã donate key, rank bằng thẻ được rồi nha (/key)',
+        'kingmc.vn',
+        'tự do xây dựng, tự do pvp và làm những điều mình thích nhưng phải tuân thủ luật',
+        'nếu phát hiện người chơi khác có',
+        'hành vi gian lận',
+        'và gửi cho admin',
+        'ai là newbie thì dùng lệnh /commands để xem danh sách lệnh cơ bản, /rules để xem luật'
+    ];
 
 function handleServerMessage(
     state,
     bot,
     jsonMsg
 ) {
+    if (!isCurrentBot(state, bot) || state.manuallyStopped) {
+        return;
+    }
+
     const text = jsonMsg.toString();
     const cleanMsg =
         cleanMinecraftText(text);
@@ -2147,34 +2368,8 @@ function handleServerMessage(
 
     // Giữ toàn bộ [MC] message trên web,
     // chỉ bỏ những message spam/không cần thiết.
-    const blockedMcLogPatterns = [
-        'đăng nhập bằng lệnh',
-        'đăng nhập thành công',
-        'phiên đăng nhập đã được kết nối trở lại',
-        'dùng lệnh /rtp để dịch chuyển ngẫu nhiên tới nơi sinh tồn và xây căn cứ',
-        'donate sẽ góp phần giúp Server',
-        'xin lưu ý: giá bán item có thể tăng hoặc giảm để cân bằng server tránh lạm phát',
-        'chơi server dưới 180 phút mỗi ngày để đảm bảo sức khỏe...',
-        'server nghiêm cấm mọi hành vi',
-        'để có rank plus và key (/warp crate), dùng lệnh /key hoặc /donate',
-        'có kinh phí để phát triển hơn',
-        'những người Donate sẽ nhận được',
-        'hack cheat',
-        'nếu bị phát hiện sẽ phạt theo luật',
-        'xu, Money, Danh vọng được dùng để',
-        'mua 1 số vật phẩm trong map',
-        'hãy là 1 người chơi văn minh',
-        'bạn đã đăng nhập!',
-        'đã donate key, rank bằng thẻ được rồi nha (/key)',
-        'kingmc.vn',
-        'tự do xây dựng, tự do pvp và làm những điều mình thích nhưng phải tuân thủ luật',
-        'nếu phát hiện người chơi khác có',
-        'hành vi gian lận',
-        'và gửi cho admin'
-    ];
-
     const shouldShowMcLog =
-        !blockedMcLogPatterns.some(
+        !BLOCKED_MC_LOG_PATTERNS.some(
             pattern =>
                 lowerMsg.includes(pattern)
         );
@@ -2371,9 +2566,11 @@ function handleServerMessage(
 }
 
 function startAfkRoutine(state) {
+    const bot = state.bot;
+
     if (
         state.manuallyStopped ||
-        !state.bot
+        !bot
     ) {
         return;
     }
@@ -2387,24 +2584,24 @@ function startAfkRoutine(state) {
         setTimeout(() => {
             if (
                 state.manuallyStopped ||
-                !state.bot
+                state.bot !== bot
             ) {
                 return;
             }
 
-            state.bot.chat('/menu');
+            bot.chat('/menu');
 
             const clickTimer =
                 setTimeout(() => {
                     if (
                         state.manuallyStopped ||
-                        !state.bot
+                        state.bot !== bot
                     ) {
                         return;
                     }
 
                     const currentWindow =
-                        state.bot.currentWindow;
+                        bot.currentWindow;
 
                     if (!currentWindow) {
                         addLog(
@@ -2420,7 +2617,7 @@ function startAfkRoutine(state) {
                     }
 
                     try {
-                        state.bot.clickWindow(
+                        bot.clickWindow(
                             24,
                             0,
                             0
@@ -2508,6 +2705,7 @@ input{
 
 button{
   border:1px solid var(--border);
+  transition:background .15s ease,border-color .15s ease,transform .05s ease;
   border-radius:10px;
   background:#1a2530;
   color:var(--text);
@@ -2515,8 +2713,18 @@ button{
   cursor:pointer
 }
 
-button:hover{
+button:hover:not(:disabled){
   background:#22313f
+}
+
+button:active:not(:disabled){
+  transform:translateY(1px)
+}
+
+button:focus-visible,
+input:focus-visible{
+  outline:2px solid #4da3ff;
+  outline-offset:2px
 }
 
 button.primary{
@@ -3340,7 +3548,7 @@ label{
         <input
           id="passwordInput"
           type="password"
-          autocomplete="new-password"
+          autocomplete="new-password" spellcheck="false"
           placeholder="Password mới (có thể để trống)"
         >
 
@@ -3356,6 +3564,7 @@ label{
       <div class="note">
         Có thể đổi username hoặc password riêng lẻ.
         Bấm "Chạy lại" để áp dụng tài khoản mới.
+        Khi service khởi động lại, nếu ENV có đủ username/password thì bot sẽ tự kết nối lại.
       </div>
 
     </div>
@@ -3387,6 +3596,27 @@ let uptimeSyncAt = Date.now();
 let draggedSlot = null;
 let inventoryActionInFlight = false;
 let refreshInFlight = false;
+let refreshQueued = false;
+let actionRequestInFlight = false;
+let syncEpoch = 0;
+let lastRenderedInventoryRevision = -1;
+
+function invalidatePendingReads() {
+  syncEpoch++;
+  return syncEpoch;
+}
+
+function runQueuedRefresh() {
+  if (
+    refreshQueued &&
+    !refreshInFlight &&
+    !actionRequestInFlight &&
+    !inventoryActionInFlight
+  ) {
+    refreshQueued = false;
+    void refresh();
+  }
+}
 
 function statusMeta(status) {
 
@@ -3435,51 +3665,105 @@ function statusMeta(status) {
   );
 }
 
-async function getBot() {
+function applyBotData(nextBot) {
+  if (!nextBot) return false;
 
-  const response =
-    await fetch(
-      '/api/bot',
-      {
-        cache:'no-store'
-      }
-    );
+  const incomingRevision =
+    Number(nextBot.stateRevision ?? 0);
 
-  if (!response.ok) {
-    throw new Error(
-      'Không lấy được trạng thái bot.'
-    );
+  const currentRevision =
+    Number(bot?.stateRevision ?? -1);
+
+  if (
+    bot &&
+    Number.isFinite(incomingRevision) &&
+    Number.isFinite(currentRevision) &&
+    incomingRevision < currentRevision
+  ) {
+    return false;
   }
 
-  bot =
-    await response.json();
+  bot = nextBot;
+  uptimeSyncAt = Date.now();
+  return true;
+}
 
-  uptimeSyncAt =
-    Date.now();
+function applyInventoryData(nextInventory) {
+  if (!nextInventory) return false;
 
+  const incomingRevision =
+    Number(nextInventory.revision ?? 0);
+
+  const currentRevision =
+    Number(inventory?.revision ?? -1);
+
+  if (
+    inventory &&
+    Number.isFinite(incomingRevision) &&
+    Number.isFinite(currentRevision) &&
+    incomingRevision < currentRevision
+  ) {
+    return false;
+  }
+
+  inventory = nextInventory;
+  return true;
+}
+
+async function getBot(requestEpoch = syncEpoch) {
+  const response =
+    await fetch('/api/bot', { cache:'no-store' });
+
+  if (!response.ok) {
+    throw new Error('Không lấy được trạng thái bot.');
+  }
+
+  const data = await response.json();
+
+  if (requestEpoch !== syncEpoch) {
+    return bot;
+  }
+
+  applyBotData(data);
   return bot;
 }
 
-async function getInventory() {
-
+async function getInventory(requestEpoch = syncEpoch) {
   const response =
-    await fetch(
-      '/api/inventory',
-      {
-        cache:'no-store'
-      }
-    );
+    await fetch('/api/inventory', { cache:'no-store' });
 
   if (!response.ok) {
-    throw new Error(
-      'Không lấy được inventory.'
-    );
+    throw new Error('Không lấy được inventory.');
   }
 
-  inventory =
-    await response.json();
+  const data = await response.json();
 
+  if (requestEpoch !== syncEpoch) {
+    return inventory;
+  }
+
+  applyInventoryData(data);
   return inventory;
+}
+
+async function getSnapshot(requestEpoch = syncEpoch) {
+  const response =
+    await fetch('/api/snapshot', { cache:'no-store' });
+
+  if (!response.ok) {
+    throw new Error('Không lấy được snapshot bot.');
+  }
+
+  const data = await response.json();
+
+  if (requestEpoch !== syncEpoch) {
+    return data;
+  }
+
+  applyBotData(data.bot);
+  applyInventoryData(data.inventory);
+
+  return data;
 }
 
 function formatInventoryName(name) {
@@ -3731,66 +4015,43 @@ function renderInventory() {
       inventory.revision || 0
     );
 
-  renderEquipment(
-    inventory
-  );
+  const currentRevision = Number(inventory.revision ?? 0);
 
-  const slots =
-    inventory.slots || {};
+  if (currentRevision === lastRenderedInventoryRevision) {
+    return;
+  }
 
-  const mainInventory =
-    document.getElementById(
-      'mainInventory'
-    );
+  lastRenderedInventoryRevision = currentRevision;
 
-  mainInventory.innerHTML = '';
+  renderEquipment(inventory);
 
-  for (
-    let slot = 9;
-    slot <= 35;
-    slot++
-  ) {
+  const slots = inventory.slots || {};
+  const mainInventory = document.getElementById('mainInventory');
+  const hotbar = document.getElementById('inventoryHotbar');
 
-    const item =
-      slots[String(slot)] ||
-      null;
+  mainInventory.replaceChildren();
+  hotbar.replaceChildren();
 
+  for (let slot = 9; slot <= 35; slot++) {
     mainInventory.appendChild(
       createInventorySlotElement(
-        item,
+        slots[String(slot)] || null,
         slot,
         false
       )
     );
   }
 
-  const hotbar =
-    document.getElementById(
-      'inventoryHotbar'
-    );
+  const selected = Number(
+    inventory.selectedHotbar ??
+    inventory.selectedSlot ??
+    0
+  );
 
-  hotbar.innerHTML = '';
-
-  const selected =
-    Number(
-      inventory.selectedHotbar ??
-      inventory.selectedSlot ??
-      0
-    );
-
-  for (
-    let slot = 36;
-    slot <= 44;
-    slot++
-  ) {
-
-    const item =
-      slots[String(slot)] ||
-      null;
-
+  for (let slot = 36; slot <= 44; slot++) {
     hotbar.appendChild(
       createInventorySlotElement(
-        item,
+        slots[String(slot)] || null,
         slot,
         (slot - 36) === selected
       )
@@ -3824,6 +4085,10 @@ function startEquipmentDrag(event, destination) {
   } catch (_) {
   }
 }
+
+document.addEventListener('dragend', () => {
+  draggedSlot = null;
+});
 
 function equipmentDestinationFromSlot(slot) {
   if (slot === 5) return 'head';
@@ -3976,6 +4241,9 @@ async function dropInventoryItem(
 
   inventoryActionInFlight = true;
 
+  invalidatePendingReads();
+  refreshQueued = true;
+
   try {
     const response =
       await fetch(
@@ -4029,6 +4297,7 @@ async function dropInventoryItem(
   } finally {
     inventoryActionInFlight =
       false;
+    runQueuedRefresh();
   }
 }
 
@@ -4053,6 +4322,10 @@ async function moveInventoryItem(
   inventoryActionInFlight =
     true;
 
+
+  invalidatePendingReads();
+
+  refreshQueued = true;
   try {
 
     const response =
@@ -4124,6 +4397,9 @@ async function moveInventoryItem(
 
     inventoryActionInFlight =
       false;
+
+    runQueuedRefresh();
+
   }
 }
 
@@ -4191,6 +4467,10 @@ async function equipInventoryItem(
   inventoryActionInFlight =
     true;
 
+
+  invalidatePendingReads();
+
+  refreshQueued = true;
   try {
 
     const response =
@@ -4262,6 +4542,9 @@ async function equipInventoryItem(
 
     inventoryActionInFlight =
       false;
+
+    runQueuedRefresh();
+
   }
 }
 
@@ -4285,6 +4568,10 @@ async function unequipEquipment(
   inventoryActionInFlight =
     true;
 
+
+  invalidatePendingReads();
+
+  refreshQueued = true;
   try {
 
     const response =
@@ -4355,6 +4642,9 @@ async function unequipEquipment(
 
     inventoryActionInFlight =
       false;
+
+    runQueuedRefresh();
+
   }
 }
 
@@ -4373,6 +4663,10 @@ async function selectHotbar(slot) {
   inventoryActionInFlight =
     true;
 
+
+  invalidatePendingReads();
+
+  refreshQueued = true;
   try {
 
     const response =
@@ -4438,19 +4732,21 @@ async function selectHotbar(slot) {
 
     inventoryActionInFlight =
       false;
+
+    runQueuedRefresh();
+
   }
 }
 
 async function refreshInventoryOnly() {
+  if (inventoryActionInFlight) {
+    return;
+  }
 
   try {
-
     await getInventory();
-
     renderInventory();
-
   } catch (_) {
-
   }
 }
 
@@ -4533,11 +4829,11 @@ function renderDetail() {
       Number.isFinite(position.x) &&
       Number.isFinite(position.y) &&
       Number.isFinite(position.z)
-        ? String(position.x.toFixed(2)) +
+        ? String(Math.round(position.x)) +
           ' ' +
-          String(position.y.toFixed(2)) +
+          String(Math.round(position.y)) +
           ' ' +
-          String(position.z.toFixed(2))
+          String(Math.round(position.z))
         : '-';
   }
 
@@ -4556,28 +4852,25 @@ function renderDetail() {
       'startButton'
     )
     .disabled =
-      ![
-        'offline',
-        'kicked'
-      ].includes(
-        bot.status
-      );
+      actionRequestInFlight ||
+      !bot.hasCredentials ||
+      !['offline','kicked'].includes(bot.status);
 
   document
     .getElementById(
       'stopButton'
     )
     .disabled =
-      bot.status ===
-      'offline';
+      actionRequestInFlight ||
+      bot.status === 'offline';
 
   document
     .getElementById(
       'restartButton'
     )
     .disabled =
-      bot.status ===
-      'offline';
+      actionRequestInFlight ||
+      bot.status === 'offline';
 }
 
 function isNearLogBottom(box) {
@@ -4592,6 +4885,8 @@ function isNearLogBottom(box) {
 async function loadLogs(
   force = false
 ) {
+
+  const requestEpoch = syncEpoch;
 
   if (
     logRequestInFlight
@@ -4630,6 +4925,10 @@ async function loadLogs(
 
     const data =
       await response.json();
+
+    if (requestEpoch !== syncEpoch) {
+      return;
+    }
 
     const box =
       document.getElementById(
@@ -4698,6 +4997,8 @@ async function loadChatLogs(
   force = false
 ) {
 
+  const requestEpoch = syncEpoch;
+
   if (
     chatRequestInFlight
   ) {
@@ -4732,6 +5033,10 @@ async function loadChatLogs(
 
     const data =
       await response.json();
+
+    if (requestEpoch !== syncEpoch) {
+      return;
+    }
 
     const box =
       document.getElementById(
@@ -4808,32 +5113,56 @@ function escapeHtml(value) {
 }
 
 async function refresh() {
-
   if (refreshInFlight) {
+    refreshQueued = true;
+    return;
+  }
+
+  if (actionRequestInFlight || inventoryActionInFlight) {
+    refreshQueued = true;
     return;
   }
 
   refreshInFlight = true;
+  const requestEpoch = syncEpoch;
 
   try {
+    try {
+      await getSnapshot(requestEpoch);
+      if (requestEpoch === syncEpoch) {
+        renderDetail();
+        if (!inventoryActionInFlight) {
+          renderInventory();
+        }
+      }
+    } catch (_) {
+      // Fall back to the legacy split endpoints if snapshot is unavailable.
+      try {
+        await getBot(requestEpoch);
+        if (requestEpoch === syncEpoch) {
+          renderDetail();
+        }
+      } catch (_) {
+      }
 
-    await getBot();
+      if (!inventoryActionInFlight) {
+        try {
+          await getInventory(requestEpoch);
+          if (requestEpoch === syncEpoch) {
+            renderInventory();
+          }
+        } catch (_) {
+        }
+      }
+    }
 
-    renderDetail();
-
-    await getInventory();
-
-    renderInventory();
-
-    await loadLogs();
-
-    await loadChatLogs();
-
-  } catch (_) {
-
+    await Promise.allSettled([
+      loadLogs(),
+      loadChatLogs()
+    ]);
   } finally {
-
     refreshInFlight = false;
+    runQueuedRefresh();
   }
 }
 
@@ -4841,6 +5170,14 @@ async function postAction(
   url,
   fallback
 ) {
+  if (actionRequestInFlight) {
+    return;
+  }
+
+  actionRequestInFlight = true;
+  invalidatePendingReads();
+  refreshQueued = true;
+  renderDetail();
 
   try {
 
@@ -4869,6 +5206,10 @@ async function postAction(
       'Không thể kết nối tới server web.'
     );
 
+  } finally {
+    actionRequestInFlight = false;
+    renderDetail();
+    runQueuedRefresh();
   }
 }
 
@@ -4914,6 +5255,8 @@ async function sendMessage(event) {
   if (!text.trim()) {
     return;
   }
+
+  invalidatePendingReads();
 
   try {
 
@@ -4990,6 +5333,8 @@ async function saveAccount() {
     );
     return;
   }
+
+  invalidatePendingReads();
 
   try {
 
@@ -5146,6 +5491,50 @@ setInterval(
 </html>`;
 
 // -----------------------------------------------------------------------------
+// API: atomic-ish dashboard snapshot
+// -----------------------------------------------------------------------------
+
+app.get(
+    '/api/snapshot',
+    (req, res) => {
+        res.json({
+            ok: true,
+            bot: publicBotState(botState),
+            inventory: publicInventoryState(botState)
+        });
+    }
+);
+
+app.get(
+    '/api/diagnostics',
+    (req, res) => {
+        const memory = process.memoryUsage();
+
+        res.json({
+            ok: true,
+            pid: process.pid,
+            node: process.version,
+            processUptimeSeconds: Math.floor(process.uptime()),
+            memory: {
+                rss: memory.rss,
+                heapUsed: memory.heapUsed,
+                heapTotal: memory.heapTotal,
+                external: memory.external,
+                arrayBuffers: memory.arrayBuffers
+            },
+            botListeners: botState.bot
+                ? botState.bot.eventNames().reduce((total, name) => {
+                    return total + botState.bot.listenerCount(name);
+                }, 0)
+                : 0,
+            reconnectCount: botState.reconnectCount,
+            reconnectAttempts: botState.reconnectAttempts,
+            status: botState.status
+        });
+    }
+);
+
+// -----------------------------------------------------------------------------
 // API: node identity / central dashboard capability discovery
 // -----------------------------------------------------------------------------
 
@@ -5160,6 +5549,8 @@ app.get(
             protocol: 2,
             api: {
                 status: '/api/bot',
+                snapshot: '/api/snapshot',
+                diagnostics: '/api/diagnostics',
                 node: '/api/node',
                 eventLogs: '/api/bot/logs',
                 chatLogs: '/api/bot/chat-logs',
@@ -5321,21 +5712,24 @@ app.post(
             'Restart from web panel'
         );
 
-        const restartTimer =
+        if (botState.restartTimer) {
+            clearTimeout(botState.restartTimer);
+        }
+
+        botState.restartTimer =
             setTimeout(() => {
+                botState.restartTimer = null;
 
-                botState.manuallyStopped =
-                    false;
-
-                startBot(
-                    botState
-                );
-
+                if (
+                    botState.username &&
+                    botState.password
+                ) {
+                    botState.manuallyStopped = false;
+                    startBot(botState);
+                } else {
+                    setBotStatus(botState, 'offline');
+                }
             }, 500);
-
-        botState.afkTimers.push(
-            restartTimer
-        );
 
         res.json({
             ok: true,
@@ -5456,6 +5850,8 @@ app.post(
             changed.push('password');
         }
 
+        botState.stateRevision++;
+
         addLog(
             botState,
             `Đã thay đổi ${changed.join(' + ')} từ web.`
@@ -5514,14 +5910,15 @@ function canUseInventoryAction(state) {
     );
 }
 
-async function finishInventoryAction(state, bot) {
+async function finishInventoryAction(state, bot, token = null) {
     await new Promise(
         resolve => setTimeout(resolve, 120)
     );
 
     if (
-        state.bot !== bot ||
-        state.manuallyStopped
+        !isCurrentBot(state, bot) ||
+        state.manuallyStopped ||
+        (token !== null && !isInventoryActionCurrent(state, bot, token))
     ) {
         return;
     }
@@ -5537,8 +5934,9 @@ async function finishInventoryAction(state, bot) {
     );
 
     if (
-        state.bot === bot &&
-        !state.manuallyStopped
+        isCurrentBot(state, bot) &&
+        !state.manuallyStopped &&
+        (token === null || isInventoryActionCurrent(state, bot, token))
     ) {
         scanInventory(
             state,
@@ -5628,6 +6026,12 @@ app.post(
         const bot =
             botState.bot;
 
+        if (typeof bot.moveSlotItem !== 'function') {
+            return res.status(501).json({
+                error: 'Mineflayer hiện tại không hỗ trợ moveSlotItem.'
+            });
+        }
+
         const sourceItem =
             bot.inventory.slots[sourceSlot] ||
             null;
@@ -5639,7 +6043,8 @@ app.post(
             });
         }
 
-        botState.inventoryActionBusy = true;
+        const actionToken =
+            beginInventoryAction(botState, bot);
 
         try {
             const beforeSource =
@@ -5656,14 +6061,24 @@ app.post(
                 `[INV] Web move: ${getSlotLabel(sourceSlot)} → ${getSlotLabel(destSlot)} | ${beforeSource}.`
             );
 
-            await bot.moveSlotItem(
-                sourceSlot,
-                destSlot
+            await withTimeout(
+                bot.moveSlotItem(sourceSlot, destSlot),
+                INVENTORY_ACTION_TIMEOUT_MS,
+                'Di chuyển item'
             );
+
+            if (!isInventoryActionCurrent(botState, bot, actionToken)) {
+                return res.status(409).json({
+                    error: 'Bot đã reconnect trong lúc thao tác inventory. Đang đồng bộ lại...',
+                    revision: botState.inventoryRevision,
+                    inventory: publicInventoryState(botState)
+                });
+            }
 
             await finishInventoryAction(
                 botState,
-                bot
+                bot,
+                actionToken
             );
 
             addLog(
@@ -5704,7 +6119,7 @@ app.post(
                     botState.inventoryRevision
             });
         } finally {
-            botState.inventoryActionBusy = false;
+            endInventoryAction(botState, bot, actionToken);
         }
     }
 );
@@ -5780,6 +6195,12 @@ app.post(
         const bot =
             botState.bot;
 
+        if (typeof bot.equip !== 'function') {
+            return res.status(501).json({
+                error: 'Mineflayer hiện tại không hỗ trợ equip.'
+            });
+        }
+
         const item =
             bot.inventory.slots[sourceSlot] ||
             null;
@@ -5791,7 +6212,8 @@ app.post(
             });
         }
 
-        botState.inventoryActionBusy = true;
+        const actionToken =
+            beginInventoryAction(botState, bot);
 
         try {
             addLog(
@@ -5799,14 +6221,24 @@ app.post(
                 `[EQUIP] Web: ${itemSummary(item)} → ${destination}.`
             );
 
-            await bot.equip(
-                item,
-                destination
+            await withTimeout(
+                bot.equip(item, destination),
+                INVENTORY_ACTION_TIMEOUT_MS,
+                'Trang bị item'
             );
+
+            if (!isInventoryActionCurrent(botState, bot, actionToken)) {
+                return res.status(409).json({
+                    error: 'Bot đã reconnect trong lúc thao tác inventory. Đang đồng bộ lại...',
+                    revision: botState.inventoryRevision,
+                    inventory: publicInventoryState(botState)
+                });
+            }
 
             await finishInventoryAction(
                 botState,
-                bot
+                bot,
+                actionToken
             );
 
             addLog(
@@ -5838,7 +6270,7 @@ app.post(
                     botState.inventoryRevision
             });
         } finally {
-            botState.inventoryActionBusy = false;
+            endInventoryAction(botState, bot, actionToken);
         }
     }
 );
@@ -5914,6 +6346,15 @@ app.post(
         const bot =
             botState.bot;
 
+        if (
+            typeof bot.moveSlotItem !== 'function' &&
+            typeof bot.unequip !== 'function'
+        ) {
+            return res.status(501).json({
+                error: 'Mineflayer hiện tại không hỗ trợ tháo trang bị.'
+            });
+        }
+
         const destinationSlotMap = {
             head: 5,
             torso: 6,
@@ -5959,8 +6400,8 @@ app.post(
             });
         }
 
-        botState.inventoryActionBusy =
-            true;
+        const actionToken =
+            beginInventoryAction(botState, bot);
 
         try {
             const summary =
@@ -5978,9 +6419,10 @@ app.post(
                 'function'
             ) {
                 try {
-                    await bot.moveSlotItem(
-                        sourceSlot,
-                        emptySlot
+                    await withTimeout(
+                        bot.moveSlotItem(sourceSlot, emptySlot),
+                        INVENTORY_ACTION_TIMEOUT_MS,
+                        'Tháo trang bị'
                     );
 
                     moved = true;
@@ -5994,14 +6436,30 @@ app.post(
                 typeof bot.unequip ===
                 'function'
             ) {
-                await bot.unequip(
-                    destination
+                await withTimeout(
+                    bot.unequip(destination),
+                    INVENTORY_ACTION_TIMEOUT_MS,
+                    'Tháo trang bị'
                 );
+                moved = true;
+            }
+
+            if (!moved) {
+                throw new Error('Không thể tháo trang bị với API Mineflayer hiện tại.');
+            }
+
+            if (!isInventoryActionCurrent(botState, bot, actionToken)) {
+                return res.status(409).json({
+                    error: 'Bot đã reconnect trong lúc thao tác inventory. Đang đồng bộ lại...',
+                    revision: botState.inventoryRevision,
+                    inventory: publicInventoryState(botState)
+                });
             }
 
             await finishInventoryAction(
                 botState,
-                bot
+                bot,
+                actionToken
             );
 
             addLog(
@@ -6033,8 +6491,7 @@ app.post(
                     botState.inventoryRevision
             });
         } finally {
-            botState.inventoryActionBusy =
-                false;
+            endInventoryAction(botState, bot, actionToken);
         }
     }
 );
@@ -6209,8 +6666,8 @@ app.post(
             });
         }
 
-        botState.inventoryActionBusy =
-            true;
+        const actionToken =
+            beginInventoryAction(botState, bot);
 
         try {
             const summary =
@@ -6221,13 +6678,24 @@ app.post(
                 `[DROP] Vứt ${summary} từ ${getSlotLabel(sourceSlot)}.`
             );
 
-            await bot.tossStack(
-                item
+            await withTimeout(
+                bot.tossStack(item),
+                INVENTORY_ACTION_TIMEOUT_MS,
+                'Vứt item'
             );
+
+            if (!isInventoryActionCurrent(botState, bot, actionToken)) {
+                return res.status(409).json({
+                    error: 'Bot đã reconnect trong lúc thao tác inventory. Đang đồng bộ lại...',
+                    revision: botState.inventoryRevision,
+                    inventory: publicInventoryState(botState)
+                });
+            }
 
             await finishInventoryAction(
                 botState,
-                bot
+                bot,
+                actionToken
             );
 
             addLog(
@@ -6259,8 +6727,7 @@ app.post(
                     botState.inventoryRevision
             });
         } finally {
-            botState.inventoryActionBusy =
-                false;
+            endInventoryAction(botState, bot, actionToken);
         }
     }
 );
@@ -6306,26 +6773,7 @@ app.get(
 );
 
 // -----------------------------------------------------------------------------
-// HTTP server
-// -----------------------------------------------------------------------------
-
-const server = app.listen(
-    HTTP_PORT,
-    '0.0.0.0',
-    () => {
-
-        console.log(
-            `[HTTP] Dashboard listening on ${HTTP_PORT}`
-        );
-
-    }
-);
-
-// -----------------------------------------------------------------------------
 // Extra lightweight status endpoint
-//
-// Trả về trạng thái tối thiểu cho các request kiểm tra nhanh.
-// Không thay thế /api/bot.
 // -----------------------------------------------------------------------------
 
 app.get(
@@ -6344,10 +6792,82 @@ app.get(
 );
 
 // -----------------------------------------------------------------------------
+// HTTP server
+// -----------------------------------------------------------------------------
+
+function scheduleAutoStartOnBoot() {
+    const hasEnvCredentials =
+        !!(botState.username && botState.password);
+
+    if (!hasEnvCredentials) {
+        addLog(
+            botState,
+            'Bot đang OFFLINE: chưa có username/password trong ENV. Có thể nhập tài khoản trên web rồi bấm Chạy.'
+        );
+        return;
+    }
+
+    if (!AUTO_START_ON_BOOT) {
+        addLog(
+            botState,
+            'Đã đọc credential từ ENV nhưng AUTO_START đang tắt. Bot đang OFFLINE.'
+        );
+        return;
+    }
+
+    addLog(
+        botState,
+        'Đã đọc credential từ ENV. Service đã listen, đang tự khởi động bot.'
+    );
+
+    clearAfkTimers(botState);
+
+    const bootTimer = setTimeout(() => {
+        if (botState.shuttingDown) {
+            return;
+        }
+
+        if (botState.bot || !botState.manuallyStopped) {
+            return;
+        }
+
+        const started = startBot(botState);
+
+        addLog(
+            botState,
+            started
+                ? 'Auto-start sau khi service khởi động: đã bắt đầu kết nối.'
+                : 'Auto-start không thành công: kiểm tra credential và trạng thái service.'
+        );
+    }, 250);
+
+    botState.afkTimers.push(bootTimer);
+}
+
+const server = app.listen(
+    HTTP_PORT,
+    '0.0.0.0',
+    () => {
+
+        console.log(
+            `[HTTP] Dashboard listening on ${HTTP_PORT}`
+        );
+
+        scheduleAutoStartOnBoot();
+    }
+);
+
+// -----------------------------------------------------------------------------
 // Graceful process shutdown
 // -----------------------------------------------------------------------------
 
 function shutdownProcess(signal) {
+    if (botState.shuttingDown) {
+        return;
+    }
+
+    botState.shuttingDown = true;
+
     console.log(
         `[PROCESS] Nhận ${signal}, đang shutdown...`
     );
@@ -6359,24 +6879,20 @@ function shutdownProcess(signal) {
     );
 
     if (botState.bot) {
-        try {
-            botState.bot.removeAllListeners();
+        const currentBot = botState.bot;
+        botState.bot = null;
 
-            if (
-                typeof botState.bot.quit ===
-                'function'
-            ) {
-                botState.bot.quit(
-                    `Process ${signal}`
-                );
+        try {
+            if (typeof currentBot.quit === 'function') {
+                currentBot.quit(`Process ${signal}`);
             }
         } catch (err) {
             console.log(
                 `[PROCESS] Shutdown bot error: ${err.message}`
             );
+        } finally {
+            cleanupBotResources(currentBot);
         }
-
-        botState.bot = null;
     }
 
     if (server) {
@@ -6409,11 +6925,10 @@ process.on(
 // -----------------------------------------------------------------------------
 // FINAL STARTUP STATE
 //
-// Quan trọng:
-// - Load credential từ ENV.
-// - KHÔNG tự connect.
-// - Bot luôn OFFLINE sau khi Render khởi động.
-// - Chỉ bấm "▶ Chạy" trên web mới kết nối.
+// - Có đủ BOT1_USERNAME + BOT1_PASSWORD (hoặc MC_USERNAME + MC_PASSWORD)
+//   => tự khởi động sau khi Render service listen.
+// - Không có credential => giữ OFFLINE để chờ nhập từ web.
+// - AUTO_START=false => tắt auto-start nhưng vẫn giữ nút Chạy thủ công.
 // -----------------------------------------------------------------------------
 
 botState.manuallyStopped = true;
@@ -6422,20 +6937,10 @@ setBotStatus(botState, 'offline');
 botState.connectedAt = null;
 resetInventoryState(botState);
 
-if (
-    botState.username &&
-    botState.password
-) {
-    addLog(
-        botState,
-        'Đã đọc credential từ ENV. Bot đang OFFLINE và chờ lệnh Chạy từ web.'
-    );
-} else {
-    addLog(
-        botState,
-        'Bot đang OFFLINE: chưa có username/password. Nhập tài khoản trên web rồi bấm Chạy.'
-    );
-}
+// Auto-start is scheduled from the HTTP server listen callback so the bot
+// only begins connecting after the Render web service is actually listening.
+// This is important after an instance/process restart.
+
 
 // ============================================================================
 // END OF FILE
@@ -6459,7 +6964,7 @@ if (
 // - Runtime username/password
 // - Health endpoint
 // - Lightweight status endpoint
-// - Manual start only
+// - Auto-start from ENV credentials after HTTP listen
 // - UTC+7 log time
 // - Log filtering
 // - Log scroll position preservation
