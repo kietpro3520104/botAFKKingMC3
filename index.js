@@ -1,7 +1,61 @@
 const mineflayer = require('mineflayer');
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
+
+// ============================================================================
+// HARD-CODED BOT CONFIG
+//
+// Chỉ cần sửa phần này khi đổi tài khoản, server hoặc host chạy bot.
+// Không cần BOT/username/password/server ENV cho bot.
+//
+// PLATFORM:
+//   'raven'  -> dùng RAVEN_HTTP_PORT bên dưới.
+//   'render' -> tự dùng process.env.PORT do Render cấp; KHÔNG cần nhập port.
+// ============================================================================
+
+const BOT_CONFIG = {
+    // Host platform
+    PLATFORM: 'render',
+
+    // Bot identity
+    BOT_ID: '7',
+
+    // KingMC account
+    USERNAME: '',
+    PASSWORD: '',
+
+    // HTTP/Web port
+    // Raven: mỗi bot phải có port riêng.
+    // Render: KHÔNG dùng giá trị này; Render tự cấp process.env.PORT.
+    RAVEN_HTTP_PORT: 17419,
+
+    // Minecraft server
+    MC_HOSTS: ['sgp.kingmc.vn'],
+    MC_PORT: 25565,
+    MC_VERSION: '1.20.1',
+
+    // Startup
+    AUTO_START: true,
+
+    // Mineflayer tuning
+    VIEW_DISTANCE: 'tiny',
+    CHECK_TIMEOUT_MS: 30000,
+
+    // KingMC location flow
+    AUTH_COORDS: { x: 5, y: 119, z: 4 },
+    LOBBY_COORDS: { x: 1, y: 41, z: 1 },
+
+    // Initial runtime settings
+    DEFAULT_SETTINGS: {
+        autoTotem: true,
+        antiHungry: true,
+        autoReconnect: true
+    }
+};
 
 const app = express();
+
 function readPositiveInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
     if (value === undefined || value === null || String(value).trim() === '') {
         return fallback;
@@ -12,9 +66,22 @@ function readPositiveInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER
     return Math.min(Math.max(Math.trunc(parsed), min), max);
 }
 
-const HTTP_PORT = readPositiveInt(process.env.PORT, 10000, 1, 65535);
+const PLATFORM = String(BOT_CONFIG.PLATFORM || 'render').trim().toLowerCase();
 
-const BOT_ID_RAW = String(process.env.BOT || '1').trim() || '1';
+if (!['raven', 'render'].includes(PLATFORM)) {
+    throw new Error(
+        `[CONFIG] PLATFORM không hợp lệ: ${BOT_CONFIG.PLATFORM}. Chỉ dùng 'raven' hoặc 'render'.`
+    );
+}
+
+// Raven: lấy port riêng đã nhập trong BOT_CONFIG.
+// Render: luôn ưu tiên PORT mà Render cấp cho Web Service.
+const HTTP_PORT =
+    PLATFORM === 'raven'
+        ? readPositiveInt(BOT_CONFIG.RAVEN_HTTP_PORT, 17419, 1, 65535)
+        : readPositiveInt(process.env.PORT, 10000, 1, 65535);
+
+const BOT_ID_RAW = String(BOT_CONFIG.BOT_ID).trim() || '1';
 const BOT_ID_NUMBER_PARSED =
     Number.parseInt(BOT_ID_RAW, 10);
 
@@ -30,9 +97,7 @@ const BOT_LABEL = `Bot ${BOT_ID}`;
 const MAX_LOGS = 100;
 const RECONNECT_DELAY = 3000;
 const INVENTORY_ACTION_TIMEOUT_MS = 15000;
-const AUTO_START_ON_BOOT = !['0', 'false', 'no', 'off'].includes(
-    String(process.env.AUTO_START ?? 'true').trim().toLowerCase()
-);
+const AUTO_START_ON_BOOT = Boolean(BOT_CONFIG.AUTO_START);
 
 // KingMC AFK flow timing.
 const DN_TO_AFK_DELAY = 1000;
@@ -44,25 +109,191 @@ const AUTO_EAT_INTERVAL_MS = 2000;
 const AUTO_TOTEM_INTERVAL_MS = 1500;
 const INVENTORY_SCAN_INTERVAL_MS = 1000;
 
-const MC_VERSION = '1.20.1';
-const HOSTS = (process.env.MC_SERVER_HOSTS || 'sgp.kingmc.vn,kingmc.vn')
-    .split(',')
-    .map(host => host.trim())
-    .filter(Boolean);
-const PORT = readPositiveInt(process.env.MC_SERVER_PORT, 25565, 1, 65535);
+const MC_VERSION = BOT_CONFIG.MC_VERSION;
+const HOSTS = Array.isArray(BOT_CONFIG.MC_HOSTS)
+    ? BOT_CONFIG.MC_HOSTS
+        .map(host => String(host).trim())
+        .filter(Boolean)
+    : [];
+const PORT = readPositiveInt(BOT_CONFIG.MC_PORT, 25565, 1, 65535);
 
 // Network / client-load tuning.
 // Mineflayer officially supports far / normal / short / tiny / numeric view distance.
 // tiny is the lowest named setting and is appropriate for an AFK bot.
-const VIEW_DISTANCE = process.env.MC_VIEW_DISTANCE || 'tiny';
+const VIEW_DISTANCE = BOT_CONFIG.VIEW_DISTANCE || 'tiny';
 const CHECK_TIMEOUT_INTERVAL = readPositiveInt(
-    process.env.MC_CHECK_TIMEOUT_MS,
+    BOT_CONFIG.CHECK_TIMEOUT_MS,
     30000,
     5000,
     300000
 );
 
-app.use(express.json({ limit: '8kb' }));
+const AUTH_COORDS = Object.freeze({
+    ...BOT_CONFIG.AUTH_COORDS
+});
+const LOBBY_COORDS = Object.freeze({
+    ...BOT_CONFIG.LOBBY_COORDS
+});
+const COORD_SCAN_INTERVAL_MS = 250;
+const AFK_CONFIRM_DELAY_MS = 700;
+const LOCATION_RETRY_BASE_MS = 1000;
+const LOCATION_RETRY_MAX_MS = 30000;
+const LOCATION_ACTION_COOLDOWN_MS = 2500;
+const IP_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
+
+const SETTINGS_FILE = path.join(__dirname, 'bot_settings.json');
+const DEFAULT_SETTINGS = Object.freeze({
+    ...BOT_CONFIG.DEFAULT_SETTINGS
+});
+
+function sanitizeAutoChatSchedules(input) {
+    if (!Array.isArray(input)) {
+        return [];
+    }
+
+    const result = [];
+
+    for (const raw of input.slice(0, 100)) {
+        if (!raw || typeof raw !== 'object') {
+            continue;
+        }
+
+        const mode = raw.mode === 'fixed' ? 'fixed' : 'interval';
+        const messages = Array.isArray(raw.messages)
+            ? raw.messages
+                .map(value => String(value ?? '').trim())
+                .filter(Boolean)
+                .slice(0, 50)
+            : [];
+
+        const times = Array.isArray(raw.times)
+            ? raw.times
+                .map(value => String(value ?? '').trim())
+                .filter(value => /^([01]\d|2[0-3]):[0-5]\d$/.test(value))
+                .slice(0, 50)
+            : [];
+
+        const intervalSeconds = readPositiveInt(
+            raw.intervalSeconds,
+            3600,
+            10,
+            7 * 24 * 60 * 60
+        );
+
+        const messageDelaySeconds = readPositiveInt(
+            raw.messageDelaySeconds,
+            2,
+            0,
+            3600
+        );
+
+        if (!messages.length) {
+            continue;
+        }
+
+        if (mode === 'fixed' && !times.length) {
+            continue;
+        }
+
+        const id = String(raw.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+
+        result.push({
+            id,
+            enabled: raw.enabled !== false,
+            mode,
+            intervalSeconds,
+            times,
+            messages,
+            messageDelaySeconds,
+            lastIntervalRunAt: 0,
+            lastFixedRunKey: '',
+            running: false
+        });
+    }
+
+    return result;
+}
+
+function loadBotSettings() {
+    try {
+        if (!fs.existsSync(SETTINGS_FILE)) {
+            return {
+                settings: { ...DEFAULT_SETTINGS },
+                autoChatSchedules: []
+            };
+        }
+
+        const raw = fs.readFileSync(SETTINGS_FILE, 'utf8');
+        const parsed = JSON.parse(raw);
+        const settings = parsed && typeof parsed.settings === 'object'
+            ? parsed.settings
+            : {};
+
+        return {
+            settings: {
+                autoTotem: settings.autoTotem !== false,
+                antiHungry: settings.antiHungry !== false,
+                autoReconnect: settings.autoReconnect !== false
+            },
+            autoChatSchedules: sanitizeAutoChatSchedules(parsed?.autoChatSchedules)
+        };
+    } catch (err) {
+        console.error(`[SETTINGS] Không đọc được ${SETTINGS_FILE}: ${err.message}`);
+        return {
+            settings: { ...DEFAULT_SETTINGS },
+            autoChatSchedules: []
+        };
+    }
+}
+
+function saveBotSettingsFile(settings, autoChatSchedules) {
+    try {
+        const payload = {
+            version: 1,
+            settings: {
+                autoTotem: settings.autoTotem !== false,
+                antiHungry: settings.antiHungry !== false,
+                autoReconnect: settings.autoReconnect !== false
+            },
+            autoChatSchedules: sanitizeAutoChatSchedules(autoChatSchedules)
+                .map(schedule => ({
+                    id: schedule.id,
+                    enabled: schedule.enabled !== false,
+                    mode: schedule.mode,
+                    intervalSeconds: schedule.intervalSeconds,
+                    times: schedule.times,
+                    messages: schedule.messages,
+                    messageDelaySeconds: schedule.messageDelaySeconds
+                }))
+        };
+
+        const tmpFile = `${SETTINGS_FILE}.tmp-${process.pid}`;
+
+        fs.writeFileSync(
+            tmpFile,
+            JSON.stringify(payload, null, 2),
+            'utf8'
+        );
+
+        fs.renameSync(
+            tmpFile,
+            SETTINGS_FILE
+        );
+
+        return true;
+    } catch (err) {
+        try {
+            const tmpFile = `${SETTINGS_FILE}.tmp-${process.pid}`;
+            if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+        } catch (_) {}
+        console.error(`[SETTINGS] Không lưu được ${SETTINGS_FILE}: ${err.message}`);
+        return false;
+    }
+}
+
+const INITIAL_SETTINGS = loadBotSettings();
+
+app.use(express.json({ limit: '512kb', strict: true }));
 
 // API responses should not be cached. The central dashboard communicates
 // with child bots server-to-server, so wildcard CORS is intentionally disabled.
@@ -82,6 +313,17 @@ app.use((req, res, next) => {
     next();
 });
 
+app.use((err, req, res, next) => {
+    if (err && (err.type === 'entity.parse.failed' || err instanceof SyntaxError)) {
+        return res.status(400).json({ error: 'JSON request không hợp lệ.' });
+    }
+    if (err) {
+        console.error(`[HTTP] ${req.method} ${req.originalUrl || req.url}: ${err.message || err}`);
+        return res.status(500).json({ error: 'Lỗi máy chủ.' });
+    }
+    return next();
+});
+
 function cleanMinecraftText(text) {
     if (!text) return '';
 
@@ -98,24 +340,15 @@ function cleanMinecraftText(text) {
         .trim();
 }
 
-function getEnvCredentials() {
+function getConfiguredCredentials() {
     return {
-        username:
-            String(
-                process.env.BOT1_USERNAME ||
-                process.env.MC_USERNAME ||
-                ''
-            ).trim(),
-
-        password:
-            process.env.BOT1_PASSWORD ||
-            process.env.MC_PASSWORD ||
-            ''
+        username: String(BOT_CONFIG.USERNAME || '').trim(),
+        password: String(BOT_CONFIG.PASSWORD || '')
     };
 }
 
 function createBotState() {
-    const credentials = getEnvCredentials();
+    const credentials = getConfiguredCredentials();
 
     return {
         id: BOT_ID_NUMBER,
@@ -145,6 +378,18 @@ function createBotState() {
 
         reconnectTimer: null,
         afkTimers: [],
+        locationMonitorTimer: null,
+        locationRetryTimer: null,
+        locationConfirmTimer: null,
+        locationRetryAttempt: 0,
+        locationRetryReason: '',
+        locationActionBusy: false,
+        pendingAfkConfirmation: false,
+        locationState: 'unknown',
+        menuCommandIndex: 0,
+        lastLoginActionAt: 0,
+        lastDnActionAt: 0,
+        locationFlowBusy: false,
         lastAuthTime: 0,
 
         inventoryState: {
@@ -173,6 +418,15 @@ function createBotState() {
         inventoryScanTimer: null,
         totemTimer: null,
         eatTimer: null,
+        autoChatTimer: null,
+        autoChatGeneration: 0,
+
+        settings: { ...INITIAL_SETTINGS.settings },
+        autoChatSchedules: INITIAL_SETTINGS.autoChatSchedules,
+
+        publicIp: '',
+        publicIpUpdatedAt: 0,
+        publicIpTimer: null,
 
         inventoryLogSignature: '',
         previousInventorySnapshot: null,
@@ -485,6 +739,13 @@ function clearManagerTimers(state) {
         state.inventoryScanTimer = null;
     }
 
+    if (state.autoChatTimer) {
+        clearInterval(state.autoChatTimer);
+        state.autoChatTimer = null;
+    }
+
+    state.autoChatGeneration++;
+
     state.isEating = false;
     state.isEquippingTotem = false;
 }
@@ -496,9 +757,33 @@ function clearRestartTimer(state) {
     }
 }
 
+function clearLocationTimers(state) {
+    if (state.locationMonitorTimer) {
+        clearInterval(state.locationMonitorTimer);
+        state.locationMonitorTimer = null;
+    }
+
+    if (state.locationRetryTimer) {
+        clearTimeout(state.locationRetryTimer);
+        state.locationRetryTimer = null;
+    }
+
+    if (state.locationConfirmTimer) {
+        clearTimeout(state.locationConfirmTimer);
+        state.locationConfirmTimer = null;
+    }
+
+    state.locationActionBusy = false;
+    state.locationFlowBusy = false;
+    state.pendingAfkConfirmation = false;
+    state.locationRetryAttempt = 0;
+    state.locationRetryReason = '';
+}
+
 function clearAllTimers(state) {
     clearAfkTimers(state);
     clearReconnectTimer(state);
+    clearLocationTimers(state);
     clearRestartTimer(state);
     clearManagerTimers(state);
 }
@@ -1197,6 +1482,7 @@ async function autoEatTick(state) {
     const bot = state.bot;
 
     if (
+        !state.settings.antiHungry ||
         state.manuallyStopped ||
         !bot ||
         state.bot !== bot ||
@@ -1389,6 +1675,7 @@ async function autoTotemTick(state) {
     const bot = state.bot;
 
     if (
+        !state.settings.autoTotem ||
         state.manuallyStopped ||
         !bot ||
         state.bot !== bot ||
@@ -1513,6 +1800,125 @@ async function autoTotemTick(state) {
     }
 }
 
+function sleepMs(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function currentVietnamTimeParts(date = new Date()) {
+    const text = date.toLocaleString('en-GB', {
+        timeZone: 'Asia/Ho_Chi_Minh',
+        hour12: false,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit'
+    });
+
+    const match = text.match(/^(\d{2})\/(\d{2})\/(\d{4}),?\s+(\d{2}):(\d{2})$/);
+    if (!match) {
+        return { dateKey: '', timeKey: '' };
+    }
+
+    return {
+        dateKey: `${match[3]}-${match[2]}-${match[1]}`,
+        timeKey: `${match[4]}:${match[5]}`
+    };
+}
+
+function isAutoChatBotReady(state) {
+    return (
+        !state.manuallyStopped &&
+        !!state.bot &&
+        !!state.bot.player &&
+        state.status !== 'offline' &&
+        state.status !== 'connecting' &&
+        state.status !== 'authenticating' &&
+        state.status !== 'entering' &&
+        state.status !== 'kicked'
+    );
+}
+
+async function runAutoChatSchedule(state, schedule) {
+    if (
+        schedule.running ||
+        !schedule.enabled ||
+        !isAutoChatBotReady(state)
+    ) {
+        return;
+    }
+
+    const generation = state.autoChatGeneration;
+    schedule.running = true;
+
+    try {
+        for (const message of schedule.messages) {
+            if (
+                generation !== state.autoChatGeneration ||
+                !state.autoChatSchedules.includes(schedule) ||
+                !isAutoChatBotReady(state)
+            ) {
+                break;
+            }
+
+            try {
+                state.bot.chat(message);
+                state.lastWebChatText = cleanMinecraftText(message);
+                state.lastWebChatAt = Date.now();
+                addChatLog(state, 'AUTO', `→ ${message}`);
+                addLog(state, `[AUTOCHAT] Đã gửi: ${message}`);
+            } catch (err) {
+                addLog(state, `[AUTOCHAT] Gửi lỗi: ${err.message}`);
+                break;
+            }
+
+            const delay = Number(schedule.messageDelaySeconds || 0) * 1000;
+            if (delay > 0) {
+                await sleepMs(delay);
+            }
+        }
+    } finally {
+        schedule.running = false;
+    }
+}
+
+async function autoChatTick(state) {
+    if (!isAutoChatBotReady(state)) {
+        return;
+    }
+
+    const now = Date.now();
+    const timeParts = currentVietnamTimeParts(new Date(now));
+
+    for (const schedule of state.autoChatSchedules) {
+        if (!schedule.enabled || !schedule.messages.length || schedule.running) {
+            continue;
+        }
+
+        if (schedule.mode === 'fixed') {
+            for (const timeKey of schedule.times) {
+                const currentKey = `${timeParts.dateKey} ${timeKey}`;
+                if (
+                    timeParts.timeKey === timeKey &&
+                    schedule.lastFixedRunKey !== currentKey
+                ) {
+                    schedule.lastFixedRunKey = currentKey;
+                    void runAutoChatSchedule(state, schedule);
+                    break;
+                }
+            }
+        } else {
+            if (
+                !schedule.lastIntervalRunAt ||
+                now - schedule.lastIntervalRunAt >= Number(schedule.intervalSeconds || 3600) * 1000
+            ) {
+                schedule.lastIntervalRunAt = now;
+                void runAutoChatSchedule(state, schedule);
+            }
+        }
+    }
+}
+
 function startBackgroundManagers(state, bot) {
     clearManagerTimers(state);
 
@@ -1585,6 +1991,29 @@ function startBackgroundManagers(state, bot) {
                     });
             },
             AUTO_TOTEM_INTERVAL_MS
+        );
+
+    state.autoChatTimer =
+        setInterval(
+            () => {
+                if (
+                    state.manuallyStopped ||
+                    state.bot !== bot
+                ) {
+                    return;
+                }
+
+                autoChatTick(state)
+                    .catch(err => {
+                        if (state.bot === bot) {
+                            addLog(
+                                state,
+                                `[AUTOCHAT] Lỗi manager: ${err.message}`
+                            );
+                        }
+                    });
+            },
+            1000
         );
 }
 
@@ -1754,6 +2183,377 @@ function formatUptime(state) {
     );
 }
 
+function getRoundedBotCoordinates(bot) {
+    if (!bot || !bot.entity || !bot.entity.position) {
+        return null;
+    }
+
+    const x = Number(bot.entity.position.x);
+    const y = Number(bot.entity.position.y);
+    const z = Number(bot.entity.position.z);
+
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+        return null;
+    }
+
+    return {
+        x: Math.round(x),
+        y: Math.round(y),
+        z: Math.round(z)
+    };
+}
+
+function sameCoordinates(a, b) {
+    return !!a && !!b &&
+        a.x === b.x &&
+        a.y === b.y &&
+        a.z === b.z;
+}
+
+function getLocationKind(bot) {
+    const coordinates = getRoundedBotCoordinates(bot);
+
+    if (!coordinates) {
+        return 'unknown';
+    }
+
+    if (sameCoordinates(coordinates, AUTH_COORDS)) {
+        return 'login';
+    }
+
+    if (sameCoordinates(coordinates, LOBBY_COORDS)) {
+        return 'lobby';
+    }
+
+    return 'other';
+}
+
+function getLocationRetryDelay(state) {
+    const attempt = Math.max(Number(state.locationRetryAttempt || 1), 1);
+    return Math.min(
+        Math.round(LOCATION_RETRY_BASE_MS * Math.pow(1.7, attempt - 1)),
+        LOCATION_RETRY_MAX_MS
+    );
+}
+
+function scheduleLocationRetry(state, bot, reason, preserveAfkConfirmation = false) {
+    if (
+        state.shuttingDown ||
+        state.manuallyStopped ||
+        state.bot !== bot
+    ) {
+        return;
+    }
+
+    if (!state.settings.autoReconnect) {
+        state.locationRetryTimer = null;
+        state.locationFlowBusy = false;
+        state.pendingAfkConfirmation = false;
+        state.ready = false;
+        return;
+    }
+
+    if (state.locationRetryTimer) {
+        return;
+    }
+
+    state.locationRetryAttempt++;
+    state.locationRetryReason = reason;
+    state.ready = false;
+    state.locationFlowBusy = true;
+
+    if (!preserveAfkConfirmation) {
+        state.pendingAfkConfirmation = false;
+    }
+
+    const delay = getLocationRetryDelay(state);
+
+    if (reason === 'login') {
+        setBotStatus(state, 'authenticating');
+    } else {
+        setBotStatus(state, 'entering');
+    }
+
+    addLog(
+        state,
+        `[FLOW] Thử lại ${reason} lần #${state.locationRetryAttempt} sau ${delay / 1000}s.`
+    );
+
+    state.locationRetryTimer = setTimeout(() => {
+        state.locationRetryTimer = null;
+
+        if (
+            state.shuttingDown ||
+            state.manuallyStopped ||
+            state.bot !== bot
+        ) {
+            return;
+        }
+
+        if (preserveAfkConfirmation) {
+            const kind = getLocationKind(bot);
+
+            if (kind === 'other') {
+                state.pendingAfkConfirmation = true;
+                state.locationFlowBusy = true;
+
+                if (!state.locationConfirmTimer) {
+                    state.locationConfirmTimer = setTimeout(() => {
+                        state.locationConfirmTimer = null;
+                        confirmAfkAfterClick(state, bot);
+                    }, AFK_CONFIRM_DELAY_MS);
+                }
+                return;
+            }
+
+            if (reason === 'menu-confirm' && kind === 'lobby') {
+                state.pendingAfkConfirmation = true;
+                state.locationFlowBusy = true;
+                startAfkRoutine(state, bot);
+                return;
+            }
+
+            state.pendingAfkConfirmation = false;
+        }
+
+        state.locationFlowBusy = false;
+    }, delay);
+}
+
+function confirmAfkAfterClick(state, bot) {
+    if (
+        state.shuttingDown ||
+        state.manuallyStopped ||
+        state.bot !== bot ||
+        !state.pendingAfkConfirmation
+    ) {
+        return;
+    }
+
+    const kind = getLocationKind(bot);
+    state.locationState = kind;
+
+    if (kind === 'other') {
+        state.pendingAfkConfirmation = false;
+        state.locationFlowBusy = false;
+        state.ready = true;
+        state.locationRetryAttempt = 0;
+        state.locationRetryReason = '';
+        state.menuCommandIndex = 0;
+        setBotStatus(state, 'afk');
+
+        addLog(state, '[FLOW] Xác nhận tọa độ sau click: đã rời LOGIN/LOBBY.');
+        addLog(state, '✅ Đã xác nhận trạng thái AFK.');
+        return;
+    }
+
+    state.ready = false;
+
+    if (kind === 'login') {
+        state.pendingAfkConfirmation = false;
+        state.locationFlowBusy = false;
+        setBotStatus(state, 'authenticating');
+        scheduleLocationRetry(state, bot, 'login');
+        return;
+    }
+
+    if (kind === 'lobby') {
+        setBotStatus(state, 'entering');
+        scheduleLocationRetry(state, bot, 'menu-confirm', true);
+        return;
+    }
+
+    scheduleLocationRetry(state, bot, 'coordinate', true);
+}
+
+function startLocationMonitor(state, bot) {
+    clearLocationTimers(state);
+
+    const tick = () => {
+        if (
+            state.shuttingDown ||
+            state.manuallyStopped ||
+            state.bot !== bot ||
+            !bot.entity
+        ) {
+            return;
+        }
+
+        const kind = getLocationKind(bot);
+        state.locationState = kind;
+
+        if (state.pendingAfkConfirmation && kind !== 'unknown') {
+            if (!state.locationConfirmTimer) {
+                state.locationConfirmTimer = setTimeout(() => {
+                    state.locationConfirmTimer = null;
+                    confirmAfkAfterClick(state, bot);
+                }, AFK_CONFIRM_DELAY_MS);
+            }
+            return;
+        }
+
+        if (state.locationRetryTimer || state.locationActionBusy) {
+            return;
+        }
+
+        if (state.locationFlowBusy || state.pendingAfkConfirmation) {
+            return;
+        }
+
+        if (kind === 'login') {
+            if (state.status === 'afk') {
+                state.ready = false;
+                setBotStatus(state, 'authenticating');
+            }
+
+            const now = Date.now();
+            if (
+                state.settings.autoReconnect &&
+                state.password &&
+                now - state.lastLoginActionAt >= LOCATION_ACTION_COOLDOWN_MS
+            ) {
+                state.lastLoginActionAt = now;
+                state.locationActionBusy = true;
+                state.locationFlowBusy = true;
+                state.ready = false;
+                setBotStatus(state, 'authenticating');
+
+                try {
+                    bot.chat(`/login ${state.password}`);
+                    addLog(state, '[FLOW] Tọa độ LOGIN xác nhận → gửi /login.');
+                } catch (err) {
+                    addLog(state, `[FLOW] /login lỗi: ${err.message}`);
+                } finally {
+                    state.locationActionBusy = false;
+                }
+
+                const verifyTimer = setTimeout(() => {
+                    if (state.bot !== bot || state.manuallyStopped) return;
+                    if (getLocationKind(bot) === 'login') {
+                        state.locationFlowBusy = false;
+                        scheduleLocationRetry(state, bot, 'login');
+                    } else {
+                        state.locationFlowBusy = false;
+                        state.locationRetryAttempt = 0;
+                    }
+                }, 1200);
+                state.afkTimers.push(verifyTimer);
+            }
+
+            return;
+        }
+
+        if (kind === 'lobby') {
+            if (state.status === 'afk') {
+                state.ready = false;
+                setBotStatus(state, 'entering');
+            }
+
+            if (!state.password) {
+                return;
+            }
+
+            if (state.locationFlowBusy || state.pendingAfkConfirmation) {
+                return;
+            }
+
+            const now = Date.now();
+            if (
+                state.settings.autoReconnect &&
+                now - state.lastDnActionAt >= LOCATION_ACTION_COOLDOWN_MS
+            ) {
+                state.lastDnActionAt = now;
+                state.locationFlowBusy = true;
+                state.ready = false;
+                setBotStatus(state, 'entering');
+
+                try {
+                    bot.chat(`/dn ${state.password}`);
+                    addLog(state, '[FLOW] Tọa độ LOBBY xác nhận → gửi /dn.');
+                } catch (err) {
+                    state.locationFlowBusy = false;
+                    addLog(state, `[FLOW] /dn lỗi: ${err.message}`);
+                    scheduleLocationRetry(state, bot, 'lobby');
+                    return;
+                }
+
+                const timer = setTimeout(() => {
+                    if (
+                        state.bot === bot &&
+                        !state.manuallyStopped &&
+                        getLocationKind(bot) === 'lobby'
+                    ) {
+                        startAfkRoutine(state, bot);
+                    } else {
+                        state.locationFlowBusy = false;
+                    }
+                }, DN_TO_AFK_DELAY);
+
+                state.afkTimers.push(timer);
+            }
+
+            return;
+        }
+
+        if (state.status === 'afk' && state.ready) {
+            return;
+        }
+
+        if (!state.pendingAfkConfirmation && state.status === 'authenticating') {
+            state.ready = false;
+        }
+    };
+
+    tick();
+
+    state.locationMonitorTimer = setInterval(
+        tick,
+        COORD_SCAN_INTERVAL_MS
+    );
+}
+
+async function refreshPublicIp(state) {
+    let controller = null;
+    let timer = null;
+    try {
+        controller = new AbortController();
+        timer = setTimeout(() => controller.abort(), 10000);
+        const response = await fetch('https://api.ipify.org?format=json', {
+            method: 'GET',
+            cache: 'no-store',
+            signal: controller.signal
+        });
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        const ip = String(data?.ip || '').trim();
+
+        if (ip) {
+            state.publicIp = ip;
+            state.publicIpUpdatedAt = Date.now();
+        }
+    } catch (err) {
+        const message = err?.name === 'AbortError' ? 'Timeout khi lấy IP public.' : (err?.message || 'Lỗi không xác định.');
+        addLog(state, `[IP] Không lấy được IP public: ${message}`);
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
+function startPublicIpMonitor(state) {
+    if (state.publicIpTimer) {
+        clearInterval(state.publicIpTimer);
+    }
+
+    void refreshPublicIp(state);
+    state.publicIpTimer = setInterval(
+        () => void refreshPublicIp(state),
+        IP_REFRESH_INTERVAL_MS
+    );
+}
+
 function getBotPosition(state) {
     if (
         !state.bot ||
@@ -1840,11 +2640,43 @@ function publicBotState(state) {
         hasCredentials:
             !!(state.username && state.password),
 
+        ipAddress:
+            state.publicIp || '',
+
+        ipAddressUpdatedAt:
+            state.publicIpUpdatedAt || null,
+
+        settings: {
+            autoTotem: state.settings.autoTotem !== false,
+            antiHungry: state.settings.antiHungry !== false,
+            autoReconnect: state.settings.autoReconnect !== false
+        },
+
+        autoChatScheduleCount:
+            state.autoChatSchedules.length,
+
+        locationState:
+            state.locationState,
+
+        roundedLocation:
+            getRoundedBotCoordinates(state.bot),
+
         position:
             getBotPosition(state),
 
         dimension:
             getBotDimension(state)
+    };
+}
+
+
+function publicBotCredentials(state) {
+    return {
+        ok: true,
+        botId: BOT_ID,
+        label: BOT_LABEL,
+        username: state.username || '',
+        password: state.password || ''
     };
 }
 
@@ -1873,6 +2705,7 @@ function scheduleReconnect(state) {
     if (
         state.shuttingDown ||
         state.manuallyStopped ||
+        !state.settings.autoReconnect ||
         state.reconnectTimer
     ) {
         return;
@@ -1976,7 +2809,6 @@ function startBot(state) {
         state.restartTimer = null;
     }
 
-    state.hostIndex = 0;
     state.ready = false;
     state.connectedAt = null;
     state.reconnectAttempts = 0;
@@ -2073,6 +2905,10 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
             state,
             `Bị kick: ${cleanMinecraftText(reasonText)}`
         );
+
+        if (state.settings.autoReconnect) {
+            scheduleReconnect(state);
+        }
     });
 
     bot.on('end', () => {
@@ -2112,9 +2948,15 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
             `Reconnect #${state.reconnectCount}.`
         );
 
-        if (HOSTS.length > 1) {
-            state.hostIndex =
-                (state.hostIndex + 1) % HOSTS.length;
+        if (!state.settings.autoReconnect) {
+            addLog(state, '[RECONNECT] Auto reconnect đang tắt.');
+            return;
+        }
+
+        if (HOSTS.length > 1 && state.reconnectAttempts >= 3) {
+            state.hostIndex = (state.hostIndex + 1) % HOSTS.length;
+            state.reconnectAttempts = 0;
+            addLog(state, `[HOST] Chuyển sang ${currentHost(state)} sau nhiều lần reconnect thất bại.`);
         }
 
         scheduleReconnect(state);
@@ -2138,6 +2980,8 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
             state,
             bot
         );
+
+        startLocationMonitor(state, bot);
     });
 
     bot.on('death', () => {
@@ -2330,23 +3174,17 @@ function handleServerMessage(
     }
 
     const text = jsonMsg.toString();
-    const cleanMsg =
-        cleanMinecraftText(text);
-    const lowerMsg =
-        cleanMsg.toLowerCase();
+    const cleanMsg = cleanMinecraftText(text);
+    const lowerMsg = cleanMsg.toLowerCase();
 
-    const customChat =
-        parseCustomChatLine(
-            cleanMsg
-        );
+    const customChat = parseCustomChatLine(cleanMsg);
 
-    const customChatIsOwnRecentWebMessage =
-        !!(
-            customChat &&
-            customChat.username === bot.username &&
-            cleanMinecraftText(state.lastWebChatText) === customChat.message &&
-            Date.now() - state.lastWebChatAt <= 2500
-        );
+    const customChatIsOwnRecentWebMessage = !!(
+        customChat &&
+        customChat.username === bot.username &&
+        cleanMinecraftText(state.lastWebChatText) === customChat.message &&
+        Date.now() - state.lastWebChatAt <= 2500
+    );
 
     if (
         customChat &&
@@ -2366,294 +3204,209 @@ function handleServerMessage(
         );
     }
 
-    // Giữ toàn bộ [MC] message trên web,
-    // chỉ bỏ những message spam/không cần thiết.
     const shouldShowMcLog =
         !BLOCKED_MC_LOG_PATTERNS.some(
-            pattern =>
-                lowerMsg.includes(pattern)
+            pattern => lowerMsg.includes(pattern)
         );
 
     if (
         shouldShowMcLog &&
         !customChat &&
-        !isRecentChatMessage(
-            state,
-            cleanMsg
-        ) &&
+        !isRecentChatMessage(state, cleanMsg) &&
         !(
             /^<[^>]{1,32}>\s/.test(cleanMsg) ||
             /^\[[^\]]{1,24}\]\s*\S{1,32}\s*[>:»]\s*/.test(cleanMsg) ||
             /^\S{1,32}\s*[>:»]\s+/.test(cleanMsg)
         )
     ) {
-        addLog(
-            state,
-            `[MC] ${cleanMsg}`
-        );
+        addLog(state, `[MC] ${cleanMsg}`);
     }
 
-    // -------------------------------------------------------------------------
-    // Lobby detection + /dn
-    // -------------------------------------------------------------------------
+    if (lowerMsg.includes('kingmc.vn')) {
+        const kind = getLocationKind(bot);
 
-    if (
-        lowerMsg.includes('kingmc.vn')
-    ) {
-        const pos =
-            bot && bot.entity
-                ? bot.entity.position
-                : null;
-
-        let isLobby = false;
-
-        if (pos) {
-            const dx =
-                Math.abs(pos.x - 0.50);
-
-            const dy =
-                Math.abs(pos.y - 41.00);
-
-            const dz =
-                Math.abs(pos.z - 0.80);
-
-            if (
-                dx <= 2.0 &&
-                dy <= 2.0 &&
-                dz <= 2.0
-            ) {
-                isLobby = true;
-            }
-        }
-
-        if (isLobby) {
-            const now = Date.now();
-
-            if (
-                !state.lastAuthTime ||
-                now - state.lastAuthTime > 5000
-            ) {
-                state.lastAuthTime = now;
-
-                state.ready = false;
+        if (kind === 'login') {
+            state.locationState = 'login';
+            state.ready = false;
+            if (state.status === 'afk' || state.status === 'online') {
                 setBotStatus(state, 'authenticating');
-
-                addLog(
-                    state,
-                    'Đã nhận diện Lobby KingMC.'
-                );
-
-                if (!state.password) {
-                    addLog(
-                        state,
-                        'Thiếu password, không thể gửi /dn.'
-                    );
-
-                    return;
-                }
-
-                bot.chat(
-                    `/dn ${state.password}`
-                );
-
-                addLog(
-                    state,
-                    'Đã gửi /dn.'
-                );
-
-                const timer =
-                    setTimeout(() => {
-                        if (
-                            !state.manuallyStopped &&
-                            state.bot === bot
-                        ) {
-                            startAfkRoutine(
-                                state
-                            );
-                        }
-                    }, DN_TO_AFK_DELAY);
-
-                state.afkTimers.push(
-                    timer
-                );
+            }
+        } else if (kind === 'lobby') {
+            state.locationState = 'lobby';
+            state.ready = false;
+            if (state.status === 'afk' || state.status === 'online') {
+                setBotStatus(state, 'entering');
             }
         }
 
         return;
     }
 
-    // -------------------------------------------------------------------------
-    // Fallback /register
-    // -------------------------------------------------------------------------
-
+    // Fallback registration/login messages are retained as a trigger,
+    // but coordinate confirmation remains authoritative for status/flow.
     if (
         state.password &&
         (
             lowerMsg.includes('/dk') ||
-            lowerMsg.includes(
-                'dang ky bang lenh'
-            ) ||
-            lowerMsg.includes(
-                'dang ky'
-            ) ||
-            lowerMsg.includes(
-                '/register'
-            )
+            lowerMsg.includes('dang ky bang lenh') ||
+            lowerMsg.includes('dang ky') ||
+            lowerMsg.includes('/register')
         )
     ) {
-        const now = Date.now();
-
-        if (
-            !state.lastAuthTime ||
-            now - state.lastAuthTime > 3000
-        ) {
-            state.lastAuthTime = now;
-
-            setBotStatus(state, 'authenticating');
-
-            bot.chat(
-                `/register ${state.password} ${state.password}`
-            );
-
-            addLog(
-                state,
-                'Đã gửi /register.'
-            );
+        const kind = getLocationKind(bot);
+        if (kind === 'login' && state.settings.autoReconnect) {
+            const now = Date.now();
+            if (
+                now - state.lastAuthTime > 3000 &&
+                now - state.lastLoginActionAt > 1500
+            ) {
+                state.lastAuthTime = now;
+                state.lastLoginActionAt = now;
+                try {
+                    bot.chat(`/register ${state.password} ${state.password}`);
+                    addLog(state, '[FLOW] Message register xác nhận → gửi /register.');
+                } catch (err) {
+                    addLog(state, `[FLOW] /register lỗi: ${err.message}`);
+                }
+            }
         }
-
         return;
     }
-
-    // -------------------------------------------------------------------------
-    // Fallback /login
-    // -------------------------------------------------------------------------
 
     if (
         state.password &&
         (
             lowerMsg.includes('/dn') ||
-            lowerMsg.includes(
-                'vui long'
-            ) ||
-            lowerMsg.includes(
-                'dang nhap'
-            ) ||
-            lowerMsg.includes(
-                '/login'
-            )
+            lowerMsg.includes('vui long') ||
+            lowerMsg.includes('dang nhap') ||
+            lowerMsg.includes('/login')
         )
     ) {
-        const now = Date.now();
-
-        if (
-            !state.lastAuthTime ||
-            now - state.lastAuthTime > 3000
-        ) {
-            state.lastAuthTime = now;
-
-            setBotStatus(state, 'authenticating');
-
-            bot.chat(
-                `/login ${state.password}`
-            );
-
-            addLog(
-                state,
-                'Đã gửi /login.'
-            );
+        const kind = getLocationKind(bot);
+        if (kind === 'login' && state.settings.autoReconnect) {
+            const now = Date.now();
+            if (
+                now - state.lastAuthTime > 3000 &&
+                now - state.lastLoginActionAt > 1500
+            ) {
+                state.lastAuthTime = now;
+                state.lastLoginActionAt = now;
+                try {
+                    bot.chat(`/login ${state.password}`);
+                    addLog(state, '[FLOW] Message login xác nhận → gửi /login.');
+                } catch (err) {
+                    addLog(state, `[FLOW] /login lỗi: ${err.message}`);
+                }
+            }
         }
     }
 }
 
-function startAfkRoutine(state) {
-    const bot = state.bot;
+function startAfkRoutine(state, expectedBot = state.bot) {
+    const bot = expectedBot;
 
     if (
+        state.shuttingDown ||
         state.manuallyStopped ||
-        !bot
+        !bot ||
+        state.bot !== bot
     ) {
         return;
     }
 
-    clearAfkTimers(state);
+    if (getLocationKind(bot) !== 'lobby') {
+        state.ready = false;
+        state.locationFlowBusy = false;
+        return;
+    }
 
+    state.locationFlowBusy = true;
+    clearAfkTimers(state);
+    if (state.locationConfirmTimer) {
+        clearTimeout(state.locationConfirmTimer);
+        state.locationConfirmTimer = null;
+    }
+    state.pendingAfkConfirmation = false;
     state.ready = false;
     setBotStatus(state, 'entering');
 
-    const menuTimer =
-        setTimeout(() => {
+    const menuCommands = ['/menu', '/gui'];
+    const command = menuCommands[state.menuCommandIndex % menuCommands.length];
+
+    const menuTimer = setTimeout(() => {
+        if (
+            state.shuttingDown ||
+            state.manuallyStopped ||
+            state.bot !== bot ||
+            getLocationKind(bot) !== 'lobby'
+        ) {
+            return;
+        }
+
+        try {
+            bot.chat(command);
+            addLog(state, `[FLOW] Gửi ${command}.`);
+        } catch (err) {
+            addLog(state, `[FLOW] ${command} lỗi: ${err.message}`);
+            scheduleLocationRetry(state, bot, 'lobby');
+            return;
+        }
+
+        const clickTimer = setTimeout(() => {
             if (
+                state.shuttingDown ||
                 state.manuallyStopped ||
                 state.bot !== bot
             ) {
                 return;
             }
 
-            bot.chat('/menu');
+            const currentWindow = bot.currentWindow;
 
-            const clickTimer =
-                setTimeout(() => {
-                    if (
-                        state.manuallyStopped ||
-                        state.bot !== bot
-                    ) {
-                        return;
-                    }
+            if (!currentWindow) {
+                state.menuCommandIndex++;
+                state.locationFlowBusy = false;
+                addLog(state, `Không có GUI sau ${command}. Sẽ thử lại flow.`);
+                scheduleLocationRetry(state, bot, 'lobby');
+                return;
+            }
 
-                    const currentWindow =
-                        bot.currentWindow;
+            try {
+                if (getLocationKind(bot) !== 'lobby') {
+                    state.ready = false;
+                    return;
+                }
 
-                    if (!currentWindow) {
-                        addLog(
-                            state,
-                            'Không có GUI /menu. Thử lại routine.'
-                        );
+                bot.clickWindow(24, 0, 0);
 
-                        startAfkRoutine(
-                            state
-                        );
+                state.ready = false;
+                state.pendingAfkConfirmation = true;
+                setBotStatus(state, 'entering');
 
-                        return;
-                    }
+                addLog(state, 'Đã click slot 24. Chờ xác nhận tọa độ trước khi đánh dấu AFK.');
 
-                    try {
-                        bot.clickWindow(
-                            24,
-                            0,
-                            0
-                        );
+                if (state.locationConfirmTimer) {
+                    clearTimeout(state.locationConfirmTimer);
+                }
 
-                        state.ready = true;
-                        setBotStatus(state, 'afk');
+                state.locationConfirmTimer = setTimeout(() => {
+                    state.locationConfirmTimer = null;
+                    confirmAfkAfterClick(state, bot);
+                }, AFK_CONFIRM_DELAY_MS);
+            } catch (err) {
+                state.ready = false;
+                state.pendingAfkConfirmation = false;
+                state.locationFlowBusy = false;
+                setBotStatus(state, 'entering');
+                addLog(state, `Lỗi click slot 24: ${err.message}`);
+                scheduleLocationRetry(state, bot, 'lobby');
+            }
+        }, AFK_MENU_CLICK_DELAY);
 
-                        addLog(
-                            state,
-                            'Đã click slot 24.'
-                        );
+        state.afkTimers.push(clickTimer);
+    }, AFK_MENU_DELAY);
 
-                        addLog(
-                            state,
-                            '✅ Đã vào trạng thái AFK.'
-                        );
-                    } catch (err) {
-                        state.ready = false;
-                        setBotStatus(state, 'online');
-
-                        addLog(
-                            state,
-                            `Lỗi click slot 24: ${err.message}`
-                        );
-                    }
-                }, AFK_MENU_CLICK_DELAY);
-
-            state.afkTimers.push(
-                clickTimer
-            );
-        }, AFK_MENU_DELAY);
-
-    state.afkTimers.push(
-        menuTimer
-    );
+    state.afkTimers.push(menuTimer);
 }
 
 const HTML = `<!doctype html>
@@ -3147,6 +3900,20 @@ label{
    font-variant-numeric:tabular-nums
 }
 
+
+.setting-list{display:grid;gap:9px;margin-bottom:12px}
+.check-row{display:flex;align-items:center;gap:9px;padding:9px 10px;border-radius:10px;background:var(--card2);font-size:12px;cursor:pointer}
+.check-row input{width:auto;accent-color:var(--blue)}
+.schedule-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:8px;margin:10px 0}
+.schedule-card{padding:9px;border:1px solid rgba(255,255,255,.08);border-radius:11px;background:linear-gradient(180deg,#151f29,#111a22);display:grid;gap:7px;box-shadow:0 5px 18px rgba(0,0,0,.14)}
+.schedule-header{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.schedule-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:7px}
+.schedule-field{display:grid;gap:4px}
+.schedule-field>span{color:var(--muted);font-size:9px}
+.schedule-field input,.schedule-field select,.schedule-card textarea{padding:8px 9px;border-radius:8px;font-size:11px}
+.schedule-card textarea{min-height:66px;resize:vertical}
+.schedule-actions{display:flex;justify-content:flex-end;gap:6px}
+.hidden-field{display:none!important}
 @media(max-width:520px){
    .inventory-grid{
      grid-template-columns:1fr
@@ -3285,11 +4052,24 @@ label{
 
         <div class="info-item">
           <div class="info-label">
-            DIMENSION
+            DIMENSION / LOCATION
           </div>
 
           <div
             id="detailDimension"
+            class="info-value"
+          >
+            -
+          </div>
+        </div>
+
+        <div class="info-item">
+          <div class="info-label">
+            BOT IP
+          </div>
+
+          <div
+            id="detailIp"
             class="info-value"
           >
             -
@@ -3330,7 +4110,10 @@ label{
 
       <div class="chat-title-row">
         <h3>Chat</h3>
-        <div id="chatRevision" class="revision">revision 0</div>
+        <div style="display:flex;align-items:center;gap:7px;">
+          <div id="chatRevision" class="revision">revision 0</div>
+          <button class="small danger" type="button" onclick="clearChatHistory()">Xóa lịch sử</button>
+        </div>
       </div>
 
       <div
@@ -3368,7 +4151,10 @@ label{
 
       <div class="chat-title-row">
         <h3>Event Log</h3>
-        <div id="eventRevision" class="revision">revision 0</div>
+        <div style="display:flex;align-items:center;gap:7px;">
+          <div id="eventRevision" class="revision">revision 0</div>
+          <button class="small danger" type="button" onclick="clearEventHistory()">Xóa lịch sử</button>
+        </div>
       </div>
 
       <div
@@ -3521,6 +4307,37 @@ label{
 
     </div>
 
+    <div id="settingsPanel" class="panel">
+
+      <div class="chat-title-row">
+        <h3>Settings</h3>
+        <div class="revision">Lưu runtime + file setting</div>
+      </div>
+
+      <div class="setting-list">
+        <label class="check-row"><input id="settingAutoTotem" type="checkbox"> <span>Auto Totem</span></label>
+        <label class="check-row"><input id="settingAntiHungry" type="checkbox"> <span>Anti Hungry / Auto Eat</span></label>
+        <label class="check-row"><input id="settingAutoReconnect" type="checkbox"> <span>Auto Reconnect + tự thử lại LOGIN/DN/MENU</span></label>
+      </div>
+
+      <button class="primary" type="button" onclick="saveSettings()">Lưu setting</button>
+      <div class="note">Tọa độ được quét mỗi 250ms. AFK chỉ được xác nhận khi tọa độ sau click không còn ở LOGIN hoặc LOBBY.</div>
+
+    </div>
+
+    <div class="panel">
+
+      <div class="chat-title-row">
+        <h3>Auto Chat</h3>
+        <button class="small primary" type="button" onclick="addAutoChatSchedule()">＋ Thêm lịch</button>
+      </div>
+
+      <div id="autoChatSchedules" class="schedule-list"></div>
+      <div class="note">Có thể đặt nhiều lịch cố định hoặc lặp theo khoảng thời gian. Trong mỗi lịch có thể có nhiều tin nhắn và delay giữa từng tin.</div>
+      <button class="primary" type="button" onclick="saveSettings()">Lưu Auto Chat</button>
+
+    </div>
+
     <div class="panel">
 
       <h3>Tài khoản</h3>
@@ -3564,7 +4381,7 @@ label{
       <div class="note">
         Có thể đổi username hoặc password riêng lẻ.
         Bấm "Chạy lại" để áp dụng tài khoản mới.
-        Khi service khởi động lại, nếu ENV có đủ username/password thì bot sẽ tự kết nối lại.
+        Khi service khởi động lại, bot sẽ dùng username/password trong BOT_CONFIG để tự kết nối lại.
       </div>
 
     </div>
@@ -3580,17 +4397,15 @@ label{
   class="toast"
 ></div>
 
+
 <script>
+'use strict';
 
 let bot = null;
 let inventory = null;
-
+let autoChatSchedules = [];
 let lastLogRevision = -1;
 let lastChatRevision = -1;
-
-let logRequestInFlight = false;
-let chatRequestInFlight = false;
-
 let uptimeSyncAt = Date.now();
 
 let draggedSlot = null;
@@ -3598,12 +4413,28 @@ let inventoryActionInFlight = false;
 let refreshInFlight = false;
 let refreshQueued = false;
 let actionRequestInFlight = false;
-let syncEpoch = 0;
-let lastRenderedInventoryRevision = -1;
+let settingsDirty = false;
+let settingsSaveInFlight = false;
+let refreshGeneration = 0;
+
+function byId(id) {
+  return document.getElementById(id);
+}
+
 
 function invalidatePendingReads() {
-  syncEpoch++;
-  return syncEpoch;
+  refreshGeneration++;
+  return refreshGeneration;
+}
+
+function renderPublicIp() {
+  const element = byId('detailIp');
+  if (element) element.textContent = bot?.ipAddress || '-';
+}
+
+function renderSettings() {
+  if (!bot) return;
+  renderPublicSettings({ settings: bot.settings || {} });
 }
 
 function runQueuedRefresh() {
@@ -3614,448 +4445,847 @@ function runQueuedRefresh() {
     !inventoryActionInFlight
   ) {
     refreshQueued = false;
-    void refresh();
+    void refresh(true);
   }
 }
 
-function statusMeta(status) {
 
-  const map = {
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
 
-    online:[
-      'green',
-      'ONLINE'
-    ],
+function showToast(message) {
+  const toast = byId('toast');
+  if (!toast) return;
 
-    afk:[
-      'green',
-      'AFK'
-    ],
+  toast.textContent = String(message || 'Đã xử lý.');
+  toast.style.display = 'block';
 
-    connecting:[
-      'yellow',
-      'CONNECTING'
-    ],
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(function() {
+    toast.style.display = 'none';
+  }, 2600);
+}
 
-    authenticating:[
-      'blue',
-      'AUTH'
-    ],
+async function apiJson(url, options) {
+  const original = options || {};
+  const controller = new AbortController();
+  const timeoutMs = Number.isFinite(Number(original.timeoutMs))
+    ? Math.max(1000, Math.min(30000, Number(original.timeoutMs)))
+    : 15000;
+  const timer = setTimeout(function() { controller.abort(); }, timeoutMs);
+  const requestOptions = {
+    cache: 'no-store',
+    ...original,
+    signal: original.signal || controller.signal
+  };
+  delete requestOptions.timeoutMs;
 
-    entering:[
-      'blue',
-      'ENTERING SERVER'
-    ],
+  try {
+    const response = await fetch(url, requestOptions);
+    const text = await response.text();
+    let data = {};
+    if (text) {
+      try { data = JSON.parse(text); }
+      catch (_) { data = { raw: text }; }
+    }
+    return { ok: response.ok, status: response.status, data };
+  } catch (err) {
+    return {
+      ok: false,
+      status: 0,
+      data: {
+        error: err && err.name === 'AbortError'
+          ? 'Request web quá thời gian chờ.'
+          : (err.message || 'Không thể kết nối server web.')
+      }
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
-    kicked:[
-      'red',
-      'KICKED'
-    ],
+function statusMeta(status, available) {
+  if (!available) return ['red', 'OFFLINE / KHÔNG KẾT NỐI'];
+  switch (status) {
+    case 'afk': return ['green', 'AFK'];
+    case 'online': return ['blue', 'ONLINE'];
+    case 'connecting': return ['yellow', 'ĐANG KẾT NỐI'];
+    case 'authenticating': return ['yellow', 'ĐANG ĐĂNG NHẬP'];
+    case 'entering': return ['yellow', 'ĐANG VÀO AFK'];
+    case 'kicked': return ['red', 'BỊ KICK'];
+    case 'offline':
+    default: return ['red', 'OFFLINE'];
+  }
+}
 
-    offline:[
-      'red',
-      'OFFLINE'
-    ]
+function renderDimensionLocation() {
+  const element = byId('detailDimension');
+  if (!element) return;
 
+  const dimension = bot && bot.dimension ? String(bot.dimension) : '-';
+  const location = String(bot && bot.locationState || '').toLowerCase();
+  const position = bot && bot.roundedLocation;
+
+  let locationLabel = '';
+  if (location === 'login') locationLabel = 'LOGIN';
+  else if (location === 'lobby') locationLabel = 'LOBBY';
+  else if (location === 'other') locationLabel = 'OTHER';
+
+  if (position && Number.isFinite(Number(position.x)) &&
+      Number.isFinite(Number(position.y)) &&
+      Number.isFinite(Number(position.z))) {
+    const coord = '(' +
+      Math.round(Number(position.x)) + ' ' +
+      Math.round(Number(position.y)) + ' ' +
+      Math.round(Number(position.z)) + ')';
+
+    if (locationLabel) {
+      element.textContent = dimension + ' • ' + locationLabel + ' ' + coord;
+    } else {
+      element.textContent = dimension + ' • ' + coord;
+    }
+    return;
+  }
+
+  element.textContent = locationLabel
+    ? dimension + ' • ' + locationLabel
+    : dimension;
+}
+
+function renderBotState() {
+  if (!bot) return;
+
+  const statusInfo = statusMeta(bot.status, bot.available !== false);
+  const status = byId('detailStatus');
+  if (status) {
+    status.innerHTML =
+      '<span class="dot ' + statusInfo[0] + '"></span>' +
+      escapeHtml(statusInfo[1]);
+  }
+
+  const title = byId('detailTitle');
+  if (title) title.textContent = bot.label || 'KingMC Bot';
+
+  const username = byId('detailUsername');
+  if (username) username.textContent = bot.username || 'Chưa đặt';
+
+  const host = byId('detailHost');
+  if (host) {
+    host.textContent = bot.host
+      ? String(bot.host) + ':' + String(bot.port ?? '')
+      : '-';
+  }
+
+  const ping = byId('detailPing');
+  if (ping) ping.textContent =
+    bot.ping == null ? '--' : String(bot.ping) + ' ms';
+
+  const reconnects = byId('detailReconnects');
+  if (reconnects) reconnects.textContent = String(bot.reconnectCount || 0);
+
+  const position = byId('detailPosition');
+  const p = bot.position;
+
+  if (position) {
+    position.textContent =
+      p && Number.isFinite(Number(p.x)) &&
+      Number.isFinite(Number(p.y)) &&
+      Number.isFinite(Number(p.z))
+        ? Math.round(Number(p.x)) + ' ' +
+          Math.round(Number(p.y)) + ' ' +
+          Math.round(Number(p.z))
+        : '-';
+  }
+
+  const ip = byId('detailIp');
+  if (ip) ip.textContent = bot.ipAddress || '-';
+
+  renderDimensionLocation();
+}
+
+function renderPublicSettings(settingsData) {
+  if (!settingsData || !settingsData.settings) return;
+
+  const settings = settingsData.settings;
+  const autoTotem = byId('settingAutoTotem');
+  const antiHungry = byId('settingAntiHungry');
+  const autoReconnect = byId('settingAutoReconnect');
+
+  if (autoTotem) autoTotem.checked = settings.autoTotem !== false;
+  if (antiHungry) antiHungry.checked = settings.antiHungry !== false;
+  if (autoReconnect) autoReconnect.checked = settings.autoReconnect !== false;
+}
+
+function scheduleFieldVisibility(card) {
+  if (!card) return;
+
+  const modeElement = card.querySelector('[data-field="mode"]');
+  const mode = modeElement && modeElement.value === 'fixed'
+    ? 'fixed'
+    : 'interval';
+
+  const intervalField = card.querySelector('[data-role="interval-field"]');
+  const fixedField = card.querySelector('[data-role="fixed-field"]');
+
+  if (intervalField) {
+    intervalField.classList.toggle('hidden-field', mode !== 'interval');
+  }
+
+  if (fixedField) {
+    fixedField.classList.toggle('hidden-field', mode !== 'fixed');
+  }
+}
+
+function clampClientNumber(value, fallback, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(min, Math.min(max, number));
+}
+
+function normalizeScheduleForClient(schedule, index) {
+  const raw = schedule && typeof schedule === 'object' ? schedule : {};
+  const mode = raw.mode === 'fixed' ? 'fixed' : 'interval';
+
+  return {
+    id: String(raw.id || (Date.now() + '-' + index)),
+    enabled: raw.enabled !== false,
+    mode: mode,
+    intervalSeconds: clampClientNumber(raw.intervalSeconds, 3600, 10, 604800),
+    times: Array.isArray(raw.times)
+      ? raw.times.map(function(value) { return String(value || '').trim(); }).filter(Boolean)
+      : [],
+    messages: Array.isArray(raw.messages)
+      ? raw.messages.map(function(value) { return String(value || '').trim(); }).filter(Boolean)
+      : [],
+    messageDelaySeconds: clampClientNumber(raw.messageDelaySeconds, 0, 0, 3600)
+  };
+}
+
+function renderAutoChatSchedules(schedules) {
+  const box = byId('autoChatSchedules');
+  if (!box) return;
+
+  const list = Array.isArray(schedules)
+    ? schedules.map(normalizeScheduleForClient)
+    : [];
+
+  autoChatSchedules = list;
+
+  if (!list.length) {
+    box.innerHTML =
+      '<div class="note">Chưa có lịch auto chat. Bấm “＋ Thêm lịch” để tạo.</div>';
+    return;
+  }
+
+  box.innerHTML = list.map(function(schedule, index) {
+    const intervalHidden = schedule.mode === 'fixed'
+      ? ' hidden-field'
+      : '';
+
+    const fixedHidden = schedule.mode === 'fixed'
+      ? ''
+      : ' hidden-field';
+
+    const checked = schedule.enabled ? ' checked' : '';
+
+    return '' +
+      '<div class="schedule-card" data-index="' + index +
+        '" data-id="' + escapeHtml(schedule.id) + '">' +
+        '<div class="schedule-header">' +
+          '<strong>Lịch #' + (index + 1) + '</strong>' +
+          '<div style="display:flex;align-items:center;gap:6px;">' +
+            '<label class="check-row" style="margin:0;padding:4px 7px;">' +
+              '<input data-field="enabled" type="checkbox"' + checked + '>' +
+              '<span>Bật</span>' +
+            '</label>' +
+            '<button class="small danger" type="button" onclick="removeAutoChatSchedule(' +
+              index + ')">Xóa</button>' +
+          '</div>' +
+        '</div>' +
+
+        '<div class="schedule-grid">' +
+          '<label class="schedule-field">' +
+            '<span>Kiểu</span>' +
+            '<select data-field="mode" onchange="scheduleModeChanged(this)">' +
+              '<option value="interval"' +
+                (schedule.mode === 'interval' ? ' selected' : '') +
+                '>Lặp lại</option>' +
+              '<option value="fixed"' +
+                (schedule.mode === 'fixed' ? ' selected' : '') +
+                '>Cố định</option>' +
+            '</select>' +
+          '</label>' +
+
+          '<label class="schedule-field' + intervalHidden +
+            '" data-role="interval-field">' +
+            '<span>Khoảng lặp (giây)</span>' +
+            '<input data-field="intervalSeconds" type="number" min="10" max="604800" value="' +
+              schedule.intervalSeconds + '">' +
+          '</label>' +
+
+          '<label class="schedule-field' + fixedHidden +
+            '" data-role="fixed-field" style="grid-column:1/-1;">' +
+            '<span>Giờ cố định (HH:mm, cách nhau bằng dấu phẩy)</span>' +
+            '<input data-field="times" value="' +
+              escapeHtml(schedule.times.join(', ')) +
+              '" placeholder="08:00, 12:00, 18:00">' +
+          '</label>' +
+        '</div>' +
+
+        '<label class="schedule-field">' +
+          '<span>Delay giữa từng tin (giây)</span>' +
+          '<input data-field="messageDelaySeconds" type="number" min="0" max="3600" value="' +
+            schedule.messageDelaySeconds + '">' +
+        '</label>' +
+
+        '<label class="schedule-field">' +
+          '<span>Tin nhắn — mỗi dòng một tin</span>' +
+          '<textarea class="schedule-messages" data-field="messages" placeholder="Tin 1&#10;Tin 2&#10;Tin 3">' +
+            escapeHtml(schedule.messages.join('\\n')) +
+          '</textarea>' +
+        '</label>' +
+      '</div>';
+  }).join('');
+
+  box.querySelectorAll('.schedule-card').forEach(scheduleFieldVisibility);
+}
+
+function markSettingsDirty() {
+  settingsDirty = true;
+}
+
+function collectAutoChatSchedules() {
+  const box = byId('autoChatSchedules');
+  if (!box) return [];
+
+  const cards = Array.from(box.querySelectorAll('.schedule-card'));
+
+  return cards.map(function(card, index) {
+    const get = function(field) {
+      return card.querySelector('[data-field="' + field + '"]');
+    };
+
+    const mode = get('mode') && get('mode').value === 'fixed'
+      ? 'fixed'
+      : 'interval';
+
+    const id = card.dataset.id ||
+      (autoChatSchedules[index] && autoChatSchedules[index].id) ||
+      (Date.now() + '-' + index);
+
+    card.dataset.id = id;
+
+    const rawMessages = String(
+      get('messages') ? get('messages').value : ''
+    );
+
+    const messages = rawMessages
+      .split(/\\r?\\n/)
+      .map(function(value) { return value.trim(); })
+      .filter(Boolean);
+
+    const rawTimes = String(
+      get('times') ? get('times').value : ''
+    );
+
+    const times = rawTimes
+      .split(/[,\\n]+/)
+      .map(function(value) { return value.trim(); })
+      .filter(Boolean);
+
+    return {
+      id: id,
+      enabled: !!(get('enabled') && get('enabled').checked),
+      mode: mode,
+      intervalSeconds: clampClientNumber(
+        get('intervalSeconds') && get('intervalSeconds').value,
+        3600,
+        10,
+        604800
+      ),
+      times: times,
+      messages: messages,
+      messageDelaySeconds: clampClientNumber(
+        get('messageDelaySeconds') && get('messageDelaySeconds').value,
+        0,
+        0,
+        3600
+      )
+    };
+  });
+}
+
+function validateAutoChatSchedules(schedules) {
+  const validTime = /^([01]\\d|2[0-3]):[0-5]\\d$/;
+
+  for (let i = 0; i < schedules.length; i++) {
+    const schedule = schedules[i];
+
+    if (!schedule.messages.length) {
+      return 'Lịch #' + (i + 1) + ' chưa có tin nhắn.';
+    }
+
+    if (schedule.mode === 'fixed') {
+      if (!schedule.times.length) {
+        return 'Lịch #' + (i + 1) + ' chưa có giờ cố định.';
+      }
+
+      for (const value of schedule.times) {
+        if (!validTime.test(value)) {
+          return 'Lịch #' + (i + 1) + ' có giờ không hợp lệ: ' + value;
+        }
+      }
+    }
+  }
+
+  return '';
+}
+
+function scheduleModeChanged(select) {
+  scheduleFieldVisibility(select ? select.closest('.schedule-card') : null);
+  markSettingsDirty();
+}
+
+function addAutoChatSchedule() {
+  const current = collectAutoChatSchedules();
+
+  current.push({
+    id: Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+    enabled: true,
+    mode: 'interval',
+    intervalSeconds: 3600,
+    times: [],
+    messages: [''],
+    messageDelaySeconds: 2
+  });
+
+  settingsDirty = true;
+  renderAutoChatSchedules(current);
+
+  const cards = byId('autoChatSchedules')
+    ? byId('autoChatSchedules').querySelectorAll('.schedule-card')
+    : [];
+
+  const last = cards.length ? cards[cards.length - 1] : null;
+  const input = last
+    ? last.querySelector('[data-field="messages"]')
+    : null;
+
+  if (input) input.focus();
+}
+
+function removeAutoChatSchedule(index) {
+  const current = collectAutoChatSchedules();
+  current.splice(index, 1);
+  settingsDirty = true;
+  renderAutoChatSchedules(current);
+}
+
+async function saveSettings() {
+  if (settingsSaveInFlight) return;
+
+  const schedules = collectAutoChatSchedules();
+  const validationError = validateAutoChatSchedules(schedules);
+
+  if (validationError) {
+    showToast(validationError);
+    return;
+  }
+
+  const payload = {
+    settings: {
+      autoTotem: !!(byId('settingAutoTotem') && byId('settingAutoTotem').checked),
+      antiHungry: !!(byId('settingAntiHungry') && byId('settingAntiHungry').checked),
+      autoReconnect: !!(byId('settingAutoReconnect') && byId('settingAutoReconnect').checked)
+    },
+    autoChatSchedules: schedules
   };
 
-  return (
-    map[status] ||
-    ['red','OFFLINE']
+  settingsSaveInFlight = true;
+  setSettingsButtonsDisabled(true);
+
+  try {
+    const result = await apiJson('/api/settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+
+    if (!result.ok) {
+      showToast(result.data.error || 'Lưu setting thất bại.');
+      return;
+    }
+
+    settingsDirty = false;
+
+    const serverSchedules = Array.isArray(result.data.autoChatSchedules)
+      ? result.data.autoChatSchedules
+      : payload.autoChatSchedules;
+
+    renderPublicSettings(result.data);
+    renderAutoChatSchedules(serverSchedules);
+    showToast(result.data.message || 'Đã lưu setting.');
+  } catch (err) {
+    showToast(err.message || 'Không thể kết nối server web.');
+  } finally {
+    settingsSaveInFlight = false;
+    setSettingsButtonsDisabled(false);
+  }
+}
+
+function setSettingsButtonsDisabled(disabled) {
+  document.querySelectorAll('#settingsPanel button, #settingsPanel input, #settingsPanel select, #settingsPanel textarea, #autoChatSchedules button, #autoChatSchedules input, #autoChatSchedules select, #autoChatSchedules textarea, [data-settings-action]').forEach(function(element) {
+    element.disabled = !!disabled;
+  });
+}
+
+async function startBot() {
+  return runBotAction('start');
+}
+
+async function stopBot() {
+  return runBotAction('stop');
+}
+
+async function restartBot() {
+  return runBotAction('restart');
+}
+
+async function runBotAction(action) {
+  if (actionRequestInFlight) return;
+
+  actionRequestInFlight = true;
+
+  const buttons = [
+    byId('startButton'),
+    byId('stopButton'),
+    byId('restartButton')
+  ];
+
+  buttons.forEach(function(button) {
+    if (button) button.disabled = true;
+  });
+
+  showToast(
+    action === 'start'
+      ? 'Đang chạy bot...'
+      : action === 'stop'
+        ? 'Đang dừng bot...'
+        : 'Đang khởi động lại bot...'
+  );
+
+  try {
+    const result = await apiJson('/api/bot/' + action, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}'
+    });
+
+    showToast(
+      result.data.message ||
+      result.data.error ||
+      (result.ok ? 'Đã xử lý.' : 'Thao tác thất bại.')
+    );
+
+    await refresh(true);
+  } catch (err) {
+    showToast(err.message || 'Không thể kết nối server web.');
+  } finally {
+    actionRequestInFlight = false;
+    buttons.forEach(function(button) {
+      if (button) button.disabled = false;
+    });
+  }
+}
+
+async function sendMessage(event) {
+  event.preventDefault();
+
+  const input = byId('messageInput');
+  const text = input ? input.value : '';
+
+  if (!text.trim()) return;
+
+  const result = await apiJson('/api/bot/send', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text: text})
+  });
+
+  if (result.ok && input) input.value = '';
+
+  showToast(
+    result.data.message ||
+    result.data.error ||
+    (result.ok ? 'Đã gửi.' : 'Gửi thất bại.')
+  );
+
+  if (result.ok) {
+    await loadChatLogs(true);
+  }
+}
+
+async function clearEventHistory() {
+  if (!confirm('Xóa toàn bộ Event Log?')) return;
+
+  const result = await apiJson('/api/bot/logs/clear', {
+    method: 'POST'
+  });
+
+  if (result.ok) {
+    lastLogRevision = -1;
+    await loadLogs(true);
+  }
+
+  showToast(
+    result.data.message ||
+    result.data.error ||
+    'Đã xử lý.'
   );
 }
 
-function applyBotData(nextBot) {
-  if (!nextBot) return false;
+async function clearChatHistory() {
+  if (!confirm('Xóa toàn bộ Chat Log?')) return;
 
-  const incomingRevision =
-    Number(nextBot.stateRevision ?? 0);
+  const result = await apiJson('/api/bot/chat-logs/clear', {
+    method: 'POST'
+  });
 
-  const currentRevision =
-    Number(bot?.stateRevision ?? -1);
-
-  if (
-    bot &&
-    Number.isFinite(incomingRevision) &&
-    Number.isFinite(currentRevision) &&
-    incomingRevision < currentRevision
-  ) {
-    return false;
+  if (result.ok) {
+    lastChatRevision = -1;
+    await loadChatLogs(true);
   }
 
-  bot = nextBot;
-  uptimeSyncAt = Date.now();
-  return true;
+  showToast(
+    result.data.message ||
+    result.data.error ||
+    'Đã xử lý.'
+  );
 }
 
-function applyInventoryData(nextInventory) {
-  if (!nextInventory) return false;
+async function saveAccount() {
+  const usernameInput = byId('usernameInput');
+  const passwordInput = byId('passwordInput');
 
-  const incomingRevision =
-    Number(nextInventory.revision ?? 0);
+  const username = usernameInput ? usernameInput.value.trim() : '';
+  const password = passwordInput ? passwordInput.value : '';
 
-  const currentRevision =
-    Number(inventory?.revision ?? -1);
-
-  if (
-    inventory &&
-    Number.isFinite(incomingRevision) &&
-    Number.isFinite(currentRevision) &&
-    incomingRevision < currentRevision
-  ) {
-    return false;
+  if (!username && !password) {
+    showToast('Nhập username hoặc password cần thay đổi.');
+    return;
   }
 
-  inventory = nextInventory;
-  return true;
-}
+  const result = await apiJson('/api/bot/account', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      username: username,
+      password: password
+    })
+  });
 
-async function getBot(requestEpoch = syncEpoch) {
-  const response =
-    await fetch('/api/bot', { cache:'no-store' });
-
-  if (!response.ok) {
-    throw new Error('Không lấy được trạng thái bot.');
+  if (result.ok) {
+    if (usernameInput) usernameInput.value = '';
+    if (passwordInput) passwordInput.value = '';
+    await refresh(true);
   }
 
-  const data = await response.json();
-
-  if (requestEpoch !== syncEpoch) {
-    return bot;
-  }
-
-  applyBotData(data);
-  return bot;
-}
-
-async function getInventory(requestEpoch = syncEpoch) {
-  const response =
-    await fetch('/api/inventory', { cache:'no-store' });
-
-  if (!response.ok) {
-    throw new Error('Không lấy được inventory.');
-  }
-
-  const data = await response.json();
-
-  if (requestEpoch !== syncEpoch) {
-    return inventory;
-  }
-
-  applyInventoryData(data);
-  return inventory;
-}
-
-async function getSnapshot(requestEpoch = syncEpoch) {
-  const response =
-    await fetch('/api/snapshot', { cache:'no-store' });
-
-  if (!response.ok) {
-    throw new Error('Không lấy được snapshot bot.');
-  }
-
-  const data = await response.json();
-
-  if (requestEpoch !== syncEpoch) {
-    return data;
-  }
-
-  applyBotData(data.bot);
-  applyInventoryData(data.inventory);
-
-  return data;
-}
-
-function formatInventoryName(name) {
-
-  if (!name) {
-    return '-';
-  }
-
-  return String(name)
-    .replace(/_/g, ' ');
+  showToast(
+    result.data.message ||
+    result.data.error ||
+    'Đã xử lý.'
+  );
 }
 
 function itemLabel(item) {
-
-  if (!item) {
-    return '-';
-  }
-
-  const name =
-    item.displayName ||
-    item.name ||
-    '-';
-
-  const count =
-    Number(item.count || 0);
-
-  return count > 1
-    ? formatInventoryName(name) + ' x' + count
-    : formatInventoryName(name);
+  if (!item) return '-';
+  const name = item.displayName || item.name || '-';
+  const count = Number(item.count || 0);
+  return String(name).replace(/_/g, ' ') +
+    (count > 1 ? ' x' + count : '');
 }
 
-function createInventorySlotElement(
-  item,
-  slot,
-  selected
-) {
+function createInventorySlot(item, slot, selected) {
+  const el = document.createElement('div');
 
-  const element =
-    document.createElement('div');
-
-  element.className =
+  el.className =
     'inventory-slot' +
-    (
-      selected
-        ? ' selected'
-        : ''
-    ) +
-    (
-      item
-        ? ''
-        : ' empty'
-    );
+    (item ? '' : ' empty') +
+    (selected ? ' selected' : '');
 
-  element.draggable =
-    !!item;
+  el.draggable = !!item;
+  el.dataset.slot = String(slot);
 
-  element.dataset.slot =
-    String(slot);
+  el.ondragstart = function(event) {
+    draggedSlot = slot;
 
-  element.ondragstart =
-    function(event) {
-      draggedSlot =
-        slot;
+    try {
+      event.dataTransfer.setData('text/plain', String(slot));
+      event.dataTransfer.effectAllowed = 'move';
+    } catch (_) {}
+  };
 
-      try {
-        event.dataTransfer.setData(
-          'text/plain',
-          String(slot)
-        );
-        event.dataTransfer.effectAllowed =
-          'move';
-      } catch (_) {
-      }
+  el.ondragover = allowDrop;
+  el.ondragleave = clearDragOver;
+  el.ondrop = function(event) {
+    dropInventorySlot(event, slot);
+  };
+
+  if (slot >= 36 && slot <= 44) {
+    el.onclick = function() {
+      selectHotbar(slot - 36);
     };
-
-  element.ondragover =
-    allowDrop;
-
-  element.ondragleave =
-    clearDragOver;
-
-  element.ondrop =
-    function(event) {
-      dropInventory(
-        event,
-        slot
-      );
-    };
-
-  element.onclick =
-    function() {
-
-      if (
-        slot >= 36 &&
-        slot <= 44
-      ) {
-        selectHotbar(
-          slot - 36
-        );
-      }
-    };
-
-  const index =
-    document.createElement('div');
-
-  index.className =
-    'slot-index';
-
-  if (
-    slot >= 36 &&
-    slot <= 44
-  ) {
-    index.textContent =
-      String(slot - 35);
-  } else if (
-    slot >= 9 &&
-    slot <= 35
-  ) {
-    index.textContent =
-      String(slot - 8);
-  } else {
-    index.textContent =
-      String(slot);
   }
 
-  const name =
-    document.createElement('div');
+  const index = document.createElement('div');
+  index.className = 'slot-index';
+  index.textContent = slot >= 36
+    ? String(slot - 35)
+    : String(slot - 8);
 
-  name.className =
-    'slot-name';
+  const name = document.createElement('div');
+  name.className = 'slot-name';
+  name.textContent = itemLabel(item);
 
-  name.textContent =
-    itemLabel(item);
+  const count = document.createElement('div');
+  count.className = 'slot-count';
+  count.textContent = item && Number(item.count || 0) > 1
+    ? String(item.count)
+    : '';
 
-  const count =
-    document.createElement('div');
+  el.appendChild(index);
+  el.appendChild(name);
+  el.appendChild(count);
 
-  count.className =
-    'slot-count';
-
-  count.textContent =
-    item && Number(item.count || 0) > 1
-      ? String(item.count)
-      : '';
-
-  element.appendChild(
-    index
-  );
-
-  element.appendChild(
-    name
-  );
-
-  element.appendChild(
-    count
-  );
-
-  return element;
-}
-
-function renderEquipment(inventoryData) {
-
-  const armor =
-    inventoryData.armor || {};
-
-  document.getElementById('equipHead').textContent =
-    itemLabel(armor.head);
-
-  document.getElementById('equipTorso').textContent =
-    itemLabel(armor.torso);
-
-  document.getElementById('equipLegs').textContent =
-    itemLabel(armor.legs);
-
-  document.getElementById('equipFeet').textContent =
-    itemLabel(armor.feet);
-
-  document.getElementById('equipOffhand').textContent =
-    itemLabel(
-      inventoryData.slots
-        ? inventoryData.slots['45']
-        : null
-    );
+  return el;
 }
 
 function renderInventory() {
+  if (!inventory) return;
 
-  if (!inventory) {
-    return;
-  }
-
-  const health =
-    Math.max(
-      0,
-      Math.min(
-        20,
-        Number(inventory.health || 0)
-      )
-    );
-
-  const food =
-    Math.max(
-      0,
-      Math.min(
-        20,
-        Number(inventory.food || 0)
-      )
-    );
-
-  document.getElementById('inventoryHealth').textContent =
-    health.toFixed(1) + ' / 20';
-
-  document.getElementById('inventoryFood').textContent =
-    String(food) + ' / 20';
-
-  document.getElementById('inventoryHealthBar').style.width =
-    String(
-      (health / 20) * 100
-    ) + '%';
-
-  document.getElementById('inventoryFoodBar').style.width =
-    String(
-      (food / 20) * 100
-    ) + '%';
-
-  document.getElementById('inventoryGoldenApple').textContent =
-    String(
-      inventory.goldenAppleCount || 0
-    );
-
-  document.getElementById('inventoryTotem').textContent =
-    String(
-      inventory.totemCount || 0
-    );
-
-  document.getElementById('inventoryFoodCount').textContent =
-    String(
-      inventory.foodCount || 0
-    );
-
-  document.getElementById('inventoryOffhand').textContent =
-    formatInventoryName(
-      inventory.offhand
-    );
-
-  document.getElementById('inventoryRevision').textContent =
-    'revision ' +
-    String(
-      inventory.revision || 0
-    );
-
-  const currentRevision = Number(inventory.revision ?? 0);
-
-  if (currentRevision === lastRenderedInventoryRevision) {
-    return;
-  }
-
-  lastRenderedInventoryRevision = currentRevision;
-
-  renderEquipment(inventory);
-
-  const slots = inventory.slots || {};
-  const mainInventory = document.getElementById('mainInventory');
-  const hotbar = document.getElementById('inventoryHotbar');
-
-  mainInventory.replaceChildren();
-  hotbar.replaceChildren();
-
-  for (let slot = 9; slot <= 35; slot++) {
-    mainInventory.appendChild(
-      createInventorySlotElement(
-        slots[String(slot)] || null,
-        slot,
-        false
-      )
-    );
-  }
-
-  const selected = Number(
-    inventory.selectedHotbar ??
-    inventory.selectedSlot ??
-    0
+  const health = Math.max(
+    0,
+    Math.min(20, Number(inventory.health || 0))
   );
 
-  for (let slot = 36; slot <= 44; slot++) {
-    hotbar.appendChild(
-      createInventorySlotElement(
-        slots[String(slot)] || null,
-        slot,
-        (slot - 36) === selected
-      )
+  const food = Math.max(
+    0,
+    Math.min(20, Number(inventory.food || 0))
+  );
+
+  const healthElement = byId('inventoryHealth');
+  const foodElement = byId('inventoryFood');
+
+  if (healthElement) healthElement.textContent =
+    health.toFixed(1) + ' / 20';
+
+  if (foodElement) foodElement.textContent =
+    food.toFixed(1) + ' / 20';
+
+  const healthBar = byId('inventoryHealthBar');
+  const foodBar = byId('inventoryFoodBar');
+
+  if (healthBar) healthBar.style.width =
+    (health / 20 * 100) + '%';
+
+  if (foodBar) foodBar.style.width =
+    (food / 20 * 100) + '%';
+
+  const golden = byId('inventoryGoldenApple');
+  const totem = byId('inventoryTotem');
+  const offhand = byId('inventoryOffhand');
+  const foodCount = byId('inventoryFoodCount');
+
+  if (golden) golden.textContent =
+    String(inventory.goldenAppleCount || 0);
+
+  if (totem) totem.textContent =
+    String(inventory.totemCount || 0);
+
+  if (offhand) offhand.textContent =
+    String(inventory.offhand || '-').replace(/_/g, ' ');
+
+  if (foodCount) foodCount.textContent =
+    String(inventory.foodCount || 0);
+
+  const armor = inventory.armor || {};
+
+  if (byId('equipHead')) byId('equipHead').textContent = itemLabel(armor.head);
+  if (byId('equipTorso')) byId('equipTorso').textContent = itemLabel(armor.torso);
+  if (byId('equipLegs')) byId('equipLegs').textContent = itemLabel(armor.legs);
+  if (byId('equipFeet')) byId('equipFeet').textContent = itemLabel(armor.feet);
+
+  const off = inventory.slots
+    ? inventory.slots['45']
+    : null;
+
+  if (byId('equipOffhand')) {
+    byId('equipOffhand').textContent = itemLabel(off);
+  }
+
+  const revision = byId('inventoryRevision');
+  if (revision) revision.textContent =
+    'revision ' + String(inventory.revision || 0);
+
+  const slots = inventory.slots || {};
+  const main = byId('mainInventory');
+  const hotbar = byId('inventoryHotbar');
+
+  if (main) {
+    main.innerHTML = '';
+    for (let slot = 9; slot <= 35; slot++) {
+      main.appendChild(
+        createInventorySlot(
+          slots[String(slot)] || null,
+          slot,
+          false
+        )
+      );
+    }
+  }
+
+  if (hotbar) {
+    hotbar.innerHTML = '';
+
+    const selected = Number(
+      inventory.selectedHotbar ??
+      inventory.selectedSlot ??
+      0
     );
+
+    for (let slot = 36; slot <= 44; slot++) {
+      hotbar.appendChild(
+        createInventorySlot(
+          slots[String(slot)] || null,
+          slot,
+          slot - 36 === selected
+        )
+      );
+    }
+  }
+}
+
+function allowDrop(event) {
+  event.preventDefault();
+
+  try {
+    event.dataTransfer.dropEffect = 'move';
+  } catch (_) {}
+
+  if (event.currentTarget && event.currentTarget.classList) {
+    event.currentTarget.classList.add('dragover');
+  }
+}
+
+function clearDragOver(event) {
+  if (event.currentTarget && event.currentTarget.classList) {
+    event.currentTarget.classList.remove('dragover');
   }
 }
 
@@ -4068,99 +5298,41 @@ function startEquipmentDrag(event, destination) {
     'off-hand': 45
   };
 
-  const slot = slotMap[destination];
-
-  if (!Number.isInteger(slot)) {
-    return;
-  }
-
-  draggedSlot = slot;
+  draggedSlot = slotMap[destination];
 
   try {
     event.dataTransfer.setData(
       'text/plain',
-      String(slot)
+      String(draggedSlot)
     );
     event.dataTransfer.effectAllowed = 'move';
-  } catch (_) {
-  }
+  } catch (_) {}
 }
 
-document.addEventListener('dragend', () => {
-  draggedSlot = null;
-});
-
-function equipmentDestinationFromSlot(slot) {
-  if (slot === 5) return 'head';
-  if (slot === 6) return 'torso';
-  if (slot === 7) return 'legs';
-  if (slot === 8) return 'feet';
-  if (slot === 45) return 'off-hand';
-  return null;
-}
-
-function allowDrop(event) {
-
-  event.preventDefault();
+function getDragSource(event) {
+  let source = draggedSlot;
 
   try {
-    event.dataTransfer.dropEffect =
-      'move';
-  } catch (_) {
-  }
+    const value = event.dataTransfer.getData('text/plain');
 
-  if (
-    event.currentTarget &&
-    event.currentTarget.classList
-  ) {
-    event.currentTarget.classList.add(
-      'dragover'
-    );
-  }
+    if (value !== '') {
+      const parsed = Number(value);
+
+      if (Number.isInteger(parsed)) {
+        source = parsed;
+      }
+    }
+  } catch (_) {}
+
+  draggedSlot = null;
+  return Number.isInteger(source) ? source : null;
 }
 
-function clearDragOver(event) {
-
-  if (
-    event.currentTarget &&
-    event.currentTarget.classList
-  ) {
-    event.currentTarget.classList.remove(
-      'dragover'
-    );
-  }
-}
-
-async function dropInventory(
-  event,
-  destinationSlot
-) {
-
+async function dropInventorySlot(event, destinationSlot) {
   event.preventDefault();
-
   clearDragOver(event);
 
-  let sourceSlot =
-    draggedSlot;
-
-  try {
-
-    const fromData =
-      event.dataTransfer.getData(
-        'text/plain'
-      );
-
-    if (
-      fromData !== ''
-    ) {
-      sourceSlot =
-        Number(fromData);
-    }
-
-  } catch (_) {
-  }
-
-  draggedSlot = null;
+  const sourceSlot = getDragSource(event);
 
   if (
     !Number.isInteger(sourceSlot) ||
@@ -4169,13 +5341,20 @@ async function dropInventory(
     return;
   }
 
-  const equipmentDestination =
-    equipmentDestinationFromSlot(sourceSlot);
+  if (sourceSlot >= 5 && sourceSlot <= 8) {
+    const map = {
+      5: 'head',
+      6: 'torso',
+      7: 'legs',
+      8: 'feet'
+    };
 
-  if (equipmentDestination) {
-    await unequipEquipment(
-      equipmentDestination
-    );
+    await unequipAndMove(map[sourceSlot], destinationSlot);
+    return;
+  }
+
+  if (sourceSlot === 45) {
+    await unequipAndMove('off-hand', destinationSlot);
     return;
   }
 
@@ -4185,1292 +5364,449 @@ async function dropInventory(
   );
 }
 
-async function dropItemToWorld(
-  event
-) {
-  event.preventDefault();
-
-  clearDragOver(event);
-
-  let sourceSlot =
-    draggedSlot;
-
-  try {
-    const fromData =
-      event.dataTransfer.getData(
-        'text/plain'
-      );
-
-    if (
-      fromData !== ''
-    ) {
-      sourceSlot =
-        Number(fromData);
+async function unequipAndMove(destination, destinationSlot) {
+  const result = await postInventory(
+    '/inventory/unequip',
+    {
+      destination: destination,
+      revision: inventory
+        ? inventory.revision
+        : 0
     }
-  } catch (_) {
-  }
+  );
 
-  draggedSlot = null;
-
-  if (
-    !Number.isInteger(sourceSlot)
-  ) {
+  if (!result.ok) {
+    showToast(result.data.error || 'Không thể tháo trang bị.');
     return;
   }
 
-  await dropInventoryItem(
-    sourceSlot
-  );
+  if (result.data.inventory) {
+    inventory = result.data.inventory;
+    renderInventory();
+  }
+
+  const slots = inventory && inventory.slots
+    ? inventory.slots
+    : {};
+
+  let sourceSlot = null;
+
+  for (let slot = 9; slot <= 35; slot++) {
+    const item = slots[String(slot)];
+    if (item && item.name) {
+      sourceSlot = slot;
+      break;
+    }
+  }
+
+  if (
+    sourceSlot !== null &&
+    sourceSlot !== destinationSlot
+  ) {
+    await moveInventoryItem(
+      sourceSlot,
+      destinationSlot
+    );
+  }
 }
 
-async function dropInventoryItem(
-  sourceSlot
-) {
-  if (
-    inventoryActionInFlight
-  ) {
-    showToast(
-      'Đang thực hiện thao tác inventory khác.'
-    );
-    return;
-  }
-
-  if (!inventory) {
-    return;
-  }
+async function moveInventoryItem(sourceSlot, destSlot) {
+  if (inventoryActionInFlight || !inventory) return;
 
   inventoryActionInFlight = true;
 
-  invalidatePendingReads();
-  refreshQueued = true;
-
   try {
-    const response =
-      await fetch(
-        '/api/inventory/drop',
-        {
-          method: 'POST',
-
-          headers: {
-            'Content-Type':
-              'application/json'
-          },
-
-          body: JSON.stringify({
-            sourceSlot,
-            revision:
-              inventory.revision
-          })
-        }
-      );
-
-    const data =
-      await response.json();
-
-    if (
-      data.inventory
-    ) {
-      inventory =
-        data.inventory;
-
-      renderInventory();
-    }
-
-    if (!response.ok) {
-      showToast(
-        data.error ||
-        'Không thể vứt item.'
-      );
-
-      await refreshInventoryOnly();
-      return;
-    }
-
-    showToast(
-      data.message ||
-      'Đã vứt item.'
-    );
-  } catch (_) {
-    showToast(
-      'Không thể kết nối tới server web.'
-    );
-  } finally {
-    inventoryActionInFlight =
-      false;
-    runQueuedRefresh();
-  }
-}
-
-async function moveInventoryItem(
-  sourceSlot,
-  destSlot
-) {
-
-  if (
-    inventoryActionInFlight
-  ) {
-    showToast(
-      'Đang thực hiện thao tác inventory khác.'
-    );
-    return;
-  }
-
-  if (!inventory) {
-    return;
-  }
-
-  inventoryActionInFlight =
-    true;
-
-
-  invalidatePendingReads();
-
-  refreshQueued = true;
-  try {
-
-    const response =
-      await fetch(
-        '/api/inventory/move',
-        {
-          method:'POST',
-
-          headers:{
-            'Content-Type':
-              'application/json'
-          },
-
-          body:
-            JSON.stringify({
-              sourceSlot,
-              destSlot,
-              revision:
-                inventory.revision
-            })
-        }
-      );
-
-    const data =
-      await response.json();
-
-    if (!response.ok) {
-
-      if (
-        data.inventory
-      ) {
-        inventory =
-          data.inventory;
-
-        renderInventory();
+    const result = await postInventory(
+      '/inventory/move',
+      {
+        sourceSlot: sourceSlot,
+        destSlot: destSlot,
+        revision: inventory.revision
       }
+    );
 
-      showToast(
-        data.error ||
-        'Di chuyển thất bại.'
-      );
-
-      await refreshInventoryOnly();
-
-      return;
-    }
-
-    if (
-      data.inventory
-    ) {
-      inventory =
-        data.inventory;
-
+    if (result.data.inventory) {
+      inventory = result.data.inventory;
       renderInventory();
     }
 
     showToast(
-      data.message ||
-      'Đã di chuyển item.'
+      result.data.message ||
+      result.data.error ||
+      (result.ok ? 'Đã di chuyển item.' : 'Di chuyển thất bại.')
     );
 
-  } catch (_) {
-
-    showToast(
-      'Không thể kết nối tới server web.'
-    );
-
+    if (!result.ok && result.status === 409) {
+      await refresh(true);
+    }
   } finally {
-
-    inventoryActionInFlight =
-      false;
-
-    runQueuedRefresh();
-
+    inventoryActionInFlight = false;
   }
 }
 
-async function dropEquip(
-  event,
-  destination
-) {
-
+function dropItemToWorld(event) {
   event.preventDefault();
-
   clearDragOver(event);
 
-  let sourceSlot =
-    draggedSlot;
+  const sourceSlot = getDragSource(event);
 
-  try {
+  if (!Number.isInteger(sourceSlot)) return;
 
-    const fromData =
-      event.dataTransfer.getData(
-        'text/plain'
-      );
-
-    if (
-      fromData !== ''
-    ) {
-      sourceSlot =
-        Number(fromData);
-    }
-
-  } catch (_) {
-  }
-
-  draggedSlot = null;
-
-  if (
-    !Number.isInteger(sourceSlot)
-  ) {
-    return;
-  }
-
-  await equipInventoryItem(
-    sourceSlot,
-    destination
-  );
-}
-
-async function equipInventoryItem(
-  sourceSlot,
-  destination
-) {
-
-  if (
-    inventoryActionInFlight
-  ) {
-    showToast(
-      'Đang thực hiện thao tác inventory khác.'
+  if (sourceSlot >= 5 && sourceSlot <= 8) {
+    unequipEquipment(
+      ['head', 'torso', 'legs', 'feet'][sourceSlot - 5]
     );
     return;
   }
 
-  if (!inventory) {
+  if (sourceSlot === 45) {
+    unequipEquipment('off-hand');
     return;
   }
 
-  inventoryActionInFlight =
-    true;
+  dropInventoryItem(sourceSlot);
+}
 
+async function dropInventoryItem(sourceSlot) {
+  if (inventoryActionInFlight || !inventory) return;
 
-  invalidatePendingReads();
+  inventoryActionInFlight = true;
 
-  refreshQueued = true;
   try {
-
-    const response =
-      await fetch(
-        '/api/inventory/equip',
-        {
-          method:'POST',
-
-          headers:{
-            'Content-Type':
-              'application/json'
-          },
-
-          body:
-            JSON.stringify({
-              sourceSlot,
-              destination,
-              revision:
-                inventory.revision
-            })
-        }
-      );
-
-    const data =
-      await response.json();
-
-    if (!response.ok) {
-
-      if (
-        data.inventory
-      ) {
-        inventory =
-          data.inventory;
-
-        renderInventory();
+    const result = await postInventory(
+      '/inventory/drop',
+      {
+        sourceSlot: sourceSlot,
+        revision: inventory.revision
       }
+    );
 
-      showToast(
-        data.error ||
-        'Trang bị thất bại.'
-      );
-
-      await refreshInventoryOnly();
-
-      return;
-    }
-
-    if (
-      data.inventory
-    ) {
-      inventory =
-        data.inventory;
-
+    if (result.data.inventory) {
+      inventory = result.data.inventory;
       renderInventory();
     }
 
     showToast(
-      data.message ||
-      'Đã trang bị item.'
+      result.data.message ||
+      result.data.error ||
+      (result.ok ? 'Đã vứt item.' : 'Vứt item thất bại.')
     );
 
-  } catch (_) {
-
-    showToast(
-      'Không thể kết nối tới server web.'
-    );
-
+    if (!result.ok && result.status === 409) {
+      await refresh(true);
+    }
   } finally {
-
-    inventoryActionInFlight =
-      false;
-
-    runQueuedRefresh();
-
+    inventoryActionInFlight = false;
   }
 }
 
-async function unequipEquipment(
-  destination
-) {
+async function dropEquip(event, destination) {
+  event.preventDefault();
+  clearDragOver(event);
+
+  const sourceSlot = getDragSource(event);
+
+  if (!Number.isInteger(sourceSlot)) return;
 
   if (
-    inventoryActionInFlight
+    (sourceSlot >= 5 && sourceSlot <= 8) ||
+    sourceSlot === 45
   ) {
-    showToast(
-      'Đang thực hiện thao tác inventory khác.'
-    );
+    showToast('Không thể lấy item từ equipment để equip vào chính equipment.');
     return;
   }
 
-  if (!inventory) {
-    return;
-  }
+  await equipDetailItem(sourceSlot, destination);
+}
 
-  inventoryActionInFlight =
-    true;
+async function equipDetailItem(sourceSlot, destination) {
+  if (inventoryActionInFlight || !inventory) return;
 
+  inventoryActionInFlight = true;
 
-  invalidatePendingReads();
-
-  refreshQueued = true;
   try {
-
-    const response =
-      await fetch(
-        '/api/inventory/unequip',
-        {
-          method:'POST',
-
-          headers:{
-            'Content-Type':
-              'application/json'
-          },
-
-          body:
-            JSON.stringify({
-              destination,
-              revision:
-                inventory.revision
-            })
-        }
-      );
-
-    const data =
-      await response.json();
-
-    if (!response.ok) {
-
-      if (
-        data.inventory
-      ) {
-        inventory =
-          data.inventory;
-
-        renderInventory();
+    const result = await postInventory(
+      '/inventory/equip',
+      {
+        sourceSlot: sourceSlot,
+        destination: destination,
+        revision: inventory.revision
       }
+    );
 
-      showToast(
-        data.error ||
-        'Tháo trang bị thất bại.'
-      );
-
-      await refreshInventoryOnly();
-
-      return;
-    }
-
-    if (
-      data.inventory
-    ) {
-      inventory =
-        data.inventory;
-
+    if (result.data.inventory) {
+      inventory = result.data.inventory;
       renderInventory();
     }
 
     showToast(
-      data.message ||
-      'Đã tháo trang bị.'
+      result.data.message ||
+      result.data.error ||
+      (result.ok ? 'Đã trang bị item.' : 'Trang bị thất bại.')
     );
 
-  } catch (_) {
+    if (!result.ok && result.status === 409) {
+      await refresh(true);
+    }
+  } finally {
+    inventoryActionInFlight = false;
+  }
+}
+
+async function unequipEquipment(destination) {
+  if (inventoryActionInFlight || !inventory) return;
+
+  inventoryActionInFlight = true;
+
+  try {
+    const result = await postInventory(
+      '/inventory/unequip',
+      {
+        destination: destination,
+        revision: inventory.revision
+      }
+    );
+
+    if (result.data.inventory) {
+      inventory = result.data.inventory;
+      renderInventory();
+    }
 
     showToast(
-      'Không thể kết nối tới server web.'
+      result.data.message ||
+      result.data.error ||
+      (result.ok ? 'Đã tháo trang bị.' : 'Tháo trang bị thất bại.')
     );
 
+    if (!result.ok && result.status === 409) {
+      await refresh(true);
+    }
   } finally {
-
-    inventoryActionInFlight =
-      false;
-
-    runQueuedRefresh();
-
+    inventoryActionInFlight = false;
   }
 }
 
 async function selectHotbar(slot) {
+  if (inventoryActionInFlight || !inventory) return;
 
-  if (
-    inventoryActionInFlight
-  ) {
-    return;
-  }
+  inventoryActionInFlight = true;
 
-  if (!inventory) {
-    return;
-  }
-
-  inventoryActionInFlight =
-    true;
-
-
-  invalidatePendingReads();
-
-  refreshQueued = true;
   try {
-
-    const response =
-      await fetch(
-        '/api/inventory/select',
-        {
-          method:'POST',
-
-          headers:{
-            'Content-Type':
-              'application/json'
-          },
-
-          body:
-            JSON.stringify({
-              slot,
-              revision:
-                inventory.revision
-            })
-        }
-      );
-
-    const data =
-      await response.json();
-
-    if (!response.ok) {
-
-      if (
-        data.inventory
-      ) {
-        inventory =
-          data.inventory;
-
-        renderInventory();
+    const result = await postInventory(
+      '/inventory/select',
+      {
+        slot: slot,
+        revision: inventory.revision
       }
+    );
 
-      showToast(
-        data.error ||
-        'Không thể chọn hotbar.'
-      );
-
-      await refreshInventoryOnly();
-
-      return;
-    }
-
-    if (
-      data.inventory
-    ) {
-      inventory =
-        data.inventory;
-
+    if (result.data.inventory) {
+      inventory = result.data.inventory;
       renderInventory();
     }
 
-  } catch (_) {
-
     showToast(
-      'Không thể kết nối tới server web.'
+      result.data.message ||
+      result.data.error ||
+      (result.ok ? 'Đã chọn hotbar.' : 'Không thể chọn hotbar.')
     );
 
+    if (!result.ok && result.status === 409) {
+      await refresh(true);
+    }
   } finally {
-
-    inventoryActionInFlight =
-      false;
-
-    runQueuedRefresh();
-
+    inventoryActionInFlight = false;
   }
 }
 
-async function refreshInventoryOnly() {
-  if (inventoryActionInFlight) {
+async function postInventory(path, body) {
+  return apiJson(path, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+}
+
+function nearBottom(box) {
+  if (!box) return true;
+  return box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+}
+
+async function loadLogs(force) {
+  const box = byId('logs');
+  if (!box) return;
+
+  if (!force && bot && lastLogRevision === Number(bot.logRevision)) {
     return;
   }
 
   try {
-    await getInventory();
-    renderInventory();
-  } catch (_) {
+    const result = await apiJson('/api/bot/logs');
+
+    if (!result.ok) return;
+
+    const logs = Array.isArray(result.data.logs)
+      ? result.data.logs
+      : [];
+
+    const keep = nearBottom(box);
+
+    box.innerHTML = logs.map(function(line) {
+      return '<div class="line">' +
+        escapeHtml(line) +
+        '</div>';
+    }).join('');
+
+    lastLogRevision = Number(result.data.revision || 0);
+
+    const revision = byId('eventRevision');
+    if (revision) revision.textContent =
+      'revision ' + lastLogRevision;
+
+    if (keep) box.scrollTop = box.scrollHeight;
+  } catch (err) {
+    console.error('[BOT UI] loadLogs', err);
   }
 }
 
-function renderDetail() {
+async function loadChatLogs(force) {
+  const box = byId('chatLogs');
+  if (!box) return;
 
-  if (!bot) return;
-
-  const [
-    color,
-    label
-  ] = statusMeta(
-    bot.status
-  );
-
-  document
-    .getElementById(
-      'detailStatus'
-    )
-    .innerHTML =
-      '<span class="dot ' +
-      color +
-      '"></span>' +
-      label;
-
-  document
-    .getElementById(
-      'detailUsername'
-    )
-    .textContent =
-      bot.username ||
-      'Chưa đặt';
-
-  document
-    .getElementById(
-      'detailHost'
-    )
-    .textContent =
-      (bot.host || '-') +
-      ':' +
-      bot.port;
-
-  document
-    .getElementById(
-      'detailPing'
-    )
-    .textContent =
-      bot.ping == null
-        ? '--'
-        : bot.ping +
-          ' ms';
-
-  document
-    .getElementById(
-      'detailUptime'
-    )
-    .textContent =
-      bot.uptime ||
-      '0h 0m 0s';
-
-  document
-    .getElementById(
-      'detailReconnects'
-    )
-    .textContent =
-      String(
-        bot.reconnectCount ?? 0
-      );
-
-  const positionElement =
-    document.getElementById(
-      'detailPosition'
-    );
-
-  if (positionElement) {
-    const position =
-      bot.position;
-
-    positionElement.textContent =
-      position &&
-      Number.isFinite(position.x) &&
-      Number.isFinite(position.y) &&
-      Number.isFinite(position.z)
-        ? String(Math.round(position.x)) +
-          ' ' +
-          String(Math.round(position.y)) +
-          ' ' +
-          String(Math.round(position.z))
-        : '-';
-  }
-
-  const dimensionElement =
-    document.getElementById(
-      'detailDimension'
-    );
-
-  if (dimensionElement) {
-    dimensionElement.textContent =
-      bot.dimension || '-';
-  }
-
-  document
-    .getElementById(
-      'startButton'
-    )
-    .disabled =
-      actionRequestInFlight ||
-      !bot.hasCredentials ||
-      !['offline','kicked'].includes(bot.status);
-
-  document
-    .getElementById(
-      'stopButton'
-    )
-    .disabled =
-      actionRequestInFlight ||
-      bot.status === 'offline';
-
-  document
-    .getElementById(
-      'restartButton'
-    )
-    .disabled =
-      actionRequestInFlight ||
-      bot.status === 'offline';
-}
-
-function isNearLogBottom(box) {
-
-  return (
-    box.scrollHeight -
-    box.scrollTop -
-    box.clientHeight
-  ) < 24;
-}
-
-async function loadLogs(
-  force = false
-) {
-
-  const requestEpoch = syncEpoch;
-
-  if (
-    logRequestInFlight
-  ) {
+  if (!force && bot &&
+      lastChatRevision === Number(bot.chatLogRevision)) {
     return;
   }
-
-  if (
-    !force &&
-    bot &&
-    bot.logRevision ===
-      lastLogRevision
-  ) {
-    return;
-  }
-
-  logRequestInFlight = true;
 
   try {
+    const result = await apiJson('/api/bot/chat-logs');
 
-    const response =
-      await fetch(
-        '/api/bot/logs?revision=' +
-        (
-          bot?.logRevision ??
-          -1
-        ),
-        {
-          cache:'no-store'
-        }
-      );
+    if (!result.ok) return;
 
-    if (!response.ok) {
-      return;
-    }
+    const logs = Array.isArray(result.data.logs)
+      ? result.data.logs
+      : [];
 
-    const data =
-      await response.json();
+    const keep = nearBottom(box);
 
-    if (requestEpoch !== syncEpoch) {
-      return;
-    }
+    box.innerHTML = logs.map(function(line) {
+      return '<div class="line">' +
+        escapeHtml(line) +
+        '</div>';
+    }).join('');
 
-    const box =
-      document.getElementById(
-        'logs'
-      );
+    lastChatRevision = Number(result.data.revision || 0);
 
-    const keepAtBottom =
-      isNearLogBottom(box);
+    const revision = byId('chatRevision');
+    if (revision) revision.textContent =
+      'revision ' + lastChatRevision;
 
-    if (!data.logs.length) {
-
-      box.innerHTML = '';
-
-      lastLogRevision =
-        data.revision ?? 0;
-
-      document.getElementById(
-        'eventRevision'
-      ).textContent =
-        'revision ' +
-        String(
-          data.revision ?? 0
-        );
-
-      return;
-    }
-
-    box.innerHTML =
-      data.logs
-        .map(
-          line =>
-            '<div class="line">' +
-            escapeHtml(line) +
-            '</div>'
-        )
-        .join('');
-
-    lastLogRevision =
-      data.revision ??
-      lastLogRevision;
-
-    document.getElementById(
-      'eventRevision'
-    ).textContent =
-      'revision ' +
-      String(
-        data.revision ?? 0
-      );
-
-    if (keepAtBottom) {
-      box.scrollTop =
-        box.scrollHeight;
-    }
-
-  } catch (_) {
-
-  } finally {
-
-    logRequestInFlight =
-      false;
-
+    if (keep) box.scrollTop = box.scrollHeight;
+  } catch (err) {
+    console.error('[BOT UI] loadChatLogs', err);
   }
 }
 
-async function loadChatLogs(
-  force = false
-) {
-
-  const requestEpoch = syncEpoch;
-
-  if (
-    chatRequestInFlight
-  ) {
-    return;
-  }
-
-  if (
-    !force &&
-    lastChatRevision >= 0 &&
-    bot &&
-    bot.chatLogRevision ===
-      lastChatRevision
-  ) {
-    return;
-  }
-
-  chatRequestInFlight = true;
-
-  try {
-
-    const response =
-      await fetch(
-        '/api/bot/chat-logs',
-        {
-          cache:'no-store'
-        }
-      );
-
-    if (!response.ok) {
-      return;
-    }
-
-    const data =
-      await response.json();
-
-    if (requestEpoch !== syncEpoch) {
-      return;
-    }
-
-    const box =
-      document.getElementById(
-        'chatLogs'
-      );
-
-    const keepAtBottom =
-      isNearLogBottom(box);
-
-    box.innerHTML =
-      Array.isArray(data.logs)
-        ? data.logs
-            .map(
-              line =>
-                '<div class="line">' +
-                escapeHtml(line) +
-                '</div>'
-            )
-            .join('')
-        : '';
-
-    lastChatRevision =
-      data.revision ??
-      lastChatRevision;
-
-    document.getElementById(
-      'chatRevision'
-    ).textContent =
-      'revision ' +
-      String(
-        data.revision ?? 0
-      );
-
-    if (keepAtBottom) {
-      box.scrollTop =
-        box.scrollHeight;
-    }
-
-  } catch (_) {
-
-  } finally {
-
-    chatRequestInFlight =
-      false;
-
-  }
-}
-
-function escapeHtml(value) {
-
-  return String(
-    value ?? ''
-  )
-    .replace(
-      /&/g,
-      '&amp;'
-    )
-    .replace(
-      /</g,
-      '&lt;'
-    )
-    .replace(
-      />/g,
-      '&gt;'
-    )
-    .replace(
-      /"/g,
-      '&quot;'
-    )
-    .replace(
-      /'/g,
-      '&#039;'
-    );
-}
-
-async function refresh() {
+async function refresh(force) {
   if (refreshInFlight) {
-    refreshQueued = true;
-    return;
-  }
-
-  if (actionRequestInFlight || inventoryActionInFlight) {
-    refreshQueued = true;
+    if (force) refreshQueued = true;
     return;
   }
 
   refreshInFlight = true;
-  const requestEpoch = syncEpoch;
+  const generation = ++refreshGeneration;
 
   try {
-    try {
-      await getSnapshot(requestEpoch);
-      if (requestEpoch === syncEpoch) {
-        renderDetail();
-        if (!inventoryActionInFlight) {
-          renderInventory();
-        }
-      }
-    } catch (_) {
-      // Fall back to the legacy split endpoints if snapshot is unavailable.
-      try {
-        await getBot(requestEpoch);
-        if (requestEpoch === syncEpoch) {
-          renderDetail();
-        }
-      } catch (_) {
-      }
+    const result = await apiJson('/api/snapshot');
 
-      if (!inventoryActionInFlight) {
-        try {
-          await getInventory(requestEpoch);
-          if (requestEpoch === syncEpoch) {
-            renderInventory();
-          }
-        } catch (_) {
-        }
+    if (
+      generation !== refreshGeneration
+    ) {
+      return;
+    }
+
+    if (!result.ok) {
+      showToast(
+        result.data.error ||
+        'Không thể lấy trạng thái bot.'
+      );
+      return;
+    }
+
+    if (result.data.bot) {
+      bot = result.data.bot;
+      uptimeSyncAt = Date.now();
+      renderBotState();
+    }
+
+    if (result.data.inventory) {
+      inventory = result.data.inventory;
+      renderInventory();
+    }
+
+    if (!settingsDirty && result.data.settings) {
+      renderPublicSettings(result.data.settings);
+
+      if (Array.isArray(result.data.settings.autoChatSchedules)) {
+        renderAutoChatSchedules(
+          result.data.settings.autoChatSchedules
+        );
       }
     }
 
-    await Promise.allSettled([
-      loadLogs(),
-      loadChatLogs()
+    await Promise.all([
+      loadLogs(false),
+      loadChatLogs(false)
     ]);
+  } catch (err) {
+    console.error('[BOT UI] refresh', err);
+    showToast('Không thể kết nối tới server web.');
   } finally {
     refreshInFlight = false;
-    runQueuedRefresh();
-  }
-}
 
-async function postAction(
-  url,
-  fallback
-) {
-  if (actionRequestInFlight) {
-    return;
-  }
-
-  actionRequestInFlight = true;
-  invalidatePendingReads();
-  refreshQueued = true;
-  renderDetail();
-
-  try {
-
-    const response =
-      await fetch(
-        url,
-        {
-          method:'POST'
-        }
-      );
-
-    const data =
-      await response.json();
-
-    showToast(
-      data.message ||
-      data.error ||
-      fallback
-    );
-
-    await refresh();
-
-  } catch (_) {
-
-    showToast(
-      'Không thể kết nối tới server web.'
-    );
-
-  } finally {
-    actionRequestInFlight = false;
-    renderDetail();
-    runQueuedRefresh();
-  }
-}
-
-async function startBot() {
-
-  await postAction(
-    '/api/bot/start',
-    'Done'
-  );
-
-}
-
-async function stopBot() {
-
-  await postAction(
-    '/api/bot/stop',
-    'Done'
-  );
-
-}
-
-async function restartBot() {
-
-  await postAction(
-    '/api/bot/restart',
-    'Done'
-  );
-
-}
-
-async function sendMessage(event) {
-
-  event.preventDefault();
-
-  const input =
-    document.getElementById(
-      'messageInput'
-    );
-
-  const text =
-    input.value;
-
-  if (!text.trim()) {
-    return;
-  }
-
-  invalidatePendingReads();
-
-  try {
-
-    const response =
-      await fetch(
-        '/api/bot/send',
-        {
-          method:'POST',
-
-          headers:{
-            'Content-Type':
-              'application/json'
-          },
-
-          body:
-            JSON.stringify({
-              text
-            })
-        }
-      );
-
-    const data =
-      await response.json();
-
-    if (!response.ok) {
-
-      showToast(
-        data.error ||
-        'Gửi thất bại.'
-      );
-
-      return;
+    if (
+      refreshQueued &&
+      !actionRequestInFlight &&
+      !inventoryActionInFlight
+    ) {
+      refreshQueued = false;
+      void refresh(true);
     }
-
-    input.value = '';
-
-    showToast(
-      'Đã gửi.'
-    );
-
-    await getBot();
-
-    await loadChatLogs(true);
-
-  } catch (_) {
-
-    showToast(
-      'Không thể kết nối tới server web.'
-    );
-
   }
 }
 
-async function saveAccount() {
+function markSettingsInputDirty(event) {
+  const target = event.target;
+  if (!target) return;
 
-  const username =
-    document
-      .getElementById(
-        'usernameInput'
-      )
-      .value
-      .trim();
-
-  const password =
-    document
-      .getElementById(
-        'passwordInput'
-      )
-      .value;
-
-  if (!username && !password) {
-    showToast(
-      'Nhập username hoặc password cần thay đổi.'
-    );
-    return;
-  }
-
-  invalidatePendingReads();
-
-  try {
-
-    const response =
-      await fetch(
-        '/api/bot/account',
-        {
-          method:'POST',
-
-          headers:{
-            'Content-Type':
-              'application/json'
-          },
-
-          body: JSON.stringify({
-            username,
-            password
-          })
-        }
-      );
-
-    const data =
-      await response.json();
-
-    if (!response.ok) {
-      showToast(
-        data.error ||
-        'Lưu thất bại.'
-      );
-      return;
-    }
-
-    document
-      .getElementById(
-        'usernameInput'
-      )
-      .value = '';
-
-    document
-      .getElementById(
-        'passwordInput'
-      )
-      .value = '';
-
-    showToast(
-      data.message ||
-      'Đã lưu thay đổi. Bấm "Chạy lại" để áp dụng.'
-    );
-
-    await refresh();
-
-  } catch (_) {
-
-    showToast(
-      'Không thể kết nối tới server web.'
-    );
-
+  if (
+    target.id === 'settingAutoTotem' ||
+    target.id === 'settingAntiHungry' ||
+    target.id === 'settingAutoReconnect' ||
+    (target.closest && target.closest('#autoChatSchedules'))
+  ) {
+    markSettingsDirty();
   }
 }
-
-function showToast(message) {
-
-  const toast =
-    document.getElementById(
-      'toast'
-    );
-
-  toast.textContent =
-    message;
-
-  toast.style.display =
-    'block';
-
-  clearTimeout(
-    showToast.timer
-  );
-
-  showToast.timer =
-    setTimeout(() => {
-      toast.style.display =
-        'none';
-    }, 2200);
-}
-
-(async function init() {
-
-  await refresh();
-
-})();
-
-setInterval(
-  refresh,
-  1000
-);
 
 function updateUptimeDisplay() {
+  if (!bot) return;
 
-  if (!bot) {
-    return;
-  }
+  const syncedSeconds = Number(bot.uptimeSeconds || 0);
+  const elapsed = bot.status === 'afk'
+    ? Math.floor((Date.now() - uptimeSyncAt) / 1000)
+    : 0;
 
-  const syncedSeconds =
-    Number(
-      bot.uptimeSeconds || 0
-    );
+  const total = Math.min(
+    syncedSeconds + elapsed,
+    (999 * 60 * 60) - 1
+  );
 
-  const elapsedSinceSync =
-    bot.status === 'afk'
-      ? Math.floor(
-          (Date.now() - uptimeSyncAt) / 1000
-        )
-      : 0;
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
 
-  const uptimeSeconds =
-    Math.min(
-      syncedSeconds + elapsedSinceSync,
-      (999 * 60 * 60) - 1
-    );
-
-  const hours =
-    Math.floor(
-      uptimeSeconds / 3600
-    );
-
-  const minutes =
-    Math.floor(
-      (uptimeSeconds % 3600) / 60
-    );
-
-  const seconds =
-    uptimeSeconds % 60;
-
-  const element =
-    document.getElementById(
-      'detailUptime'
-    );
+  const element = byId('detailUptime');
 
   if (element) {
     element.textContent =
@@ -5480,12 +5816,82 @@ function updateUptimeDisplay() {
   }
 }
 
-setInterval(
-  updateUptimeDisplay,
-  250
-);
+document.addEventListener('input', markSettingsInputDirty);
+document.addEventListener('change', markSettingsInputDirty);
 
+window.addAutoChatSchedule = addAutoChatSchedule;
+window.allowDrop = allowDrop;
+window.clearChatHistory = clearChatHistory;
+window.clearDragOver = clearDragOver;
+window.clearEventHistory = clearEventHistory;
+window.dropEquip = dropEquip;
+window.dropItemToWorld = dropItemToWorld;
+window.refresh = refresh;
+window.removeAutoChatSchedule = removeAutoChatSchedule;
+window.restartBot = restartBot;
+window.saveAccount = saveAccount;
+window.saveSettings = saveSettings;
+window.scheduleModeChanged = scheduleModeChanged;
+window.sendMessage = sendMessage;
+window.showToast = showToast;
+window.startBot = startBot;
+window.startEquipmentDrag = startEquipmentDrag;
+window.stopBot = stopBot;
+window.unequipEquipment = unequipEquipment;
+
+window.invalidatePendingReads = invalidatePendingReads;
+window.renderPublicIp = renderPublicIp;
+window.renderSettings = renderSettings;
+window.runQueuedRefresh = runQueuedRefresh;
+window.addEventListener('error', function(event) {
+  try {
+    console.error(
+      '[BOT UI]',
+      event.error || event.message || 'Unknown UI error'
+    );
+  } catch (_) {}
+});
+
+window.addEventListener('unhandledrejection', function(event) {
+  try {
+    console.error(
+      '[BOT UI] Unhandled rejection',
+      event.reason
+    );
+  } catch (_) {}
+});
+
+window.startBot = startBot;
+window.stopBot = stopBot;
+window.restartBot = restartBot;
+window.sendMessage = sendMessage;
+window.addAutoChatSchedule = addAutoChatSchedule;
+window.removeAutoChatSchedule = removeAutoChatSchedule;
+window.scheduleModeChanged = scheduleModeChanged;
+window.saveSettings = saveSettings;
+window.clearEventHistory = clearEventHistory;
+window.clearChatHistory = clearChatHistory;
+window.saveAccount = saveAccount;
+window.allowDrop = allowDrop;
+window.clearDragOver = clearDragOver;
+window.startEquipmentDrag = startEquipmentDrag;
+window.dropEquip = dropEquip;
+window.dropItemToWorld = dropItemToWorld;
+window.unequipEquipment = unequipEquipment;
+
+(async function init() {
+  await refresh(true);
+})();
+
+setInterval(function() {
+  if (!settingsSaveInFlight) {
+    void refresh(false);
+  }
+}, 1000);
+
+setInterval(updateUptimeDisplay, 250);
 </script>
+
 
 </body>
 </html>`;
@@ -5500,7 +5906,8 @@ app.get(
         res.json({
             ok: true,
             bot: publicBotState(botState),
-            inventory: publicInventoryState(botState)
+            inventory: publicInventoryState(botState),
+            settings: publicSettingsState(botState)
         });
     }
 );
@@ -5535,6 +5942,119 @@ app.get(
 );
 
 // -----------------------------------------------------------------------------
+// Settings / automation / history management
+// -----------------------------------------------------------------------------
+
+function publicSettingsState(state) {
+    return {
+        settings: {
+            autoTotem: state.settings.autoTotem !== false,
+            antiHungry: state.settings.antiHungry !== false,
+            autoReconnect: state.settings.autoReconnect !== false
+        },
+        autoChatSchedules: sanitizeAutoChatSchedules(state.autoChatSchedules).map(schedule => ({
+            id: schedule.id,
+            enabled: schedule.enabled !== false,
+            mode: schedule.mode,
+            intervalSeconds: schedule.intervalSeconds,
+            times: schedule.times,
+            messages: schedule.messages,
+            messageDelaySeconds: schedule.messageDelaySeconds
+        }))
+    };
+}
+
+app.get('/api/settings', (req, res) => {
+    res.json({
+        ok: true,
+        ...publicSettingsState(botState)
+    });
+});
+
+app.post('/api/settings', (req, res) => {
+    const body = req.body && typeof req.body === 'object'
+        ? req.body
+        : {};
+
+    const incoming = body.settings && typeof body.settings === 'object'
+        ? body.settings
+        : body;
+
+    const nextSettings = {
+        autoTotem: incoming.autoTotem !== false,
+        antiHungry: incoming.antiHungry !== false,
+        autoReconnect: incoming.autoReconnect !== false
+    };
+
+    const schedules = sanitizeAutoChatSchedules(body.autoChatSchedules);
+
+    const runtimeSchedules = sanitizeAutoChatSchedules(schedules);
+    for (const schedule of runtimeSchedules) {
+        schedule.lastIntervalRunAt = Date.now();
+        schedule.lastFixedRunKey = '';
+        schedule.running = false;
+    }
+
+    const persisted = saveBotSettingsFile(
+        nextSettings,
+        runtimeSchedules
+    );
+
+    if (!persisted) {
+        return res.status(500).json({
+            error: 'Không thể ghi bot_settings.json; runtime chưa được thay đổi.'
+        });
+    }
+
+    botState.settings = nextSettings;
+    botState.autoChatGeneration++;
+    botState.autoChatSchedules = runtimeSchedules;
+
+    addLog(
+        botState,
+        `[SETTING] Auto Totem=${nextSettings.autoTotem ? 'ON' : 'OFF'} | Anti Hungry=${nextSettings.antiHungry ? 'ON' : 'OFF'} | Auto Reconnect=${nextSettings.autoReconnect ? 'ON' : 'OFF'}.`
+    );
+
+    if (!nextSettings.autoReconnect) {
+        if (botState.reconnectTimer) {
+            clearTimeout(botState.reconnectTimer);
+            botState.reconnectTimer = null;
+        }
+        if (botState.locationRetryTimer) {
+            clearTimeout(botState.locationRetryTimer);
+            botState.locationRetryTimer = null;
+        }
+    }
+
+    res.json({
+        ok: true,
+        message: 'Đã lưu setting.',
+        ...publicSettingsState(botState)
+    });
+});
+
+app.post('/api/bot/logs/clear', (req, res) => {
+    botState.logs = [];
+    botState.logRevision++;
+    res.json({
+        ok: true,
+        revision: botState.logRevision,
+        message: 'Đã xóa lịch sử Event Log.'
+    });
+});
+
+app.post('/api/bot/chat-logs/clear', (req, res) => {
+    botState.chatLogs = [];
+    botState.recentChatMessages = [];
+    botState.chatLogRevision++;
+    res.json({
+        ok: true,
+        revision: botState.chatLogRevision,
+        message: 'Đã xóa lịch sử Chat.'
+    });
+});
+
+// -----------------------------------------------------------------------------
 // API: node identity / central dashboard capability discovery
 // -----------------------------------------------------------------------------
 
@@ -5562,13 +6082,36 @@ app.get(
                 restart: '/api/bot/restart',
                 send: '/api/bot/send',
                 account: '/api/bot/account',
+                credentials: '/api/bot/credentials',
                 moveInventory: '/api/inventory/move',
                 equip: '/api/inventory/equip',
                 unequip: '/api/inventory/unequip',
                 selectHotbar: '/api/inventory/select',
-                dropInventory: '/api/inventory/drop'
+                dropInventory: '/api/inventory/drop',
+                settings: '/api/settings',
+                clearLogs: '/api/bot/logs/clear',
+                clearChatLogs: '/api/bot/chat-logs/clear',
             }
         });
+    }
+);
+
+// -----------------------------------------------------------------------------
+// API: current bot credentials
+//
+// Used only by the central Manager after the Manager ADMIN password has been
+// validated there. Credentials are read directly from runtime botState so a
+// runtime account change is reflected immediately.
+// -----------------------------------------------------------------------------
+
+app.get(
+    '/api/bot/credentials',
+    (req, res) => {
+        res.json(
+            publicBotCredentials(
+                botState
+            )
+        );
     }
 );
 
@@ -5812,7 +6355,7 @@ app.post(
 // -----------------------------------------------------------------------------
 // Update account
 // Runtime only.
-// ENV variables are not changed.
+// BOT_CONFIG là nguồn credential gốc. Thay đổi từ web chỉ áp dụng lúc runtime.
 // -----------------------------------------------------------------------------
 
 app.post(
@@ -6796,13 +7339,13 @@ app.get(
 // -----------------------------------------------------------------------------
 
 function scheduleAutoStartOnBoot() {
-    const hasEnvCredentials =
-        !!(botState.username && botState.password);
+    const hasConfiguredCredentials =
+        !!(BOT_CONFIG.USERNAME && BOT_CONFIG.PASSWORD);
 
-    if (!hasEnvCredentials) {
+    if (!hasConfiguredCredentials) {
         addLog(
             botState,
-            'Bot đang OFFLINE: chưa có username/password trong ENV. Có thể nhập tài khoản trên web rồi bấm Chạy.'
+            'Bot đang OFFLINE: BOT_CONFIG chưa có username/password. Có thể nhập tài khoản trên web rồi bấm Chạy.'
         );
         return;
     }
@@ -6810,14 +7353,14 @@ function scheduleAutoStartOnBoot() {
     if (!AUTO_START_ON_BOOT) {
         addLog(
             botState,
-            'Đã đọc credential từ ENV nhưng AUTO_START đang tắt. Bot đang OFFLINE.'
+            'AUTO_START đang tắt trong BOT_CONFIG. Bot đang OFFLINE.'
         );
         return;
     }
 
     addLog(
         botState,
-        'Đã đọc credential từ ENV. Service đã listen, đang tự khởi động bot.'
+        'Đã đọc credential từ BOT_CONFIG. Service đã listen, đang tự khởi động bot.'
     );
 
     clearAfkTimers(botState);
@@ -6850,9 +7393,11 @@ const server = app.listen(
     () => {
 
         console.log(
-            `[HTTP] Dashboard listening on ${HTTP_PORT}`
+            `[HTTP] Dashboard listening on ${HTTP_PORT} | ` +
+            `Platform ${PLATFORM}`
         );
 
+        startPublicIpMonitor(botState);
         scheduleAutoStartOnBoot();
     }
 );
@@ -6925,9 +7470,8 @@ process.on(
 // -----------------------------------------------------------------------------
 // FINAL STARTUP STATE
 //
-// - Có đủ BOT1_USERNAME + BOT1_PASSWORD (hoặc MC_USERNAME + MC_PASSWORD)
-//   => tự khởi động sau khi Render service listen.
-// - Không có credential => giữ OFFLINE để chờ nhập từ web.
+// - BOT_CONFIG có username/password => tự khởi động sau khi HTTP service listen.
+// - BOT_CONFIG thiếu credential => giữ OFFLINE để chờ nhập từ web.
 // - AUTO_START=false => tắt auto-start nhưng vẫn giữ nút Chạy thủ công.
 // -----------------------------------------------------------------------------
 
@@ -6937,16 +7481,15 @@ setBotStatus(botState, 'offline');
 botState.connectedAt = null;
 resetInventoryState(botState);
 
-// Auto-start is scheduled from the HTTP server listen callback so the bot
-// only begins connecting after the Render web service is actually listening.
-// This is important after an instance/process restart.
+// Auto-start được gọi sau khi HTTP server listen xong để bot chỉ kết nối
+// sau khi dashboard/web service đã sẵn sàng.
 
 
 // ============================================================================
 // END OF FILE
 // ============================================================================
 //
-// File này là bản 1-bot hoàn chỉnh.
+// File này là bản 1-bot hardcoded hoàn chỉnh.
 //
 // Chức năng giữ lại:
 // - Mineflayer
@@ -6962,16 +7505,17 @@ resetInventoryState(botState);
 // - Reconnect + host fallback
 // - Chat / command
 // - Runtime username/password
+// - Credential API cho Manager: /api/bot/credentials
 // - Health endpoint
 // - Lightweight status endpoint
-// - Auto-start from ENV credentials after HTTP listen
+// - Auto-start từ credential hardcode trong BOT_CONFIG sau khi HTTP listen
 // - UTC+7 log time
 // - Log filtering
 // - Log scroll position preservation
 // - View distance tuning
 // - Graceful shutdown
-// - BOT environment identity
-// - CORS + /api/node central dashboard discovery
+// - BOT_ID hardcode trong BOT_CONFIG
+// - CORS/API discovery cho central dashboard
 //
 // Lưu ý:
 // Phần này chỉ là marker kết thúc file.
