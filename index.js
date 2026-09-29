@@ -2366,8 +2366,31 @@ function confirmAfkAfterClick(state, bot) {
     scheduleLocationRetry(state, bot, 'coordinate', true);
 }
 
+function resetLocationFlowState(state, reason = '') {
+    if (state.locationRetryTimer) {
+        clearTimeout(state.locationRetryTimer);
+        state.locationRetryTimer = null;
+    }
+
+    if (state.locationConfirmTimer) {
+        clearTimeout(state.locationConfirmTimer);
+        state.locationConfirmTimer = null;
+    }
+
+    state.locationActionBusy = false;
+    state.locationFlowBusy = false;
+    state.pendingAfkConfirmation = false;
+    state.locationRetryAttempt = 0;
+    state.locationRetryReason = '';
+
+    if (reason) {
+        addLog(state, `[FLOW] Reset flow: ${reason}.`);
+    }
+}
+
 function startLocationMonitor(state, bot) {
     clearLocationTimers(state);
+    state.locationState = 'unknown';
 
     const tick = () => {
         if (
@@ -2379,8 +2402,55 @@ function startLocationMonitor(state, bot) {
             return;
         }
 
+        const previousKind = state.locationState;
         const kind = getLocationKind(bot);
         state.locationState = kind;
+        const now = Date.now();
+
+        // The server can silently return an already-connected AFK bot to the
+        // auth/lobby coordinates without closing the Mineflayer connection.
+        // Treat that as a fresh flow instead of relying on the old AFK state.
+        if (
+            state.status === 'afk' &&
+            previousKind === 'other' &&
+            (kind === 'login' || kind === 'lobby')
+        ) {
+            state.ready = false;
+            resetLocationFlowState(
+                state,
+                `phát hiện AFK -> ${kind.toUpperCase()} bất ngờ`
+            );
+            setBotStatus(
+                state,
+                kind === 'login' ? 'authenticating' : 'entering'
+            );
+        }
+
+        // Self-heal a flow that got stuck because a GUI/teleport changed
+        // state between two timers. Without this guard, locationFlowBusy can
+        // remain true forever and block all subsequent /login or /dn actions.
+        if (
+            state.locationFlowBusy &&
+            !state.locationRetryTimer &&
+            !state.locationActionBusy &&
+            !state.pendingAfkConfirmation &&
+            (kind === 'login' || kind === 'lobby')
+        ) {
+            const lastActionAt =
+                kind === 'login'
+                    ? Number(state.lastLoginActionAt || 0)
+                    : Number(state.lastDnActionAt || 0);
+
+            if (
+                lastActionAt > 0 &&
+                now - lastActionAt >= 7000
+            ) {
+                resetLocationFlowState(
+                    state,
+                    `flow ${kind.toUpperCase()} bị kẹt quá 7 giây`
+                );
+            }
+        }
 
         if (state.pendingAfkConfirmation && kind !== 'unknown') {
             if (!state.locationConfirmTimer) {
@@ -3340,6 +3410,12 @@ function startAfkRoutine(state, expectedBot = state.bot) {
             state.bot !== bot ||
             getLocationKind(bot) !== 'lobby'
         ) {
+            // Never leave locationFlowBusy locked when a delayed timer fires
+            // after a teleport, reconnect, or location change.
+            if (state.bot === bot && !state.manuallyStopped) {
+                state.locationFlowBusy = false;
+                state.pendingAfkConfirmation = false;
+            }
             return;
         }
 
@@ -3358,6 +3434,10 @@ function startAfkRoutine(state, expectedBot = state.bot) {
                 state.manuallyStopped ||
                 state.bot !== bot
             ) {
+                if (state.bot === bot && !state.manuallyStopped) {
+                    state.locationFlowBusy = false;
+                    state.pendingAfkConfirmation = false;
+                }
                 return;
             }
 
@@ -3374,6 +3454,8 @@ function startAfkRoutine(state, expectedBot = state.bot) {
             try {
                 if (getLocationKind(bot) !== 'lobby') {
                     state.ready = false;
+                    state.locationFlowBusy = false;
+                    state.pendingAfkConfirmation = false;
                     return;
                 }
 
