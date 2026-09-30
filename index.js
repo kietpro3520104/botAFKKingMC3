@@ -146,6 +146,11 @@ const DEFAULT_SETTINGS = Object.freeze({
     ...BOT_CONFIG.DEFAULT_SETTINGS
 });
 
+const BOT_SCHEDULER_MAX_ITEMS = 50;
+const BOT_SCHEDULER_TICK_MS = 1000;
+const BOT_SCHEDULER_MANUAL_GUARD_MS = 5000;
+const BOT_SCHEDULER_MAX_PHASE_MINUTES = 43200;
+
 function sanitizeAutoChatSchedules(input) {
     if (!Array.isArray(input)) {
         return [];
@@ -214,12 +219,114 @@ function sanitizeAutoChatSchedules(input) {
     return result;
 }
 
+function sanitizeBotSchedules(input, options = {}) {
+    const rawList = Array.isArray(input)
+        ? input.filter(item => item && typeof item === 'object')
+        : [];
+
+    if (!rawList.length) return [];
+
+    const now = Date.now();
+    const resetCycleState = options.resetCycleState === true;
+    const rawFirst = rawList[0];
+    const requestedMode = rawFirst.mode === 'cycle' ? 'cycle' : 'fixed';
+    const id = String(rawFirst.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    const enabled = rawFirst.enabled !== false;
+
+    // New format: one scheduler + many ordered items.
+    // Legacy v2.1 format: many independent cards. Merge same-mode cards into one scheduler.
+    let sourceItems;
+    if (Array.isArray(rawFirst.items)) {
+        sourceItems = rawFirst.items;
+    } else {
+        sourceItems = rawList
+            .filter(item => (item.mode === 'cycle' ? 'cycle' : 'fixed') === requestedMode)
+            .flatMap(item => requestedMode === 'fixed'
+                ? [{
+                    id: item.id,
+                    action: item.action,
+                    time: item.time,
+                    lastFixedRunKey: item.lastFixedRunKey
+                }]
+                : [
+                    { id: `${item.id || 'cycle'}-stop`, action: 'stop', afterMinutes: item.offAfterMinutes },
+                    { id: `${item.id || 'cycle'}-start`, action: 'start', afterMinutes: item.onAfterMinutes }
+                ]
+            );
+    }
+
+    const items = [];
+    for (const rawItem of sourceItems.slice(0, BOT_SCHEDULER_MAX_ITEMS)) {
+        const raw = rawItem && typeof rawItem === 'object' ? rawItem : {};
+        const itemId = String(raw.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+        const action = raw.action === 'start' ? 'start' : 'stop';
+
+        if (requestedMode === 'fixed') {
+            const time = String(raw.time || '').trim();
+            if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) continue;
+            items.push({
+                id: itemId,
+                action,
+                time,
+                lastFixedRunKey: resetCycleState ? '' : String(raw.lastFixedRunKey || '')
+            });
+        } else {
+            items.push({
+                id: itemId,
+                action,
+                afterMinutes: readPositiveInt(
+                    raw.afterMinutes,
+                    120,
+                    1,
+                    BOT_SCHEDULER_MAX_PHASE_MINUTES
+                )
+            });
+        }
+    }
+
+    if (!items.length) return [];
+
+    if (requestedMode === 'fixed') {
+        const seen = new Set();
+        const uniqueItems = items.filter(item => {
+            if (seen.has(item.time)) return false;
+            seen.add(item.time);
+            return true;
+        });
+
+        return [{ id, enabled, mode: 'fixed', items: uniqueItems }];
+    }
+
+    const rawAnchor = Number(rawFirst.cycleAnchorAt);
+    const cycleAnchorAt = resetCycleState
+        ? now
+        : Number.isFinite(rawAnchor) && rawAnchor > 0
+            ? Math.trunc(rawAnchor)
+            : now;
+    const rawEventIndex = Number(rawFirst.lastCycleEventIndex);
+    const lastCycleEventIndex = resetCycleState
+        ? 0
+        : Number.isInteger(rawEventIndex) && rawEventIndex >= 0
+            ? rawEventIndex
+            : 0;
+
+    return [{
+        id,
+        enabled,
+        mode: 'cycle',
+        items,
+        cycleAnchorAt,
+        lastCycleEventIndex
+    }];
+}
+
 function loadBotSettings() {
     try {
         if (!fs.existsSync(SETTINGS_FILE)) {
             return {
                 settings: { ...DEFAULT_SETTINGS },
-                autoChatSchedules: []
+                autoChatSchedules: [],
+                botSchedules: []
             };
         }
 
@@ -235,21 +342,23 @@ function loadBotSettings() {
                 antiHungry: settings.antiHungry !== false,
                 autoReconnect: settings.autoReconnect !== false
             },
-            autoChatSchedules: sanitizeAutoChatSchedules(parsed?.autoChatSchedules)
+            autoChatSchedules: sanitizeAutoChatSchedules(parsed?.autoChatSchedules),
+            botSchedules: sanitizeBotSchedules(parsed?.botSchedules)
         };
     } catch (err) {
         console.error(`[SETTINGS] Không đọc được ${SETTINGS_FILE}: ${err.message}`);
         return {
             settings: { ...DEFAULT_SETTINGS },
-            autoChatSchedules: []
+            autoChatSchedules: [],
+            botSchedules: []
         };
     }
 }
 
-function saveBotSettingsFile(settings, autoChatSchedules) {
+function saveBotSettingsFile(settings, autoChatSchedules, botSchedules) {
     try {
         const payload = {
-            version: 1,
+            version: 2,
             settings: {
                 autoTotem: settings.autoTotem !== false,
                 antiHungry: settings.antiHungry !== false,
@@ -264,6 +373,32 @@ function saveBotSettingsFile(settings, autoChatSchedules) {
                     times: schedule.times,
                     messages: schedule.messages,
                     messageDelaySeconds: schedule.messageDelaySeconds
+                })),
+            botSchedules: sanitizeBotSchedules(botSchedules)
+                .map(schedule => ({
+                    id: schedule.id,
+                    enabled: schedule.enabled !== false,
+                    mode: schedule.mode,
+                    items: Array.isArray(schedule.items)
+                        ? schedule.items.map(item => schedule.mode === 'fixed'
+                            ? {
+                                id: item.id,
+                                action: item.action === 'start' ? 'start' : 'stop',
+                                time: item.time,
+                                lastFixedRunKey: item.lastFixedRunKey || ''
+                            }
+                            : {
+                                id: item.id,
+                                action: item.action === 'start' ? 'start' : 'stop',
+                                afterMinutes: item.afterMinutes
+                            })
+                        : [],
+                    ...(schedule.mode === 'cycle'
+                        ? {
+                            cycleAnchorAt: schedule.cycleAnchorAt,
+                            lastCycleEventIndex: schedule.lastCycleEventIndex
+                        }
+                        : {})
                 }))
         };
 
@@ -423,6 +558,11 @@ function createBotState() {
 
         settings: { ...INITIAL_SETTINGS.settings },
         autoChatSchedules: INITIAL_SETTINGS.autoChatSchedules,
+        botSchedules: INITIAL_SETTINGS.botSchedules,
+        botSchedulerTimer: null,
+        lastManualLifecycleAt: 0,
+        lifecycleActionBusy: false,
+        lastAuthDnActionAt: 0,
 
         publicIp: '',
         publicIpUpdatedAt: 0,
@@ -450,6 +590,7 @@ function createBotState() {
 }
 
 const botState = createBotState();
+startBotScheduler(botState);
 
 function addLog(state, message) {
     const time = new Date().toLocaleTimeString('vi-VN', {
@@ -694,11 +835,23 @@ function cleanupBotResources(bot) {
     }
 }
 
-function withTimeout(promise, timeoutMs, label = 'Thao tác') {
+function withTimeout(
+    promise,
+    timeoutMs,
+    label = 'Thao tác',
+    onTimeout = null
+) {
     let timer = null;
 
     const timeoutPromise = new Promise((_, reject) => {
         timer = setTimeout(() => {
+            if (typeof onTimeout === 'function') {
+                try {
+                    onTimeout();
+                } catch (_) {
+                }
+            }
+
             reject(new Error(`${label} quá thời gian chờ.`));
         }, timeoutMs);
     });
@@ -757,6 +910,13 @@ function clearRestartTimer(state) {
     }
 }
 
+function clearPublicIpTimer(state) {
+    if (state.publicIpTimer) {
+        clearInterval(state.publicIpTimer);
+        state.publicIpTimer = null;
+    }
+}
+
 function clearLocationTimers(state) {
     if (state.locationMonitorTimer) {
         clearInterval(state.locationMonitorTimer);
@@ -780,12 +940,16 @@ function clearLocationTimers(state) {
     state.locationRetryReason = '';
 }
 
-function clearAllTimers(state) {
+function clearAllTimers(state, includePublicIp = false) {
     clearAfkTimers(state);
     clearReconnectTimer(state);
     clearLocationTimers(state);
     clearRestartTimer(state);
     clearManagerTimers(state);
+
+    if (includePublicIp) {
+        clearPublicIpTimer(state);
+    }
 }
 
 const FOOD_PRIORITY = [
@@ -1487,6 +1651,7 @@ async function autoEatTick(state) {
         !bot ||
         state.bot !== bot ||
         !bot.player ||
+        !state.ready ||
         state.isEating ||
         state.inventoryActionBusy
     ) {
@@ -1574,7 +1739,8 @@ async function autoEatTick(state) {
         await withTimeout(
             bot.equip(foodItem, 'hand'),
             INVENTORY_ACTION_TIMEOUT_MS,
-            'Equip thức ăn'
+            'Equip thức ăn',
+            () => invalidateInventoryAction(state)
         );
 
         if (
@@ -1594,7 +1760,8 @@ async function autoEatTick(state) {
         await withTimeout(
             bot.consume(),
             INVENTORY_ACTION_TIMEOUT_MS,
-            'Ăn thức ăn'
+            'Ăn thức ăn',
+            () => invalidateInventoryAction(state)
         );
 
         if (state.bot === oldBot) {
@@ -1621,11 +1788,16 @@ async function autoEatTick(state) {
             return;
         }
 
+        if (!isInventoryActionCurrent(state, oldBot, actionToken)) {
+            return;
+        }
+
         try {
             if (
                 oldHeldItem &&
                 bot.inventory &&
-                Array.isArray(bot.inventory.slots)
+                Array.isArray(bot.inventory.slots) &&
+                isInventoryActionCurrent(state, oldBot, actionToken)
             ) {
                 let oldItemStillExists = false;
 
@@ -1636,30 +1808,46 @@ async function autoEatTick(state) {
                     }
                 }
 
-                if (oldItemStillExists) {
+                if (
+                    oldItemStillExists &&
+                    isInventoryActionCurrent(state, oldBot, actionToken)
+                ) {
                     await withTimeout(
                         bot.equip(oldHeldItem, 'hand'),
                         INVENTORY_ACTION_TIMEOUT_MS,
-                        'Khôi phục item cũ'
+                        'Khôi phục item cũ',
+                        () => invalidateInventoryAction(state)
                     );
 
-                    addLog(
-                        state,
-                        `[FOOD] Đã khôi phục item cũ: ${oldHeldItem.displayName || oldHeldItem.name}.`
-                    );
+                    if (isInventoryActionCurrent(state, oldBot, actionToken)) {
+                        addLog(
+                            state,
+                            `[FOOD] Đã khôi phục item cũ: ${oldHeldItem.displayName || oldHeldItem.name}.`
+                        );
+                    }
                 }
             }
         } catch (err) {
-            addLog(
-                state,
-                `[HOTBAR] Không thể restore item cũ: ${err.message}`
-            );
+            if (state.bot === oldBot) {
+                addLog(
+                    state,
+                    `[HOTBAR] Không thể restore item cũ: ${err.message}`
+                );
+            }
+        }
+
+        if (!isInventoryActionCurrent(state, oldBot, actionToken)) {
+            return;
         }
 
         restoreSelectedSlot(
             state,
             oldSelectedSlot
         );
+
+        if (!isInventoryActionCurrent(state, oldBot, actionToken)) {
+            return;
+        }
 
         scanInventory(
             state,
@@ -1681,6 +1869,7 @@ async function autoTotemTick(state) {
         state.bot !== bot ||
         !bot.player ||
         !bot.entity ||
+        !state.ready ||
         state.isEating ||
         state.isEquippingTotem ||
         state.inventoryActionBusy
@@ -1766,12 +1955,14 @@ async function autoTotemTick(state) {
         await withTimeout(
             bot.equip(totem, 'off-hand'),
             INVENTORY_ACTION_TIMEOUT_MS,
-            'Equip Totem'
+            'Equip Totem',
+            () => invalidateInventoryAction(state)
         );
 
         if (
             state.bot === oldBot &&
-            !state.manuallyStopped
+            !state.manuallyStopped &&
+            isInventoryActionCurrent(state, oldBot, actionToken)
         ) {
             addLog(
                 state,
@@ -1829,6 +2020,7 @@ function currentVietnamTimeParts(date = new Date()) {
 function isAutoChatBotReady(state) {
     return (
         !state.manuallyStopped &&
+        state.ready === true &&
         !!state.bot &&
         !!state.bot.player &&
         state.status !== 'offline' &&
@@ -1916,6 +2108,175 @@ async function autoChatTick(state) {
                 void runAutoChatSchedule(state, schedule);
             }
         }
+    }
+}
+
+function getBotCycleEventIndex(schedule, now = Date.now()) {
+    if (!schedule || schedule.mode !== 'cycle' || !Array.isArray(schedule.items) || !schedule.items.length) {
+        return 0;
+    }
+
+    const anchorAt = Number(schedule.cycleAnchorAt);
+    if (!Number.isFinite(anchorAt) || anchorAt <= 0) return 0;
+
+    const durations = schedule.items.map(item => Math.max(1, Number(item.afterMinutes || 0)) * 60);
+    if (!durations.length || durations.some(value => !Number.isFinite(value) || value <= 0)) return 0;
+
+    const cycleLength = durations.reduce((sum, value) => sum + value, 0);
+    const elapsedSeconds = Math.max(0, (Number(now) - anchorAt) / 1000);
+    if (!Number.isFinite(elapsedSeconds) || elapsedSeconds < durations[0]) return 0;
+
+    const itemCount = durations.length;
+    const cycleNumber = Math.floor(elapsedSeconds / cycleLength);
+    const cycleOffset = elapsedSeconds - cycleNumber * cycleLength;
+
+    let completedInCycle = 0;
+    let cumulative = 0;
+    for (const duration of durations) {
+        cumulative += duration;
+        if (cycleOffset + 0.001 >= cumulative) completedInCycle++;
+        else break;
+    }
+
+    return cycleNumber * itemCount + completedInCycle;
+}
+
+function getBotCycleEventAction(schedule, eventIndex) {
+    if (!schedule || !Array.isArray(schedule.items) || !Number.isInteger(eventIndex) || eventIndex <= 0) return null;
+    const itemIndex = (eventIndex - 1) % schedule.items.length;
+    const item = schedule.items[itemIndex];
+    return item && item.action === 'start' ? 'start' : 'stop';
+}
+
+function markManualLifecycleAction(state) {
+    state.lastManualLifecycleAt = Date.now();
+}
+
+function applyScheduledLifecycleAction(state, action, reason) {
+    if (
+        state.shuttingDown ||
+        state.lifecycleActionBusy ||
+        Date.now() - Number(state.lastManualLifecycleAt || 0) < BOT_SCHEDULER_MANUAL_GUARD_MS
+    ) {
+        return false;
+    }
+
+    if (
+        action === 'start' &&
+        !state.manuallyStopped &&
+        (state.bot || ['connecting', 'authenticating', 'entering', 'online', 'afk'].includes(state.status))
+    ) {
+        addLog(state, `[SCHEDULER] ${reason}: Bot đã ở trạng thái chạy, bỏ qua START.`);
+        return true;
+    }
+
+    if (action === 'stop' && state.manuallyStopped && !state.bot) {
+        addLog(state, `[SCHEDULER] ${reason}: Bot đã tắt, bỏ qua STOP.`);
+        return true;
+    }
+
+    state.lifecycleActionBusy = true;
+    try {
+        if (action === 'stop') {
+            stopBot(state, 'scheduler');
+        } else if (action === 'start') {
+            if (!startBot(state, 'scheduler')) return false;
+        } else {
+            return false;
+        }
+
+        addLog(state, `[SCHEDULER] ${reason}: ${action === 'stop' ? 'Tắt bot' : 'Bật bot'}.`);
+        return true;
+    } finally {
+        state.lifecycleActionBusy = false;
+    }
+}
+
+function persistBotSchedulerRuntimeState(state) {
+    const saved = saveBotSettingsFile(state.settings, state.autoChatSchedules, state.botSchedules);
+    if (!saved) addLog(state, '[SCHEDULER] Không thể lưu trạng thái tiến độ lịch vào bot_settings.json.');
+    return saved;
+}
+
+function botSchedulerTick(state) {
+    if (state.shuttingDown) return;
+
+    const now = Date.now();
+    const timeParts = currentVietnamTimeParts(new Date(now));
+    const manualGuardActive =
+        now - Number(state.lastManualLifecycleAt || 0) < BOT_SCHEDULER_MANUAL_GUARD_MS;
+
+    for (const schedule of state.botSchedules) {
+        if (!schedule.enabled || !Array.isArray(schedule.items) || !schedule.items.length) continue;
+
+        if (schedule.mode === 'fixed') {
+            for (const item of schedule.items) {
+                if (item.time !== timeParts.timeKey) continue;
+                const currentKey = `${timeParts.dateKey} ${item.time}`;
+                if (item.lastFixedRunKey === currentKey) continue;
+
+                if (manualGuardActive) {
+                    // Manual START/STOP has priority. Consume this occurrence so
+                    // the scheduler cannot execute it a few seconds later after
+                    // the guard expires. The next occurrence will run normally.
+                    item.lastFixedRunKey = currentKey;
+                    addLog(
+                        state,
+                        `[SCHEDULER] Cố định ${item.time}: bỏ qua lần này vì vừa có thao tác START/STOP thủ công.`
+                    );
+                    persistBotSchedulerRuntimeState(state);
+                    break;
+                }
+
+                const applied = applyScheduledLifecycleAction(state, item.action, `Cố định ${item.time}`);
+                if (applied) {
+                    item.lastFixedRunKey = currentKey;
+                    persistBotSchedulerRuntimeState(state);
+                    break;
+                }
+            }
+            continue;
+        }
+
+        const eventIndex = getBotCycleEventIndex(schedule, now);
+        if (eventIndex <= Number(schedule.lastCycleEventIndex || 0)) continue;
+
+        const action = getBotCycleEventAction(schedule, eventIndex);
+        if (!action) continue;
+
+        if (manualGuardActive) {
+            schedule.lastCycleEventIndex = eventIndex;
+            addLog(
+                state,
+                `[SCHEDULER] Chu kỳ #${eventIndex}: bỏ qua lần này vì vừa có thao tác START/STOP thủ công.`
+            );
+            persistBotSchedulerRuntimeState(state);
+            continue;
+        }
+
+        const applied = applyScheduledLifecycleAction(state, action, `Chu kỳ #${eventIndex}`);
+        if (applied) {
+            schedule.lastCycleEventIndex = eventIndex;
+            persistBotSchedulerRuntimeState(state);
+        }
+    }
+}
+
+function startBotScheduler(state) {
+    if (state.botSchedulerTimer) {
+        clearInterval(state.botSchedulerTimer);
+    }
+
+    state.botSchedulerTimer = setInterval(
+        () => botSchedulerTick(state),
+        BOT_SCHEDULER_TICK_MS
+    );
+}
+
+function clearBotSchedulerTimer(state) {
+    if (state.botSchedulerTimer) {
+        clearInterval(state.botSchedulerTimer);
+        state.botSchedulerTimer = null;
     }
 }
 
@@ -2210,7 +2571,32 @@ function sameCoordinates(a, b) {
         a.z === b.z;
 }
 
+function getBotBlockCoordinates(bot) {
+    if (!bot || !bot.entity || !bot.entity.position) {
+        return null;
+    }
+
+    const x = Number(bot.entity.position.x);
+    const y = Number(bot.entity.position.y);
+    const z = Number(bot.entity.position.z);
+
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+        return null;
+    }
+
+    return {
+        x: Math.floor(x),
+        y: Math.floor(y),
+        z: Math.floor(z)
+    };
+}
+
 function getLocationKind(bot) {
+    // Location flow intentionally uses rounded player coordinates.
+    // The dashboard also displays rounded coordinates, and the previous
+    // working bot used the same rule. Using Math.floor here can classify
+    // an actual AUTH/LOBBY position as "other" when the player Y/X/Z has
+    // a fractional component near the block boundary.
     const coordinates = getRoundedBotCoordinates(bot);
 
     if (!coordinates) {
@@ -2426,6 +2812,34 @@ function startLocationMonitor(state, bot) {
             );
         }
 
+        // If the bot has already left LOGIN/LOBBY, treat that
+        // coordinate change as the AFK success condition immediately.
+        // This must run before the generic flow-busy guards because an
+        // entering flow can still have locationFlowBusy=true when the server
+        // teleports the bot out of the lobby.
+        if (
+            previousKind === 'lobby' &&
+            kind === 'other' &&
+            state.status === 'entering' &&
+            !state.manuallyStopped
+        ) {
+            state.ready = false;
+            state.locationFlowBusy = true;
+            state.pendingAfkConfirmation = true;
+
+            addLog(
+                state,
+                '[FLOW] Phát hiện bot đã rời LOBBY → chờ xác nhận AFK.'
+            );
+
+            if (!state.locationConfirmTimer) {
+                state.locationConfirmTimer = setTimeout(() => {
+                    state.locationConfirmTimer = null;
+                    confirmAfkAfterClick(state, bot);
+                }, AFK_CONFIRM_DELAY_MS);
+            }
+        }
+
         // Self-heal a flow that got stuck because a GUI/teleport changed
         // state between two timers. Without this guard, locationFlowBusy can
         // remain true forever and block all subsequent /login or /dn actions.
@@ -2452,6 +2866,8 @@ function startLocationMonitor(state, bot) {
             }
         }
 
+        // When the AFK confirmation timer is active, let it decide the
+        // final state from the current coordinates.
         if (state.pendingAfkConfirmation && kind !== 'unknown') {
             if (!state.locationConfirmTimer) {
                 state.locationConfirmTimer = setTimeout(() => {
@@ -2499,7 +2915,59 @@ function startLocationMonitor(state, bot) {
 
                 const verifyTimer = setTimeout(() => {
                     if (state.bot !== bot || state.manuallyStopped) return;
-                    if (getLocationKind(bot) === 'login') {
+
+                    const verifyKind = getLocationKind(bot);
+
+                    if (verifyKind === 'login') {
+                        // Some KingMC auth flows keep the player at AUTH_COORDS
+                        // after /login succeeds. In that case the old flow could
+                        // still progress because the server accepted /dn from
+                        // the auth location. Send /dn once as a fallback, then
+                        // let the normal location monitor continue the flow.
+                        const nowAfterLogin = Date.now();
+                        if (
+                            state.settings.autoReconnect &&
+                            state.password &&
+                            nowAfterLogin - Number(state.lastAuthDnActionAt || 0) >= 3000
+                        ) {
+                            state.lastAuthDnActionAt = nowAfterLogin;
+                            state.lastDnActionAt = nowAfterLogin;
+                            state.locationFlowBusy = true;
+                            state.ready = false;
+                            setBotStatus(state, 'entering');
+
+                            try {
+                                bot.chat(`/dn ${state.password}`);
+                                addLog(
+                                    state,
+                                    '[FLOW] Vẫn ở tọa độ AUTH sau /login → gửi /dn trực tiếp.'
+                                );
+                            } catch (err) {
+                                state.locationFlowBusy = false;
+                                addLog(
+                                    state,
+                                    `[FLOW] /dn tại AUTH lỗi: ${err.message}`
+                                );
+                                scheduleLocationRetry(state, bot, 'login');
+                                return;
+                            }
+
+                            const authDnVerifyTimer = setTimeout(() => {
+                                if (state.bot !== bot || state.manuallyStopped) return;
+
+                                if (getLocationKind(bot) === 'login') {
+                                    state.locationFlowBusy = false;
+                                    scheduleLocationRetry(state, bot, 'login');
+                                } else {
+                                    state.locationFlowBusy = false;
+                                    state.locationRetryAttempt = 0;
+                                }
+                            }, 1500);
+
+                            state.afkTimers.push(authDnVerifyTimer);
+                            return;
+                        }
+
                         state.locationFlowBusy = false;
                         scheduleLocationRetry(state, bot, 'login');
                     } else {
@@ -2838,21 +3306,33 @@ function disconnectBot(
     }
 }
 
-function stopBot(state) {
+function stopBot(state, source = 'manual') {
+    if (source === 'manual') {
+        markManualLifecycleAction(state);
+    }
+
     state.manuallyStopped = true;
 
     addLog(
         state,
-        'Dừng bot từ web.'
+        source === 'scheduler'
+            ? 'Scheduler yêu cầu dừng bot.'
+            : 'Dừng bot từ web.'
     );
 
     disconnectBot(
         state,
-        'Stopped from web panel'
+        source === 'scheduler'
+            ? 'Stopped by scheduler'
+            : 'Stopped from web panel'
     );
 }
 
-function startBot(state) {
+function startBot(state, source = 'manual') {
+    if (source === 'manual') {
+        markManualLifecycleAction(state);
+    }
+
     if (state.shuttingDown) {
         return false;
     }
@@ -2882,6 +3362,7 @@ function startBot(state) {
     state.ready = false;
     state.connectedAt = null;
     state.reconnectAttempts = 0;
+    state.lastAuthDnActionAt = 0;
     setBotStatus(state, 'connecting');
 
     if (state.bot) {
@@ -2970,6 +3451,7 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
         setBotStatus(state, 'kicked');
         state.ready = false;
         clearManagerTimers(state);
+        clearLocationTimers(state);
 
         addLog(
             state,
@@ -2990,6 +3472,7 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
             state.bot = null;
             clearManagerTimers(state);
             clearAfkTimers(state);
+            clearLocationTimers(state);
             invalidateInventoryAction(state);
             state.ready = false;
             state.connectedAt = null;
@@ -3491,7 +3974,7 @@ function startAfkRoutine(state, expectedBot = state.bot) {
     state.afkTimers.push(menuTimer);
 }
 
-const HTML = `<!doctype html>
+const HTML = String.raw`<!doctype html>
 <html lang="vi">
 <head>
 <meta charset="utf-8">
@@ -3986,15 +4469,29 @@ label{
 .setting-list{display:grid;gap:9px;margin-bottom:12px}
 .check-row{display:flex;align-items:center;gap:9px;padding:9px 10px;border-radius:10px;background:var(--card2);font-size:12px;cursor:pointer}
 .check-row input{width:auto;accent-color:var(--blue)}
-.schedule-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:8px;margin:10px 0}
-.schedule-card{padding:9px;border:1px solid rgba(255,255,255,.08);border-radius:11px;background:linear-gradient(180deg,#151f29,#111a22);display:grid;gap:7px;box-shadow:0 5px 18px rgba(0,0,0,.14)}
-.schedule-header{display:flex;align-items:center;justify-content:space-between;gap:8px}
-.schedule-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:7px}
-.schedule-field{display:grid;gap:4px}
-.schedule-field>span{color:var(--muted);font-size:9px}
-.schedule-field input,.schedule-field select,.schedule-card textarea{padding:8px 9px;border-radius:8px;font-size:11px}
-.schedule-card textarea{min-height:66px;resize:vertical}
-.schedule-actions{display:flex;justify-content:flex-end;gap:6px}
+.schedule-list{display:grid;gap:7px;margin:10px 0}
+.schedule-row{padding:8px 9px;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:linear-gradient(180deg,#151f29,#111a22);box-shadow:0 4px 14px rgba(0,0,0,.12);transition:border-color .15s,opacity .15s}
+.schedule-row:hover{border-color:rgba(77,163,255,.42)}
+.schedule-row.dragging{opacity:.5}
+.schedule-row-top{display:grid;grid-template-columns:24px minmax(0,1fr) auto auto;gap:7px;align-items:center}
+.schedule-handle{width:24px;height:28px;display:flex;align-items:center;justify-content:center;color:var(--muted);cursor:grab;border:1px solid rgba(255,255,255,.06);border-radius:7px;background:rgba(255,255,255,.025);user-select:none}
+.schedule-handle:active{cursor:grabbing}
+.schedule-row-title{font-size:11px;font-weight:800;min-width:0}
+.schedule-inline{display:flex;gap:6px;align-items:center;min-width:0}
+.schedule-inline input,.schedule-inline select{padding:7px 8px;border-radius:8px;font-size:11px;min-width:0}
+.schedule-inline .action-select{width:92px}.schedule-inline .time-input{width:88px}.schedule-inline .minutes-input{width:104px}
+.schedule-row-main{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;align-items:end;margin-top:7px}
+.schedule-row-main textarea{width:100%;min-height:52px;padding:7px 8px;border-radius:8px;font-size:11px;resize:vertical}
+.schedule-row-main .schedule-field{display:grid;gap:4px}
+.schedule-row-main .schedule-field>span,.schedule-field>span{color:var(--muted);font-size:9px}
+.schedule-meta{display:flex;gap:6px;flex-wrap:wrap;align-items:center;color:var(--muted);font-size:9px}
+.scheduler-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin:9px 0 7px}
+.scheduler-mode-box{display:flex;align-items:center;gap:7px;min-width:220px}
+.scheduler-mode-box>span{color:var(--muted);font-size:9px}
+.scheduler-mode-box select{padding:8px 9px;border-radius:8px;font-size:11px}
+.scheduler-note{margin:5px 0 8px;color:var(--muted);font-size:9px;line-height:1.45}
+.compact-save{margin-top:7px}
+.app-footer{margin-top:18px;text-align:center;color:var(--muted);font-size:10px;line-height:1.5;opacity:.9}
 .hidden-field{display:none!important}
 @media(max-width:520px){
    .inventory-grid{
@@ -4402,21 +4899,48 @@ label{
         <label class="check-row"><input id="settingAutoReconnect" type="checkbox"> <span>Auto Reconnect + tự thử lại LOGIN/DN/MENU</span></label>
       </div>
 
-      <button class="primary" type="button" onclick="saveSettings()">Lưu setting</button>
+      <button id="saveSettingsButton" class="primary" type="button" onclick="saveSettings()">Lưu setting</button>
       <div class="note">Tọa độ được quét mỗi 250ms. AFK chỉ được xác nhận khi tọa độ sau click không còn ở LOGIN hoặc LOBBY.</div>
 
     </div>
 
-    <div class="panel">
+    <div id="autoChatPanel" class="panel">
 
       <div class="chat-title-row">
         <h3>Auto Chat</h3>
-        <button class="small primary" type="button" onclick="addAutoChatSchedule()">＋ Thêm lịch</button>
+        <button class="small primary" type="button" onclick="addAutoChatSchedule()">＋ Thêm</button>
       </div>
 
       <div id="autoChatSchedules" class="schedule-list"></div>
-      <div class="note">Có thể đặt nhiều lịch cố định hoặc lặp theo khoảng thời gian. Trong mỗi lịch có thể có nhiều tin nhắn và delay giữa từng tin.</div>
-      <button class="primary" type="button" onclick="saveSettings()">Lưu Auto Chat</button>
+      <div class="note">Mỗi dòng là một lịch riêng. Kéo ⋮⋮ để đổi thứ tự; sửa trực tiếp rồi bấm Lưu Auto Chat.</div>
+      <button id="saveAutoChatButton" class="primary compact-save" type="button" onclick="saveAutoChat()">Lưu Auto Chat</button>
+
+    </div>
+
+    <div id="botSchedulePanel" class="panel">
+
+      <div class="chat-title-row">
+        <h3>Hẹn giờ Bot</h3>
+        <button class="small primary" type="button" onclick="addBotSchedule()">＋ Thêm</button>
+      </div>
+
+      <div class="scheduler-toolbar">
+        <label class="scheduler-mode-box">
+          <span>Chế độ</span>
+          <select id="botScheduleMode" onchange="botScheduleModeChanged(this)">
+            <option value="fixed">Giờ cố định mỗi ngày</option>
+            <option value="cycle">Chu kỳ theo thứ tự</option>
+          </select>
+        </label>
+        <label class="check-row" style="margin:0;padding:7px 9px;">
+          <input id="botScheduleEnabled" type="checkbox" checked>
+          <span>Kích hoạt lịch</span>
+        </label>
+      </div>
+      <div id="botScheduleModeNote" class="scheduler-note"></div>
+      <div id="botSchedules" class="schedule-list"></div>
+      <div class="note">Chỉ có một chế độ tại một thời điểm. Bấm ＋ để thêm dòng. Ở Chu kỳ, thời gian mỗi dòng tính từ dòng ngay phía trên; kéo đổi thứ tự thì cách tính cũng đổi theo.</div>
+      <button id="saveBotSchedulesButton" class="primary compact-save" type="button" onclick="saveBotSchedules()">Lưu hẹn giờ Bot</button>
 
     </div>
 
@@ -4474,6 +4998,10 @@ label{
 
 </div>
 
+<div class="app-footer">
+  <strong>Version 2.1</strong> • Update 30/09/2026 • Hẹn giờ Bot 1 mode với nhiều dòng, kéo-thả đổi thứ tự, chu kỳ tính theo dòng kề trên; làm gọn UI Auto Chat và tách riêng các nút lưu.
+</div>
+
 <div
   id="toast"
   class="toast"
@@ -4486,6 +5014,7 @@ label{
 let bot = null;
 let inventory = null;
 let autoChatSchedules = [];
+let botSchedules = [];
 let lastLogRevision = -1;
 let lastChatRevision = -1;
 let uptimeSyncAt = Date.now();
@@ -4497,6 +5026,10 @@ let refreshQueued = false;
 let actionRequestInFlight = false;
 let settingsDirty = false;
 let settingsSaveInFlight = false;
+let autoChatDirty = false;
+let autoChatSaveInFlight = false;
+let botScheduleDirty = false;
+let botScheduleSaveInFlight = false;
 let refreshGeneration = 0;
 
 function byId(id) {
@@ -4524,7 +5057,10 @@ function runQueuedRefresh() {
     refreshQueued &&
     !refreshInFlight &&
     !actionRequestInFlight &&
-    !inventoryActionInFlight
+    !inventoryActionInFlight &&
+    !settingsSaveInFlight &&
+    !autoChatSaveInFlight &&
+    !botScheduleSaveInFlight
   ) {
     refreshQueued = false;
     void refresh(true);
@@ -4704,26 +5240,6 @@ function renderPublicSettings(settingsData) {
   if (autoReconnect) autoReconnect.checked = settings.autoReconnect !== false;
 }
 
-function scheduleFieldVisibility(card) {
-  if (!card) return;
-
-  const modeElement = card.querySelector('[data-field="mode"]');
-  const mode = modeElement && modeElement.value === 'fixed'
-    ? 'fixed'
-    : 'interval';
-
-  const intervalField = card.querySelector('[data-role="interval-field"]');
-  const fixedField = card.querySelector('[data-role="fixed-field"]');
-
-  if (intervalField) {
-    intervalField.classList.toggle('hidden-field', mode !== 'interval');
-  }
-
-  if (fixedField) {
-    fixedField.classList.toggle('hidden-field', mode !== 'fixed');
-  }
-}
-
 function clampClientNumber(value, fallback, min, max) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
@@ -4733,260 +5249,357 @@ function clampClientNumber(value, fallback, min, max) {
 function normalizeScheduleForClient(schedule, index) {
   const raw = schedule && typeof schedule === 'object' ? schedule : {};
   const mode = raw.mode === 'fixed' ? 'fixed' : 'interval';
-
   return {
     id: String(raw.id || (Date.now() + '-' + index)),
     enabled: raw.enabled !== false,
-    mode: mode,
+    mode,
     intervalSeconds: clampClientNumber(raw.intervalSeconds, 3600, 10, 604800),
-    times: Array.isArray(raw.times)
-      ? raw.times.map(function(value) { return String(value || '').trim(); }).filter(Boolean)
-      : [],
-    messages: Array.isArray(raw.messages)
-      ? raw.messages.map(function(value) { return String(value || '').trim(); }).filter(Boolean)
-      : [],
-    messageDelaySeconds: clampClientNumber(raw.messageDelaySeconds, 0, 0, 3600)
+    times: Array.isArray(raw.times) ? raw.times.map(function(value) { return String(value || '').trim(); }).filter(Boolean) : [],
+    messages: Array.isArray(raw.messages) ? raw.messages.map(function(value) { return String(value || '').trim(); }).filter(Boolean) : [],
+    messageDelaySeconds: clampClientNumber(raw.messageDelaySeconds, 2, 0, 3600)
   };
 }
 
 function renderAutoChatSchedules(schedules) {
   const box = byId('autoChatSchedules');
   if (!box) return;
-
-  const list = Array.isArray(schedules)
-    ? schedules.map(normalizeScheduleForClient)
-    : [];
-
+  const list = Array.isArray(schedules) ? schedules.map(normalizeScheduleForClient) : [];
   autoChatSchedules = list;
 
   if (!list.length) {
-    box.innerHTML =
-      '<div class="note">Chưa có lịch auto chat. Bấm “＋ Thêm lịch” để tạo.</div>';
+    box.innerHTML = '<div class="note">Chưa có lịch Auto Chat. Bấm “＋ Thêm” để tạo.</div>';
     return;
   }
 
   box.innerHTML = list.map(function(schedule, index) {
-    const intervalHidden = schedule.mode === 'fixed'
-      ? ' hidden-field'
-      : '';
-
-    const fixedHidden = schedule.mode === 'fixed'
-      ? ''
-      : ' hidden-field';
-
     const checked = schedule.enabled ? ' checked' : '';
-
+    const fixed = schedule.mode === 'fixed';
     return '' +
-      '<div class="schedule-card" data-index="' + index +
-        '" data-id="' + escapeHtml(schedule.id) + '">' +
-        '<div class="schedule-header">' +
-          '<strong>Lịch #' + (index + 1) + '</strong>' +
-          '<div style="display:flex;align-items:center;gap:6px;">' +
-            '<label class="check-row" style="margin:0;padding:4px 7px;">' +
-              '<input data-field="enabled" type="checkbox"' + checked + '>' +
-              '<span>Bật</span>' +
-            '</label>' +
-            '<button class="small danger" type="button" onclick="removeAutoChatSchedule(' +
-              index + ')">Xóa</button>' +
-          '</div>' +
+      '<div class="schedule-row" draggable="true" data-index="' + index + '" data-id="' + escapeHtml(schedule.id) + '"' +
+        ' ondragstart="dragAutoChatSchedule(event,' + index + ')" ondragover="allowAutoChatDrop(event)" ondrop="dropAutoChatSchedule(event,' + index + ')" ondragend="endScheduleDrag(this)">' +
+        '<div class="schedule-row-top">' +
+          '<div class="schedule-handle" title="Kéo để sắp xếp">⋮⋮</div>' +
+          '<div class="schedule-row-title">Lịch #' + (index + 1) + '</div>' +
+          '<label class="check-row" style="margin:0;padding:5px 7px;"><input data-field="enabled" type="checkbox"' + checked + '> <span>Bật</span></label>' +
+          '<button class="small danger" type="button" onclick="removeAutoChatSchedule(' + index + ')">Xóa</button>' +
         '</div>' +
-
-        '<div class="schedule-grid">' +
-          '<label class="schedule-field">' +
-            '<span>Kiểu</span>' +
-            '<select data-field="mode" onchange="scheduleModeChanged(this)">' +
-              '<option value="interval"' +
-                (schedule.mode === 'interval' ? ' selected' : '') +
-                '>Lặp lại</option>' +
-              '<option value="fixed"' +
-                (schedule.mode === 'fixed' ? ' selected' : '') +
-                '>Cố định</option>' +
-            '</select>' +
-          '</label>' +
-
-          '<label class="schedule-field' + intervalHidden +
-            '" data-role="interval-field">' +
-            '<span>Khoảng lặp (giây)</span>' +
-            '<input data-field="intervalSeconds" type="number" min="10" max="604800" value="' +
-              schedule.intervalSeconds + '">' +
-          '</label>' +
-
-          '<label class="schedule-field' + fixedHidden +
-            '" data-role="fixed-field" style="grid-column:1/-1;">' +
-            '<span>Giờ cố định (HH:mm, cách nhau bằng dấu phẩy)</span>' +
-            '<input data-field="times" value="' +
-              escapeHtml(schedule.times.join(', ')) +
-              '" placeholder="08:00, 12:00, 18:00">' +
-          '</label>' +
+        '<div class="schedule-inline" style="margin-top:7px;flex-wrap:wrap;">' +
+          '<select data-field="mode" onchange="scheduleModeChanged(this)">' +
+            '<option value="interval"' + (!fixed ? ' selected' : '') + '>Lặp lại</option>' +
+            '<option value="fixed"' + (fixed ? ' selected' : '') + '>Giờ cố định</option>' +
+          '</select>' +
+          (fixed
+            ? '<input data-field="times" class="time-input" style="width:min(100%,280px);" value="' + escapeHtml(schedule.times.join(', ')) + '" placeholder="08:00, 12:00, 18:00">'
+            : '<input data-field="intervalSeconds" class="minutes-input" type="number" min="10" max="604800" value="' + schedule.intervalSeconds + '" title="Khoảng lặp (giây)">') +
+          '<input data-field="messageDelaySeconds" class="minutes-input" type="number" min="0" max="3600" value="' + schedule.messageDelaySeconds + '" title="Delay giữa các tin (giây)">' +
+          '<span class="schedule-meta">Delay tin (s)</span>' +
         '</div>' +
-
-        '<label class="schedule-field">' +
-          '<span>Delay giữa từng tin (giây)</span>' +
-          '<input data-field="messageDelaySeconds" type="number" min="0" max="3600" value="' +
-            schedule.messageDelaySeconds + '">' +
-        '</label>' +
-
-        '<label class="schedule-field">' +
-          '<span>Tin nhắn — mỗi dòng một tin</span>' +
-          '<textarea class="schedule-messages" data-field="messages" placeholder="Tin 1&#10;Tin 2&#10;Tin 3">' +
-            escapeHtml(schedule.messages.join('\\n')) +
-          '</textarea>' +
-        '</label>' +
+        '<div class="schedule-row-main">' +
+          '<label class="schedule-field"><span>Tin nhắn — mỗi dòng một tin</span><textarea data-field="messages" placeholder="Tin 1&#10;Tin 2&#10;Tin 3">' + escapeHtml(schedule.messages.join('\n')) + '</textarea></label>' +
+          '<div class="schedule-meta" style="padding-bottom:6px;"><span>' + (fixed ? 'Theo giờ' : 'Theo khoảng lặp') + '</span></div>' +
+        '</div>' +
       '</div>';
   }).join('');
-
-  box.querySelectorAll('.schedule-card').forEach(scheduleFieldVisibility);
 }
 
-function markSettingsDirty() {
-  settingsDirty = true;
+function markSettingsDirty() { settingsDirty = true; }
+function markAutoChatDirty() { autoChatDirty = true; }
+function markBotScheduleDirty() { botScheduleDirty = true; }
+function defaultFixedTime(index) {
+  const hour = (3 + Number(index || 0) * 3) % 24;
+  return String(hour).padStart(2, '0') + ':00';
 }
+
 
 function collectAutoChatSchedules() {
   const box = byId('autoChatSchedules');
   if (!box) return [];
-
-  const cards = Array.from(box.querySelectorAll('.schedule-card'));
-
-  return cards.map(function(card, index) {
-    const get = function(field) {
-      return card.querySelector('[data-field="' + field + '"]');
-    };
-
-    const mode = get('mode') && get('mode').value === 'fixed'
-      ? 'fixed'
-      : 'interval';
-
-    const id = card.dataset.id ||
-      (autoChatSchedules[index] && autoChatSchedules[index].id) ||
-      (Date.now() + '-' + index);
-
-    card.dataset.id = id;
-
-    const rawMessages = String(
-      get('messages') ? get('messages').value : ''
-    );
-
-    const messages = rawMessages
-      .split(/\\r?\\n/)
-      .map(function(value) { return value.trim(); })
-      .filter(Boolean);
-
-    const rawTimes = String(
-      get('times') ? get('times').value : ''
-    );
-
-    const times = rawTimes
-      .split(/[,\\n]+/)
-      .map(function(value) { return value.trim(); })
-      .filter(Boolean);
-
+  return Array.from(box.querySelectorAll('.schedule-row')).map(function(row, index) {
+    const get = field => row.querySelector('[data-field="' + field + '"]');
+    const mode = get('mode') && get('mode').value === 'fixed' ? 'fixed' : 'interval';
+    const id = row.dataset.id || (autoChatSchedules[index] && autoChatSchedules[index].id) || (Date.now() + '-' + index);
+    row.dataset.id = id;
+    const messages = String(get('messages') ? get('messages').value : '').split(/\r?\n/).map(v => v.trim()).filter(Boolean);
+    let intervalSeconds = 3600;
+    let times = [];
+    if (mode === 'fixed') {
+      times = String(get('times') ? get('times').value : '').split(/[,\n]+/).map(v => v.trim()).filter(Boolean);
+    } else {
+      intervalSeconds = clampClientNumber(get('intervalSeconds') ? get('intervalSeconds').value : 3600, 3600, 10, 604800);
+    }
     return {
-      id: id,
+      id,
       enabled: !!(get('enabled') && get('enabled').checked),
-      mode: mode,
-      intervalSeconds: clampClientNumber(
-        get('intervalSeconds') && get('intervalSeconds').value,
-        3600,
-        10,
-        604800
-      ),
-      times: times,
-      messages: messages,
-      messageDelaySeconds: clampClientNumber(
-        get('messageDelaySeconds') && get('messageDelaySeconds').value,
-        0,
-        0,
-        3600
-      )
+      mode,
+      intervalSeconds,
+      times,
+      messages,
+      messageDelaySeconds: clampClientNumber(get('messageDelaySeconds') ? get('messageDelaySeconds').value : 2, 2, 0, 3600)
     };
   });
 }
 
 function validateAutoChatSchedules(schedules) {
-  const validTime = /^([01]\\d|2[0-3]):[0-5]\\d$/;
-
+  const validTime = /^([01]\d|2[0-3]):[0-5]\d$/;
   for (let i = 0; i < schedules.length; i++) {
     const schedule = schedules[i];
-
-    if (!schedule.messages.length) {
-      return 'Lịch #' + (i + 1) + ' chưa có tin nhắn.';
-    }
-
+    if (!schedule.messages.length) return 'Lịch #' + (i + 1) + ' chưa có tin nhắn.';
     if (schedule.mode === 'fixed') {
-      if (!schedule.times.length) {
-        return 'Lịch #' + (i + 1) + ' chưa có giờ cố định.';
-      }
-
+      if (!schedule.times.length) return 'Lịch #' + (i + 1) + ' chưa có giờ cố định.';
       for (const value of schedule.times) {
-        if (!validTime.test(value)) {
-          return 'Lịch #' + (i + 1) + ' có giờ không hợp lệ: ' + value;
-        }
+        if (!validTime.test(value)) return 'Lịch #' + (i + 1) + ' có giờ không hợp lệ: ' + value;
       }
     }
   }
-
   return '';
 }
 
 function scheduleModeChanged(select) {
-  scheduleFieldVisibility(select ? select.closest('.schedule-card') : null);
-  markSettingsDirty();
+  const current = collectAutoChatSchedules();
+  const index = Number(select?.closest('.schedule-row')?.dataset.index ?? -1);
+  if (current[index]) {
+    if (current[index].mode === 'fixed' && !current[index].times.length) {
+      current[index].times = ['08:00'];
+    }
+    if (current[index].mode === 'interval' && !Number.isFinite(Number(current[index].intervalSeconds))) {
+      current[index].intervalSeconds = 3600;
+    }
+  }
+  autoChatDirty = true;
+  renderAutoChatSchedules(current);
 }
 
-function addAutoChatSchedule() {
+let draggedAutoChatIndex = null;
+function dragAutoChatSchedule(event, index) {
+  draggedAutoChatIndex = index;
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', String(index));
+  event.currentTarget.classList.add('dragging');
+}
+function allowAutoChatDrop(event) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; }
+function dropAutoChatSchedule(event, targetIndex) {
+  event.preventDefault();
+  const from = draggedAutoChatIndex;
+  draggedAutoChatIndex = null;
+  if (!Number.isInteger(from) || from === targetIndex) return;
   const current = collectAutoChatSchedules();
-
-  current.push({
-    id: Date.now() + '-' + Math.random().toString(36).slice(2, 8),
-    enabled: true,
-    mode: 'interval',
-    intervalSeconds: 3600,
-    times: [],
-    messages: [''],
-    messageDelaySeconds: 2
-  });
-
-  settingsDirty = true;
+  const [moved] = current.splice(from, 1);
+  current.splice(targetIndex, 0, moved);
+  autoChatDirty = true;
   renderAutoChatSchedules(current);
+}
+function endScheduleDrag(element) { if (element) element.classList.remove('dragging'); draggedAutoChatIndex = null; }
 
-  const cards = byId('autoChatSchedules')
-    ? byId('autoChatSchedules').querySelectorAll('.schedule-card')
-    : [];
-
-  const last = cards.length ? cards[cards.length - 1] : null;
-  const input = last
-    ? last.querySelector('[data-field="messages"]')
-    : null;
-
-  if (input) input.focus();
+function addAutoChatSchedule() {
+  if (autoChatSaveInFlight) return;
+  const current = collectAutoChatSchedules();
+  current.push({ id: Date.now() + '-' + Math.random().toString(36).slice(2, 8), enabled: true, mode: 'interval', intervalSeconds: 3600, times: [], messages: [''], messageDelaySeconds: 2 });
+  autoChatDirty = true;
+  renderAutoChatSchedules(current);
+  const rows = byId('autoChatSchedules')?.querySelectorAll('.schedule-row') || [];
+  rows[rows.length - 1]?.querySelector('[data-field="messages"]')?.focus();
 }
 
 function removeAutoChatSchedule(index) {
+  if (autoChatSaveInFlight) return;
   const current = collectAutoChatSchedules();
   current.splice(index, 1);
-  settingsDirty = true;
+  autoChatDirty = true;
   renderAutoChatSchedules(current);
 }
+
+function normalizeBotSchedulerForClient(schedules) {
+  const raw = Array.isArray(schedules) ? schedules[0] : null;
+  if (!raw) return { id: String(Date.now()), enabled: true, mode: 'fixed', items: [] };
+
+  const mode = raw.mode === 'cycle' ? 'cycle' : 'fixed';
+  let items = Array.isArray(raw.items) ? raw.items.slice() : [];
+
+  if (!items.length && Array.isArray(schedules)) {
+    items = schedules
+      .filter(s => (s.mode === 'cycle' ? 'cycle' : 'fixed') === mode)
+      .flatMap(s => mode === 'fixed'
+        ? [{ id: s.id, action: s.action, time: s.time }]
+        : [
+            { id: String(s.id || '') + '-stop', action: 'stop', afterMinutes: clampClientNumber(s.offAfterMinutes, 120, 1, 43200) },
+            { id: String(s.id || '') + '-start', action: 'start', afterMinutes: clampClientNumber(s.onAfterMinutes, 300, 1, 43200) }
+          ]);
+  }
+
+  return {
+    id: String(raw.id || Date.now()),
+    enabled: raw.enabled !== false,
+    mode,
+    items: items.map(function(item, index) {
+      return mode === 'fixed'
+        ? { id: String(item.id || Date.now() + '-' + index), action: item.action === 'start' ? 'start' : 'stop', time: String(item.time || '03:00') }
+        : { id: String(item.id || Date.now() + '-' + index), action: item.action === 'start' ? 'start' : 'stop', afterMinutes: clampClientNumber(item.afterMinutes, index === 0 ? 120 : 300, 1, 43200) };
+    })
+  };
+}
+
+function renderBotScheduleModeNote(mode) {
+  const note = byId('botScheduleModeNote');
+  if (!note) return;
+  note.textContent = mode === 'cycle'
+    ? 'Mỗi dòng kích hoạt sau khoảng thời gian tính từ dòng ngay phía trên. Dòng đầu tiên tính từ lúc bấm Lưu. Kéo ⋮⋮ để đổi thứ tự.'
+    : 'Mỗi dòng dùng giờ Việt Nam (GMT+7). Có thể thêm nhiều giờ: 03:00 Tắt → 06:00 Bật → 12:00 Tắt → 19:00 Bật.';
+}
+
+function renderBotSchedules(schedules) {
+  const box = byId('botSchedules');
+  if (!box) return;
+  const scheduler = normalizeBotSchedulerForClient(schedules);
+  botSchedules = scheduler.items.length || (Array.isArray(schedules) && schedules.length) ? [scheduler] : [];
+
+  if (byId('botScheduleMode')) byId('botScheduleMode').value = scheduler.mode;
+  if (byId('botScheduleEnabled')) byId('botScheduleEnabled').checked = scheduler.enabled !== false;
+  renderBotScheduleModeNote(scheduler.mode);
+
+  if (!scheduler.items.length) {
+    box.innerHTML = '<div class="note">Chưa có dòng hẹn giờ. Bấm “＋ Thêm” để tạo dòng đầu tiên.</div>';
+    return;
+  }
+
+  box.innerHTML = scheduler.items.map(function(item, index) {
+    const actionValue = item.action === 'start' ? 'start' : 'stop';
+    const actionText = actionValue === 'start' ? 'Bật Bot' : 'Tắt Bot';
+    const timing = scheduler.mode === 'fixed'
+      ? '<input data-field="time" class="time-input" type="time" value="' + escapeHtml(item.time || '03:00') + '">'
+      : '<input data-field="afterMinutes" class="minutes-input" type="number" min="1" max="43200" value="' + clampClientNumber(item.afterMinutes, index === 0 ? 120 : 300, 1, 43200) + '" title="Phút">';
+    const relation = scheduler.mode === 'fixed'
+      ? 'Mỗi ngày'
+      : (index === 0 ? 'Tính từ lúc lưu' : 'Tính từ dòng ' + index);
+
+    return '' +
+      '<div class="schedule-row" draggable="true" data-index="' + index + '" data-id="' + escapeHtml(item.id) + '" ondragstart="dragBotSchedule(event,' + index + ')" ondragover="allowBotScheduleDrop(event)" ondrop="dropBotSchedule(event,' + index + ')" ondragend="endBotScheduleDrag(this)">' +
+        '<div class="schedule-row-top">' +
+          '<div class="schedule-handle" title="Kéo để đổi thứ tự">⋮⋮</div>' +
+          '<div class="schedule-row-title">' + (index + 1) + '. ' + actionText + '</div>' +
+          '<div class="schedule-inline">' +
+            '<select data-field="action" class="action-select">' +
+              '<option value="stop"' + (actionValue === 'stop' ? ' selected' : '') + '>Tắt</option>' +
+              '<option value="start"' + (actionValue === 'start' ? ' selected' : '') + '>Bật</option>' +
+            '</select>' + timing +
+          '</div>' +
+          '<button class="small danger" type="button" onclick="removeBotSchedule(' + index + ')">Xóa</button>' +
+        '</div>' +
+        '<div class="schedule-meta" style="margin-top:5px;"><span>' + relation + '</span>' +
+          (scheduler.mode === 'cycle' ? '<span>•</span><span>Thời gian tính từ dòng kề trên</span>' : '') +
+        '</div>' +
+      '</div>';
+  }).join('');
+}
+
+function collectBotSchedules() {
+  const box = byId('botSchedules');
+  const modeSelect = byId('botScheduleMode');
+  if (!box || !modeSelect) return [];
+  const mode = modeSelect.value === 'cycle' ? 'cycle' : 'fixed';
+  const scheduler = normalizeBotSchedulerForClient(botSchedules);
+  const items = Array.from(box.querySelectorAll('.schedule-row')).map(function(row, index) {
+    const get = field => row.querySelector('[data-field="' + field + '"]');
+    const id = row.dataset.id || scheduler.items[index]?.id || (Date.now() + '-' + index);
+    if (mode === 'fixed') {
+      return { id, action: get('action')?.value === 'start' ? 'start' : 'stop', time: String(get('time')?.value || '').trim() };
+    }
+    return { id, action: get('action')?.value === 'start' ? 'start' : 'stop', afterMinutes: clampClientNumber(get('afterMinutes')?.value, index === 0 ? 120 : 300, 1, 43200) };
+  });
+  if (!items.length) return [];
+  return [{ id: scheduler.id || String(Date.now()), enabled: byId('botScheduleEnabled') ? !!byId('botScheduleEnabled').checked : true, mode, items }];
+}
+
+function validateBotSchedules(schedules) {
+  if (!schedules.length) return '';
+  if (schedules.length !== 1) return 'Chỉ được lưu một chế độ hẹn giờ Bot cùng lúc.';
+  const schedule = schedules[0];
+  if (!Array.isArray(schedule.items) || !schedule.items.length) return 'Hẹn giờ Bot chưa có dòng nào.';
+  if (schedule.mode === 'fixed') {
+    const seen = new Set();
+    for (let i = 0; i < schedule.items.length; i++) {
+      const time = schedule.items[i].time;
+      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) return 'Dòng #' + (i + 1) + ' có giờ không hợp lệ.';
+      if (seen.has(time)) return 'Dòng #' + (i + 1) + ' bị trùng giờ ' + time + '.';
+      seen.add(time);
+    }
+  } else {
+    for (let i = 0; i < schedule.items.length; i++) {
+      const value = Number(schedule.items[i].afterMinutes);
+      if (!Number.isFinite(value) || value < 1 || value > 43200) return 'Dòng #' + (i + 1) + ' có thời gian chờ không hợp lệ.';
+    }
+  }
+  return '';
+}
+
+function botScheduleModeChanged(select) {
+  const current = collectBotSchedules();
+  const scheduler = normalizeBotSchedulerForClient(current.length ? current : botSchedules);
+  const newMode = select && select.value === 'cycle' ? 'cycle' : 'fixed';
+  const items = scheduler.items.map(function(item, index) {
+    return newMode === 'fixed'
+      ? { id: item.id, action: item.action, time: defaultFixedTime(index) }
+      : { id: item.id, action: item.action, afterMinutes: index === 0 ? 120 : 300 };
+  });
+  botSchedules = [{ id: scheduler.id || String(Date.now()), enabled: byId('botScheduleEnabled') ? !!byId('botScheduleEnabled').checked : true, mode: newMode, items }];
+  botScheduleDirty = true;
+  renderBotSchedules(botSchedules);
+}
+
+function addBotSchedule() {
+  const current = collectBotSchedules();
+  const scheduler = normalizeBotSchedulerForClient(current.length ? current : botSchedules);
+  const index = scheduler.items.length;
+  const item = scheduler.mode === 'fixed'
+    ? { id: Date.now() + '-' + Math.random().toString(36).slice(2, 8), action: 'stop', time: defaultFixedTime(index) }
+    : { id: Date.now() + '-' + Math.random().toString(36).slice(2, 8), action: index % 2 === 0 ? 'stop' : 'start', afterMinutes: index === 0 ? 120 : 300 };
+  scheduler.items.push(item);
+  botSchedules = [scheduler];
+  botScheduleDirty = true;
+  renderBotSchedules(botSchedules);
+}
+
+function removeBotSchedule(index) {
+  if (botScheduleSaveInFlight) return;
+  const scheduler = normalizeBotSchedulerForClient(collectBotSchedules());
+  scheduler.items.splice(index, 1);
+  botSchedules = scheduler.items.length ? [scheduler] : [];
+  botScheduleDirty = true;
+  renderBotSchedules(botSchedules);
+}
+
+let draggedBotScheduleIndex = null;
+function dragBotSchedule(event, index) {
+  draggedBotScheduleIndex = index;
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', String(index));
+  event.currentTarget.classList.add('dragging');
+}
+function allowBotScheduleDrop(event) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; }
+function dropBotSchedule(event, targetIndex) {
+  event.preventDefault();
+  const from = draggedBotScheduleIndex;
+  draggedBotScheduleIndex = null;
+  if (!Number.isInteger(from) || from === targetIndex) return;
+  const scheduler = normalizeBotSchedulerForClient(collectBotSchedules());
+  const [moved] = scheduler.items.splice(from, 1);
+  scheduler.items.splice(targetIndex, 0, moved);
+  botSchedules = [scheduler];
+  botScheduleDirty = true;
+  renderBotSchedules(botSchedules);
+}
+function endBotScheduleDrag(element) { if (element) element.classList.remove('dragging'); draggedBotScheduleIndex = null; }
 
 async function saveSettings() {
   if (settingsSaveInFlight) return;
 
-  const schedules = collectAutoChatSchedules();
-  const validationError = validateAutoChatSchedules(schedules);
-
-  if (validationError) {
-    showToast(validationError);
-    return;
-  }
+  invalidatePendingReads();
 
   const payload = {
     settings: {
       autoTotem: !!(byId('settingAutoTotem') && byId('settingAutoTotem').checked),
       antiHungry: !!(byId('settingAntiHungry') && byId('settingAntiHungry').checked),
       autoReconnect: !!(byId('settingAutoReconnect') && byId('settingAutoReconnect').checked)
-    },
-    autoChatSchedules: schedules
+    }
   };
 
   settingsSaveInFlight = true;
@@ -5005,27 +5618,123 @@ async function saveSettings() {
     }
 
     settingsDirty = false;
-
-    const serverSchedules = Array.isArray(result.data.autoChatSchedules)
-      ? result.data.autoChatSchedules
-      : payload.autoChatSchedules;
-
     renderPublicSettings(result.data);
-    renderAutoChatSchedules(serverSchedules);
     showToast(result.data.message || 'Đã lưu setting.');
   } catch (err) {
     showToast(err.message || 'Không thể kết nối server web.');
   } finally {
     settingsSaveInFlight = false;
     setSettingsButtonsDisabled(false);
+    runQueuedRefresh();
+  }
+}
+
+async function saveAutoChat() {
+  if (autoChatSaveInFlight) return;
+
+  invalidatePendingReads();
+
+  const schedules = collectAutoChatSchedules();
+  const validationError = validateAutoChatSchedules(schedules);
+
+  if (validationError) {
+    showToast(validationError);
+    return;
+  }
+
+  autoChatSaveInFlight = true;
+  setAutoChatButtonsDisabled(true);
+
+  try {
+    const result = await apiJson('/api/auto-chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ autoChatSchedules: schedules })
+    });
+
+    if (!result.ok) {
+      showToast(result.data.error || 'Lưu Auto Chat thất bại.');
+      return;
+    }
+
+    autoChatDirty = false;
+    const serverSchedules = Array.isArray(result.data.autoChatSchedules)
+      ? result.data.autoChatSchedules
+      : schedules;
+
+    renderAutoChatSchedules(serverSchedules);
+    showToast(result.data.message || 'Đã lưu Auto Chat.');
+  } catch (err) {
+    showToast(err.message || 'Không thể kết nối server web.');
+  } finally {
+    autoChatSaveInFlight = false;
+    setAutoChatButtonsDisabled(false);
+    runQueuedRefresh();
+  }
+}
+
+async function saveBotSchedules() {
+  if (botScheduleSaveInFlight) return;
+
+  invalidatePendingReads();
+
+  const schedules = collectBotSchedules();
+  const validationError = validateBotSchedules(schedules);
+
+  if (validationError) {
+    showToast(validationError);
+    return;
+  }
+
+  botScheduleSaveInFlight = true;
+  setBotScheduleButtonsDisabled(true);
+
+  try {
+    const result = await apiJson('/api/bot-schedules', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ botSchedules: schedules })
+    });
+
+    if (!result.ok) {
+      showToast(result.data.error || 'Lưu hẹn giờ Bot thất bại.');
+      return;
+    }
+
+    botScheduleDirty = false;
+    const serverSchedules = Array.isArray(result.data.botSchedules)
+      ? result.data.botSchedules
+      : schedules;
+
+    renderBotSchedules(serverSchedules);
+    showToast(result.data.message || 'Đã lưu hẹn giờ Bot.');
+  } catch (err) {
+    showToast(err.message || 'Không thể kết nối server web.');
+  } finally {
+    botScheduleSaveInFlight = false;
+    setBotScheduleButtonsDisabled(false);
+    runQueuedRefresh();
   }
 }
 
 function setSettingsButtonsDisabled(disabled) {
-  document.querySelectorAll('#settingsPanel button, #settingsPanel input, #settingsPanel select, #settingsPanel textarea, #autoChatSchedules button, #autoChatSchedules input, #autoChatSchedules select, #autoChatSchedules textarea, [data-settings-action]').forEach(function(element) {
+  document.querySelectorAll('#settingsPanel button, #settingsPanel input, #settingsPanel select, #settingsPanel textarea').forEach(function(element) {
     element.disabled = !!disabled;
   });
 }
+
+function setAutoChatButtonsDisabled(disabled) {
+  document.querySelectorAll('#autoChatPanel button, #autoChatPanel input, #autoChatPanel select, #autoChatPanel textarea').forEach(function(element) {
+    element.disabled = !!disabled;
+  });
+}
+
+function setBotScheduleButtonsDisabled(disabled) {
+  document.querySelectorAll('#botSchedulePanel button, #botSchedulePanel input, #botSchedulePanel select, #botSchedulePanel textarea').forEach(function(element) {
+    element.disabled = !!disabled;
+  });
+}
+
 
 async function startBot() {
   return runBotAction('start');
@@ -5042,6 +5751,7 @@ async function restartBot() {
 async function runBotAction(action) {
   if (actionRequestInFlight) return;
 
+  invalidatePendingReads();
   actionRequestInFlight = true;
 
   const buttons = [
@@ -5152,6 +5862,8 @@ async function clearChatHistory() {
 }
 
 async function saveAccount() {
+  invalidatePendingReads();
+
   const usernameInput = byId('usernameInput');
   const passwordInput = byId('passwordInput');
 
@@ -5714,7 +6426,7 @@ function nearBottom(box) {
   return box.scrollHeight - box.scrollTop - box.clientHeight < 24;
 }
 
-async function loadLogs(force) {
+async function loadLogs(force, expectedGeneration = refreshGeneration) {
   const box = byId('logs');
   if (!box) return;
 
@@ -5725,6 +6437,7 @@ async function loadLogs(force) {
   try {
     const result = await apiJson('/api/bot/logs');
 
+    if (expectedGeneration !== null && expectedGeneration !== refreshGeneration) return;
     if (!result.ok) return;
 
     const logs = Array.isArray(result.data.logs)
@@ -5751,7 +6464,7 @@ async function loadLogs(force) {
   }
 }
 
-async function loadChatLogs(force) {
+async function loadChatLogs(force, expectedGeneration = refreshGeneration) {
   const box = byId('chatLogs');
   if (!box) return;
 
@@ -5763,6 +6476,7 @@ async function loadChatLogs(force) {
   try {
     const result = await apiJson('/api/bot/chat-logs');
 
+    if (expectedGeneration !== null && expectedGeneration !== refreshGeneration) return;
     if (!result.ok) return;
 
     const logs = Array.isArray(result.data.logs)
@@ -5828,17 +6542,19 @@ async function refresh(force) {
 
     if (!settingsDirty && result.data.settings) {
       renderPublicSettings(result.data.settings);
+    }
 
-      if (Array.isArray(result.data.settings.autoChatSchedules)) {
-        renderAutoChatSchedules(
-          result.data.settings.autoChatSchedules
-        );
-      }
+    if (!autoChatDirty && Array.isArray(result.data.autoChatSchedules)) {
+      renderAutoChatSchedules(result.data.autoChatSchedules);
+    }
+
+    if (!botScheduleDirty && Array.isArray(result.data.botSchedules)) {
+      renderBotSchedules(result.data.botSchedules);
     }
 
     await Promise.all([
-      loadLogs(false),
-      loadChatLogs(false)
+      loadLogs(false, generation),
+      loadChatLogs(false, generation)
     ]);
   } catch (err) {
     console.error('[BOT UI] refresh', err);
@@ -5849,7 +6565,10 @@ async function refresh(force) {
     if (
       refreshQueued &&
       !actionRequestInFlight &&
-      !inventoryActionInFlight
+      !inventoryActionInFlight &&
+      !settingsSaveInFlight &&
+      !autoChatSaveInFlight &&
+      !botScheduleSaveInFlight
     ) {
       refreshQueued = false;
       void refresh(true);
@@ -5864,10 +6583,19 @@ function markSettingsInputDirty(event) {
   if (
     target.id === 'settingAutoTotem' ||
     target.id === 'settingAntiHungry' ||
-    target.id === 'settingAutoReconnect' ||
-    (target.closest && target.closest('#autoChatSchedules'))
+    target.id === 'settingAutoReconnect'
   ) {
     markSettingsDirty();
+    return;
+  }
+
+  if (target.closest && target.closest('#autoChatSchedules')) {
+    markAutoChatDirty();
+    return;
+  }
+
+  if (target.id === 'botScheduleEnabled' || (target.closest && target.closest('#botSchedules'))) {
+    markBotScheduleDirty();
   }
 }
 
@@ -5902,6 +6630,15 @@ document.addEventListener('input', markSettingsInputDirty);
 document.addEventListener('change', markSettingsInputDirty);
 
 window.addAutoChatSchedule = addAutoChatSchedule;
+window.dragAutoChatSchedule = dragAutoChatSchedule;
+window.allowAutoChatDrop = allowAutoChatDrop;
+window.dropAutoChatSchedule = dropAutoChatSchedule;
+window.endScheduleDrag = endScheduleDrag;
+window.addBotSchedule = addBotSchedule;
+window.dragBotSchedule = dragBotSchedule;
+window.allowBotScheduleDrop = allowBotScheduleDrop;
+window.dropBotSchedule = dropBotSchedule;
+window.endBotScheduleDrag = endBotScheduleDrag;
 window.allowDrop = allowDrop;
 window.clearChatHistory = clearChatHistory;
 window.clearDragOver = clearDragOver;
@@ -5910,10 +6647,14 @@ window.dropEquip = dropEquip;
 window.dropItemToWorld = dropItemToWorld;
 window.refresh = refresh;
 window.removeAutoChatSchedule = removeAutoChatSchedule;
+window.removeBotSchedule = removeBotSchedule;
 window.restartBot = restartBot;
 window.saveAccount = saveAccount;
+window.saveAutoChat = saveAutoChat;
+window.saveBotSchedules = saveBotSchedules;
 window.saveSettings = saveSettings;
 window.scheduleModeChanged = scheduleModeChanged;
+window.botScheduleModeChanged = botScheduleModeChanged;
 window.sendMessage = sendMessage;
 window.showToast = showToast;
 window.startBot = startBot;
@@ -5949,7 +6690,12 @@ window.restartBot = restartBot;
 window.sendMessage = sendMessage;
 window.addAutoChatSchedule = addAutoChatSchedule;
 window.removeAutoChatSchedule = removeAutoChatSchedule;
+window.addBotSchedule = addBotSchedule;
+window.removeBotSchedule = removeBotSchedule;
+window.botScheduleModeChanged = botScheduleModeChanged;
 window.scheduleModeChanged = scheduleModeChanged;
+window.saveAutoChat = saveAutoChat;
+window.saveBotSchedules = saveBotSchedules;
 window.saveSettings = saveSettings;
 window.clearEventHistory = clearEventHistory;
 window.clearChatHistory = clearChatHistory;
@@ -5966,7 +6712,11 @@ window.unequipEquipment = unequipEquipment;
 })();
 
 setInterval(function() {
-  if (!settingsSaveInFlight) {
+  if (
+    !settingsSaveInFlight &&
+    !autoChatSaveInFlight &&
+    !botScheduleSaveInFlight
+  ) {
     void refresh(false);
   }
 }, 1000);
@@ -5989,7 +6739,9 @@ app.get(
             ok: true,
             bot: publicBotState(botState),
             inventory: publicInventoryState(botState),
-            settings: publicSettingsState(botState)
+            settings: publicSettingsState(botState),
+            autoChatSchedules: publicAutoChatState(botState),
+            botSchedules: publicBotSchedulesState(botState)
         });
     }
 );
@@ -6029,27 +6781,49 @@ app.get(
 
 function publicSettingsState(state) {
     return {
-        settings: {
-            autoTotem: state.settings.autoTotem !== false,
-            antiHungry: state.settings.antiHungry !== false,
-            autoReconnect: state.settings.autoReconnect !== false
-        },
-        autoChatSchedules: sanitizeAutoChatSchedules(state.autoChatSchedules).map(schedule => ({
-            id: schedule.id,
-            enabled: schedule.enabled !== false,
-            mode: schedule.mode,
-            intervalSeconds: schedule.intervalSeconds,
-            times: schedule.times,
-            messages: schedule.messages,
-            messageDelaySeconds: schedule.messageDelaySeconds
-        }))
+        autoTotem: state.settings.autoTotem !== false,
+        antiHungry: state.settings.antiHungry !== false,
+        autoReconnect: state.settings.autoReconnect !== false
     };
+}
+
+function publicAutoChatState(state) {
+    return sanitizeAutoChatSchedules(state.autoChatSchedules).map(schedule => ({
+        id: schedule.id,
+        enabled: schedule.enabled !== false,
+        mode: schedule.mode,
+        intervalSeconds: schedule.intervalSeconds,
+        times: schedule.times,
+        messages: schedule.messages,
+        messageDelaySeconds: schedule.messageDelaySeconds
+    }));
+}
+
+function publicBotSchedulesState(state) {
+    return sanitizeBotSchedules(state.botSchedules).map(schedule => ({
+        id: schedule.id,
+        enabled: schedule.enabled !== false,
+        mode: schedule.mode,
+        items: Array.isArray(schedule.items)
+            ? schedule.items.map(item => schedule.mode === 'fixed'
+                ? {
+                    id: item.id,
+                    action: item.action === 'start' ? 'start' : 'stop',
+                    time: item.time
+                }
+                : {
+                    id: item.id,
+                    action: item.action === 'start' ? 'start' : 'stop',
+                    afterMinutes: item.afterMinutes
+                })
+            : []
+    }));
 }
 
 app.get('/api/settings', (req, res) => {
     res.json({
         ok: true,
-        ...publicSettingsState(botState)
+        settings: publicSettingsState(botState)
     });
 });
 
@@ -6068,29 +6842,19 @@ app.post('/api/settings', (req, res) => {
         autoReconnect: incoming.autoReconnect !== false
     };
 
-    const schedules = sanitizeAutoChatSchedules(body.autoChatSchedules);
-
-    const runtimeSchedules = sanitizeAutoChatSchedules(schedules);
-    for (const schedule of runtimeSchedules) {
-        schedule.lastIntervalRunAt = Date.now();
-        schedule.lastFixedRunKey = '';
-        schedule.running = false;
-    }
-
     const persisted = saveBotSettingsFile(
         nextSettings,
-        runtimeSchedules
+        botState.autoChatSchedules,
+        botState.botSchedules
     );
 
     if (!persisted) {
         return res.status(500).json({
-            error: 'Không thể ghi bot_settings.json; runtime chưa được thay đổi.'
+            error: 'Không thể ghi bot_settings.json; setting chưa được thay đổi.'
         });
     }
 
     botState.settings = nextSettings;
-    botState.autoChatGeneration++;
-    botState.autoChatSchedules = runtimeSchedules;
 
     addLog(
         botState,
@@ -6098,20 +6862,203 @@ app.post('/api/settings', (req, res) => {
     );
 
     if (!nextSettings.autoReconnect) {
-        if (botState.reconnectTimer) {
-            clearTimeout(botState.reconnectTimer);
-            botState.reconnectTimer = null;
-        }
-        if (botState.locationRetryTimer) {
-            clearTimeout(botState.locationRetryTimer);
-            botState.locationRetryTimer = null;
+        const wasReadyAfk =
+            botState.status === 'afk' &&
+            botState.ready === true;
+
+        clearReconnectTimer(botState);
+        clearAfkTimers(botState);
+        resetLocationFlowState(botState);
+
+        if (wasReadyAfk) {
+            botState.ready = true;
         }
     }
 
     res.json({
         ok: true,
-        message: 'Đã lưu setting.',
-        ...publicSettingsState(botState)
+        message: 'Đã lưu setting riêng.',
+        settings: publicSettingsState(botState)
+    });
+});
+
+app.get('/api/auto-chat', (req, res) => {
+    res.json({
+        ok: true,
+        autoChatSchedules: publicAutoChatState(botState)
+    });
+});
+
+app.post('/api/auto-chat', (req, res) => {
+    const body = req.body && typeof req.body === 'object'
+        ? req.body
+        : {};
+
+    const schedules = sanitizeAutoChatSchedules(body.autoChatSchedules);
+    const runtimeSchedules = sanitizeAutoChatSchedules(schedules);
+
+    for (const schedule of runtimeSchedules) {
+        schedule.lastIntervalRunAt = Date.now();
+        schedule.lastFixedRunKey = '';
+        schedule.running = false;
+    }
+
+    const persisted = saveBotSettingsFile(
+        botState.settings,
+        runtimeSchedules,
+        botState.botSchedules
+    );
+
+    if (!persisted) {
+        return res.status(500).json({
+            error: 'Không thể ghi bot_settings.json; Auto Chat chưa được thay đổi.'
+        });
+    }
+
+    botState.autoChatGeneration++;
+    botState.autoChatSchedules = runtimeSchedules;
+
+    addLog(
+        botState,
+        `[AUTOCHAT] Đã lưu riêng ${runtimeSchedules.length} lịch.`
+    );
+
+    res.json({
+        ok: true,
+        message: 'Đã lưu Auto Chat riêng.',
+        autoChatSchedules: publicAutoChatState(botState)
+    });
+});
+
+app.get('/api/bot-schedules', (req, res) => {
+    res.json({
+        ok: true,
+        botSchedules: publicBotSchedulesState(botState)
+    });
+});
+
+app.post('/api/bot-schedules', (req, res) => {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const rawSchedules = Array.isArray(body.botSchedules)
+        ? body.botSchedules
+        : body.botSchedules && typeof body.botSchedules === 'object'
+            ? [body.botSchedules]
+            : [];
+
+    if (rawSchedules.length > 1) {
+        return res.status(400).json({
+            error: 'Hẹn giờ Bot chỉ cho phép một chế độ tại một thời điểm. Hãy dùng nút + để thêm nhiều dòng trong cùng chế độ.'
+        });
+    }
+
+    if (!rawSchedules.length) {
+        const persisted = saveBotSettingsFile(
+            botState.settings,
+            botState.autoChatSchedules,
+            []
+        );
+        if (!persisted) {
+            return res.status(500).json({
+                error: 'Không thể ghi bot_settings.json; hẹn giờ Bot chưa được thay đổi.'
+            });
+        }
+        botState.botSchedules = [];
+        addLog(botState, '[SCHEDULER] Đã xóa toàn bộ hẹn giờ Bot.');
+        return res.json({
+            ok: true,
+            message: 'Đã tắt hẹn giờ Bot.',
+            botSchedules: []
+        });
+    }
+
+    const raw = rawSchedules[0] || {};
+    const mode = raw.mode === 'cycle' ? 'cycle' : 'fixed';
+    const rawItems = Array.isArray(raw.items) ? raw.items : [];
+
+    if (!rawItems.length) {
+        return res.status(400).json({
+            error: 'Hẹn giờ Bot chưa có dòng lịch. Bấm + để thêm một hành động.'
+        });
+    }
+
+    if (rawItems.length > BOT_SCHEDULER_MAX_ITEMS) {
+        return res.status(400).json({
+            error: `Hẹn giờ Bot tối đa ${BOT_SCHEDULER_MAX_ITEMS} dòng.`
+        });
+    }
+
+    if (mode === 'fixed') {
+        const fixedTimes = new Set();
+        for (let index = 0; index < rawItems.length; index++) {
+            const item = rawItems[index] || {};
+            const time = String(item.time || '').trim();
+            if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) {
+                return res.status(400).json({
+                    error: `Dòng #${index + 1} có giờ không hợp lệ: ${time || '(trống)'}. Dùng HH:mm.`
+                });
+            }
+            if (fixedTimes.has(time)) {
+                return res.status(400).json({
+                    error: `Dòng #${index + 1} bị trùng giờ ${time}. Mỗi giờ chỉ đặt một hành động.`
+                });
+            }
+            fixedTimes.add(time);
+        }
+    } else {
+        for (let index = 0; index < rawItems.length; index++) {
+            const item = rawItems[index] || {};
+            const afterMinutes = Number(item.afterMinutes);
+            if (
+                !Number.isFinite(afterMinutes) ||
+                afterMinutes < 1 ||
+                afterMinutes > BOT_SCHEDULER_MAX_PHASE_MINUTES
+            ) {
+                return res.status(400).json({
+                    error: `Dòng #${index + 1} có thời gian chờ không hợp lệ (1-${BOT_SCHEDULER_MAX_PHASE_MINUTES} phút).`
+                });
+            }
+        }
+    }
+
+    const runtimeSchedules = sanitizeBotSchedules(
+        [{
+            id: raw.id,
+            enabled: raw.enabled !== false,
+            mode,
+            items: rawItems
+        }],
+        { resetCycleState: true }
+    );
+
+    if (!runtimeSchedules.length) {
+        return res.status(400).json({
+            error: 'Không thể chuẩn hóa lịch hẹn giờ Bot.'
+        });
+    }
+
+    const persisted = saveBotSettingsFile(
+        botState.settings,
+        botState.autoChatSchedules,
+        runtimeSchedules
+    );
+
+    if (!persisted) {
+        return res.status(500).json({
+            error: 'Không thể ghi bot_settings.json; hẹn giờ Bot chưa được thay đổi.'
+        });
+    }
+
+    botState.botSchedules = runtimeSchedules;
+
+    addLog(
+        botState,
+        `[SCHEDULER] Đã lưu mode ${mode === 'fixed' ? 'giờ cố định' : 'chu kỳ'} với ${runtimeSchedules[0].items.length} dòng. ${mode === 'cycle' ? 'Chu kỳ tính lại từ thời điểm lưu.' : ''}`.trim()
+    );
+
+    res.json({
+        ok: true,
+        message: 'Đã lưu hẹn giờ Bot riêng.',
+        botSchedules: publicBotSchedulesState(botState)
     });
 });
 
@@ -6171,6 +7118,8 @@ app.get(
                 selectHotbar: '/api/inventory/select',
                 dropInventory: '/api/inventory/drop',
                 settings: '/api/settings',
+                autoChat: '/api/auto-chat',
+                botSchedules: '/api/bot-schedules',
                 clearLogs: '/api/bot/logs/clear',
                 clearChatLogs: '/api/bot/chat-logs/clear',
             }
@@ -6273,7 +7222,8 @@ app.post(
         }
 
         startBot(
-            botState
+            botState,
+            'manual'
         );
 
         res.json({
@@ -6292,8 +7242,10 @@ app.post(
     '/api/bot/stop',
     (req, res) => {
 
+        markManualLifecycleAction(botState);
         stopBot(
-            botState
+            botState,
+            'manual'
         );
 
         res.json({
@@ -6330,6 +7282,7 @@ app.post(
         botState.afkStartedAt = null;
         botState.reconnectCount = 0;
 
+        markManualLifecycleAction(botState);
         botState.manuallyStopped = true;
 
         disconnectBot(
@@ -6689,7 +7642,8 @@ app.post(
             await withTimeout(
                 bot.moveSlotItem(sourceSlot, destSlot),
                 INVENTORY_ACTION_TIMEOUT_MS,
-                'Di chuyển item'
+                'Di chuyển item',
+                () => invalidateInventoryAction(botState)
             );
 
             if (!isInventoryActionCurrent(botState, bot, actionToken)) {
@@ -6849,7 +7803,8 @@ app.post(
             await withTimeout(
                 bot.equip(item, destination),
                 INVENTORY_ACTION_TIMEOUT_MS,
-                'Trang bị item'
+                'Trang bị item',
+                () => invalidateInventoryAction(botState)
             );
 
             if (!isInventoryActionCurrent(botState, bot, actionToken)) {
@@ -7047,7 +8002,8 @@ app.post(
                     await withTimeout(
                         bot.moveSlotItem(sourceSlot, emptySlot),
                         INVENTORY_ACTION_TIMEOUT_MS,
-                        'Tháo trang bị'
+                        'Tháo trang bị',
+                        () => invalidateInventoryAction(botState)
                     );
 
                     moved = true;
@@ -7064,7 +8020,8 @@ app.post(
                 await withTimeout(
                     bot.unequip(destination),
                     INVENTORY_ACTION_TIMEOUT_MS,
-                    'Tháo trang bị'
+                    'Tháo trang bị',
+                    () => invalidateInventoryAction(botState)
                 );
                 moved = true;
             }
@@ -7306,7 +8263,8 @@ app.post(
             await withTimeout(
                 bot.tossStack(item),
                 INVENTORY_ACTION_TIMEOUT_MS,
-                'Vứt item'
+                'Vứt item',
+                () => invalidateInventoryAction(botState)
             );
 
             if (!isInventoryActionCurrent(botState, bot, actionToken)) {
@@ -7456,7 +8414,7 @@ function scheduleAutoStartOnBoot() {
             return;
         }
 
-        const started = startBot(botState);
+        const started = startBot(botState, 'boot');
 
         addLog(
             botState,
@@ -7502,8 +8460,10 @@ function shutdownProcess(signal) {
     botState.manuallyStopped = true;
 
     clearAllTimers(
-        botState
+        botState,
+        true
     );
+    clearBotSchedulerTimer(botState);
 
     if (botState.bot) {
         const currentBot = botState.bot;
