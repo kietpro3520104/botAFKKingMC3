@@ -3732,7 +3732,14 @@ function publicBotState(state) {
         rssMb: Math.round(mem.rss / (1024 * 1024)),
         heapMb: Math.round(mem.heapUsed / (1024 * 1024)),
         ramRss: Math.round(mem.rss / (1024 * 1024)),
+        ramRssMb: Math.round(mem.rss / (1024 * 1024)),
         ramHeap: Math.round(mem.heapUsed / (1024 * 1024)),
+        memory: {
+            rss: Math.round(mem.rss / (1024 * 1024)),
+            rssMb: Math.round(mem.rss / (1024 * 1024)),
+            heap: Math.round(mem.heapUsed / (1024 * 1024)),
+            heapMb: Math.round(mem.heapUsed / (1024 * 1024))
+        },
         host: currentHost(state),
         port: PORT,
 
@@ -5982,6 +5989,14 @@ input:focus, select:focus, textarea:focus {
             -
           </div>
         </div>
+
+        <div class="info-item">
+          <div class="info-label">
+            BỘ NHỚ (RAM) 🧠
+          </div>
+
+          <div id="detailRamUsage" class="info-value" style="color:var(--green);">-- MB</div>
+        </div>
       </div>
 
       <div class="controls">
@@ -6574,9 +6589,15 @@ function renderBotState() {
   if (ip) ip.textContent = bot.ipAddress || '-';
 
   const topRam = byId('topRamUsage');
-  if (topRam) {
-    const ram = bot.ramRssMb || 0;
-    topRam.textContent = ram ? (ram + ' MB') : '-- MB';
+  const cardRam = byId('detailRamUsage');
+  const ram = Number(bot.ramRssMb || bot.ramRss || bot.rssMb || bot.memory?.rssMb || 0);
+  const heap = Number(bot.ramHeap || bot.heapMb || bot.memory?.heapMb || 0);
+  if (topRam && ram > 0) {
+    topRam.textContent = ram + ' MB';
+  }
+  if (cardRam) {
+    cardRam.textContent = ram > 0 ? (ram + ' MB' + (heap > 0 ? ' (Heap ' + heap + ' MB)' : '')) : '-- MB';
+    cardRam.style.color = ram > 380 ? 'var(--red)' : ram > 280 ? 'var(--yellow)' : 'var(--green)';
   }
 
   renderDimensionLocation();
@@ -9951,11 +9972,19 @@ app.get(
     '/',
     (req, res) => {
         const cur = publicSettingsState(botState);
+        const mem = process.memoryUsage();
+        const rssMb = Math.round(mem.rss / (1024 * 1024));
+        const heapMb = Math.round(mem.heapUsed / (1024 * 1024));
         let renderedHtml = HTML;
         if (cur.autoTotem) renderedHtml = renderedHtml.replace('id="settingAutoTotem"', 'id="settingAutoTotem" checked');
         if (cur.antiHungry) renderedHtml = renderedHtml.replace('id="settingAntiHungry"', 'id="settingAntiHungry" checked');
         if (cur.autoReconnect) renderedHtml = renderedHtml.replace('id="settingAutoReconnect"', 'id="settingAutoReconnect" checked');
         if (cur.antiAfkKick) renderedHtml = renderedHtml.replace('id="settingAntiAfkKick"', 'id="settingAntiAfkKick" checked');
+
+        // Pre-render RAM ngay từ lúc tải trang HTML (kể cả khi bot chưa bấm Chạy)
+        renderedHtml = renderedHtml.replace('id="topRamUsage">-- MB', `id="topRamUsage">${rssMb} MB`);
+        renderedHtml = renderedHtml.replace('id="detailRamUsage" class="info-value" style="color:var(--green);">-- MB', `id="detailRamUsage" class="info-value" style="color:var(--green);">${rssMb} MB (Heap ${heapMb} MB)`);
+
         res
             .type('html')
             .send(renderedHtml);
