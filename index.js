@@ -4,53 +4,60 @@ const fs = require('fs');
 const path = require('path');
 
 // ============================================================================
-// HARD-CODED BOT CONFIG
+// CẤU HÌNH TỔNG BOT MINECRAFT KINGMC (HARDCODED CONFIG V7 - SIÊU VIP)
 //
-// Chỉ cần sửa phần này khi đổi tài khoản, server hoặc host chạy bot.
-// Không cần BOT/username/password/server ENV cho bot.
-//
-// PLATFORM:
-//   'raven'  -> dùng RAVEN_HTTP_PORT bên dưới.
-//   'render' -> tự dùng process.env.PORT do Render cấp; KHÔNG cần nhập port.
+// Quăng file này lên VPS / Hosting dưới dạng index.js hoặc bot.js.
+// Tự động nhận diện Render / RavenHost / VPS và khởi chạy Web UI tức thì!
+// Chỉnh sửa các trường cấu hình trực tiếp ngay bên dưới:
 // ============================================================================
 
 const BOT_CONFIG = {
-    // Host platform
-    PLATFORM: 'render',
+    // --- 1. TÀI KHOẢN BOT (ĐỂ TRỐNG ĐỂ TỰ ĐIỀN HOẶC NHẬP TỪ WEB UI) ---
+    USERNAME: '',                         // Tên tài khoản Minecraft ingame (VD: 'AFK_PRO_01')
+    PASSWORD: '',                         // Mật khẩu /login trong server KingMC (VD: 'matkhau123')
 
-    // Bot identity
-    BOT_ID: '7',
+    // --- 2. SERVER MINECRAFT KINGMC ---
+    MC_HOSTS: ['sgp.kingmc.vn', 'kingmc.vn'], // Danh sách IP server KingMC
+    MC_PORT: 25565,                           // Cổng Minecraft mặc định (25565)
+    MC_VERSION: '1.20.1',                     // Phiên bản Minecraft kết nối
 
-    // KingMC account
-    USERNAME: '',
-    PASSWORD: '',
+    // --- 3. THÔNG BÁO WEBHOOK DISCORD & TELEGRAM (ĐỂ TRỐNG NẾU CHƯA DÙNG) ---
+    DISCORD_WEBHOOK_URL: '',              // Link Discord Webhook nhận thông báo kick, chết, spawn
+    TELEGRAM_BOT_TOKEN: '',               // Token Bot Telegram (VD: '123456789:ABCdefGhI...')
+    TELEGRAM_CHAT_ID: '',                 // ID cuộc trò chuyện Telegram nhận thông báo
 
-    // HTTP/Web port
-    // Raven: mỗi bot phải có port riêng.
-    // Render: KHÔNG dùng giá trị này; Render tự cấp process.env.PORT.
-    RAVEN_HTTP_PORT: 17419,
+    // --- 4. CỔNG MÁY CHỦ WEB & NỀN TẢNG HOSTING (TỰ ĐỘNG GÁN 100%) ---
+    PLATFORM: 'auto',                     // 'auto' (Tự nhận diện Render / RavenHost / Local VPS)
+    WEB_PORT: 3000,                       // Cổng Web dự phòng khi test Local PC (Render & RavenHost tự động gán 100%)
+    RAVEN_HTTP_PORT: null,                // Cổng RavenHost: ĐỂ NULL ĐỂ TỰ ĐỘNG LẤY TỪ PANEL RAVENHOST (SERVER_PORT)
+    BOT_ID: '1',                          // ID định danh của bot
 
-    // Minecraft server
-    MC_HOSTS: ['sgp.kingmc.vn'],
-    MC_PORT: 25565,
-    MC_VERSION: '1.20.1',
+    // --- 5. TỐI ƯU HÓA BỘ NHỚ & CHỐNG TRÀN RAM (WATCHDOG 300-500MB) ---
+    AUTO_START: true,                     // Tự động kết nối vào game nếu đã có USERNAME và PASSWORD
+    VIEW_DISTANCE: 'tiny',                // Tầm nhìn tối thiểu để tiết kiệm RAM tối đa
+    CHECK_TIMEOUT_MS: 30000,              // Timeout kiểm tra kết nối mạng
+    RAM_WATCHDOG_LIMIT_MB: 380,           // Ngưỡng RAM tự dọn dẹp sạch sẽ và kích hoạt GC (300-500MB)
 
-    // Startup
-    AUTO_START: true,
-
-    // Mineflayer tuning
-    VIEW_DISTANCE: 'tiny',
-    CHECK_TIMEOUT_MS: 30000,
-
-    // KingMC location flow
+    // --- 6. TỌA ĐỘ CHUYỂN SERVER KINGMC ---
     AUTH_COORDS: { x: 5, y: 119, z: 4 },
     LOBBY_COORDS: { x: 1, y: 41, z: 1 },
 
-    // Initial runtime settings
+    // --- 7. TỐI ƯU HÓA KHU FARM HẠT & ITEM (KELP / MOB FARM) ---
+    FARM_OPTIMIZATION: {
+        ENABLED: true,
+        MAX_ENTITIES_IN_MEMORY: 120,      // Giới hạn thực thể lưu trong RAM (chống tràn 512MB RAM Render)
+        IGNORE_ITEM_PHYSICS: true,        // Bỏ qua tính toán va chạm với item rơi
+        DROP_PARTICLES_AND_SOUNDS: true,  // Chặn hoàn toàn packet hạt bọt nước & âm thanh farm
+        CHUNK_CULL_RADIUS: 2,             // Chỉ giữ 2 chunks quanh bot, giải phóng map thừa
+        PRUNE_INTERVAL_MS: 1500           // Quét dọn rác mỗi 1.5 giây
+    },
+
+    // --- 8. CẤU HÌNH HÀNH VI TỰ ĐỘNG (THUẦN AFK & ANTI-AFK) ---
     DEFAULT_SETTINGS: {
-        autoTotem: true,
-        antiHungry: true,
-        autoReconnect: true
+        autoTotem: true,                  // Tự cầm totem khi còn ít máu phòng té ngã
+        antiHungry: true,                 // Tự ăn khi đói chống chết đói khi treo máy
+        autoReconnect: true,              // Tự kết nối lại khi mất mạng / server restart
+        antiAfkKick: true                 // Giả lập vi chuyển động yaw/pitch & sneak chống kick AFK
     }
 };
 
@@ -66,20 +73,223 @@ function readPositiveInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER
     return Math.min(Math.max(Math.trunc(parsed), min), max);
 }
 
-const PLATFORM = String(BOT_CONFIG.PLATFORM || 'render').trim().toLowerCase();
 
-if (!['raven', 'render'].includes(PLATFORM)) {
-    throw new Error(
-        `[CONFIG] PLATFORM không hợp lệ: ${BOT_CONFIG.PLATFORM}. Chỉ dùng 'raven' hoặc 'render'.`
-    );
+// ============================================================================
+// HỆ THỐNG TỰ ĐỘNG NHẬN DIỆN NỀN TẢNG (RENDER / RAVENHOST.SPACE) & PHÁT HIỆN PORT
+// ============================================================================
+// HỆ THỐNG TỰ ĐỘNG NHẬN DIỆN NỀN TẢNG (RENDER / RAVENHOST.SPACE) & PHÁT HIỆN PORT SIÊU CHUẨN
+// ============================================================================
+
+function extractCliArgs() {
+    let port = null;
+    let platform = null;
+    const argv = process.argv.slice(2);
+    for (let i = 0; i < argv.length; i++) {
+        const arg = argv[i];
+        if (arg.startsWith('--port=')) {
+            const p = parseInt(arg.split('=')[1], 10);
+            if (Number.isFinite(p) && p > 0 && p <= 65535) port = p;
+        } else if (arg === '--port' || arg === '-p') {
+            if (i + 1 < argv.length) {
+                const p = parseInt(argv[i + 1], 10);
+                if (Number.isFinite(p) && p > 0 && p <= 65535) {
+                    port = p;
+                    i++;
+                }
+            }
+        } else if (arg.startsWith('-p=')) {
+            const p = parseInt(arg.split('=')[1], 10);
+            if (Number.isFinite(p) && p > 0 && p <= 65535) port = p;
+        } else if (arg.startsWith('--platform=')) {
+            platform = arg.split('=')[1].trim().toLowerCase();
+        } else if (arg === '--platform') {
+            if (i + 1 < argv.length) {
+                platform = argv[i + 1].trim().toLowerCase();
+                i++;
+            }
+        } else if (/^\d{2,5}$/.test(arg) && !port) {
+            const p = parseInt(arg, 10);
+            if (Number.isFinite(p) && p > 0 && p <= 65535) port = p;
+        }
+    }
+    return { port, platform };
 }
 
-// Raven: lấy port riêng đã nhập trong BOT_CONFIG.
-// Render: luôn ưu tiên PORT mà Render cấp cho Web Service.
-const HTTP_PORT =
-    PLATFORM === 'raven'
-        ? readPositiveInt(BOT_CONFIG.RAVEN_HTTP_PORT, 17419, 1, 65535)
-        : readPositiveInt(process.env.PORT, 10000, 1, 65535);
+function detectHostPlatformAndPort(config, fallbackPort, role = 'bot') {
+    const cli = extractCliArgs();
+
+    // 1. Dấu hiệu Render theo tài liệu chính thức (https://render.com/docs/environment-variables):
+    // Render luôn luôn inject RENDER="true", RENDER_SERVICE_ID, RENDER_INSTANCE_ID,...
+    const isRender = !!(
+        (process.env.RENDER && String(process.env.RENDER).toLowerCase() === 'true') ||
+        process.env.RENDER_SERVICE_ID ||
+        process.env.RENDER_INSTANCE_ID ||
+        process.env.RENDER_SERVICE_NAME ||
+        process.env.RENDER_EXTERNAL_HOSTNAME
+    );
+
+    // 2. Dấu hiệu RavenHost (ravenhost.space) / Pterodactyl Panel:
+    // Theo tài liệu https://ravenhost.space/docs/subdomains:
+    // panel.ravenhost.space chạy container Pterodactyl, cấp phát port qua SERVER_PORT
+    // hoặc PORT trên container, và định tuyến subdomain http://yourhost.app.ravenhost.space:PORT
+    const isRaven = !!(
+        process.env.P_SERVER_UUID ||
+        process.env.P_SERVER_LOCATION ||
+        process.env.SERVER_PORT ||
+        process.env.P_SERVER_PORT ||
+        process.env.SERVER_MEMORY ||
+        process.env.RAVEN_PORT ||
+        process.env.RAVEN_HTTP_PORT ||
+        process.env.RAVEN_ENV ||
+        (process.env.HOSTNAME && (process.env.HOSTNAME.includes('ravenhost') || process.env.HOSTNAME.includes('pterodactyl'))) ||
+        (!isRender && process.env.PORT) // Trên RavenHost/Pterodactyl, app nhận allocation port từ biến PORT hoặc SERVER_PORT
+    );
+
+    let platform = 'auto';
+    let detectionSource = 'mặc định';
+
+    const configuredPlatform = String(config.PLATFORM || 'auto').trim().toLowerCase();
+
+    // Thứ tự ưu tiên nền tảng:
+    // Ưu tiên 1: Tham số dòng lệnh CLI (--platform=...)
+    if (cli.platform === 'render' || cli.platform === 'raven') {
+        platform = cli.platform;
+        detectionSource = `Tham số dòng lệnh CLI (--platform=${cli.platform})`;
+    }
+    // Ưu tiên 2: Người dùng chủ động ép cứng cấu hình trong code (config.PLATFORM)
+    else if (configuredPlatform === 'render' || configuredPlatform === 'raven') {
+        platform = configuredPlatform;
+        detectionSource = `Cấu hình ép buộc config.PLATFORM = '${configuredPlatform}'`;
+    }
+    // Ưu tiên 3: Tự nhận diện Render từ biến môi trường chính thức (process.env.RENDER)
+    else if (isRender) {
+        platform = 'render';
+        detectionSource = 'Biến môi trường Render chính thức (process.env.RENDER)';
+    }
+    // Ưu tiên 4: Tự nhận diện RavenHost (ravenhost.space / Pterodactyl Panel)
+    else if (isRaven) {
+        platform = 'raven';
+        if (process.env.SERVER_PORT) {
+            detectionSource = `RavenHost / Pterodactyl Panel (SERVER_PORT = ${process.env.SERVER_PORT})`;
+        } else if (process.env.P_SERVER_UUID) {
+            detectionSource = `RavenHost Container (P_SERVER_UUID = ${process.env.P_SERVER_UUID})`;
+        } else if (process.env.PORT) {
+            detectionSource = `RavenHost App Allocation (PORT = ${process.env.PORT})`;
+        } else {
+            detectionSource = 'Môi trường RavenHost (ravenhost.space)';
+        }
+    }
+    // Ưu tiên 5: Fallback mặc định
+    else {
+        platform = 'raven';
+        detectionSource = 'Mặc định Local PC / VPS độc lập (Raven mode)';
+    }
+
+    // 3. Phân giải Cổng (Port) theo chuẩn tài liệu ravenhost.space và render.com:
+    let port = fallbackPort;
+    let portSource = 'mặc định';
+
+    // ƯU TIÊN CAO NHẤT: Tham số dòng lệnh CLI (--port=XXXX, --port XXXX, -p XXXX, hoặc số nguyên ở argv)
+    // Thường được cấp bởi startup command trong Panel Pterodactyl egg của RavenHost: "node index.js --port={{SERVER_PORT}}"
+    if (cli.port) {
+        port = cli.port;
+        portSource = `Tham số dòng lệnh CLI / Pterodactyl Startup (--port = ${cli.port})`;
+    } else if (platform === 'render') {
+        // Tài liệu Render: Web Service nhận port từ biến PORT do Render cấp phát, mặc định cổng 10000
+        const renderPort = Number(process.env.PORT);
+        if (Number.isFinite(renderPort) && renderPort > 0 && renderPort <= 65535) {
+            port = renderPort;
+            portSource = `Render cấp tự động (process.env.PORT = ${renderPort})`;
+        } else {
+            port = 10000;
+            portSource = 'Render mặc định (10000)';
+        }
+    } else {
+        // Tài liệu ravenhost.space (https://ravenhost.space/docs/subdomains):
+        // Container Pterodactyl cấp port qua SERVER_PORT hoặc PORT.
+        const rawPort = process.env.SERVER_PORT ||
+                        process.env.P_SERVER_PORT ||
+                        process.env.PORT ||
+                        process.env.RAVEN_HTTP_PORT ||
+                        process.env.RAVEN_PORT;
+
+        const parsedPort = Number(rawPort);
+        if (Number.isFinite(parsedPort) && parsedPort > 0 && parsedPort <= 65535) {
+            port = parsedPort;
+            if (process.env.SERVER_PORT) {
+                portSource = `RavenHost Panel cấp tự động (process.env.SERVER_PORT = ${parsedPort})`;
+            } else if (process.env.P_SERVER_PORT) {
+                portSource = `Panel Pterodactyl cấp (process.env.P_SERVER_PORT = ${parsedPort})`;
+            } else if (process.env.PORT) {
+                portSource = `RavenHost App Allocation (process.env.PORT = ${parsedPort})`;
+            } else if (process.env.RAVEN_HTTP_PORT) {
+                portSource = `Biến môi trường RAVEN_HTTP_PORT = ${parsedPort}`;
+            } else {
+                portSource = `Biến môi trường RAVEN_PORT = ${parsedPort}`;
+            }
+        } else {
+            // Khi không có biến môi trường:
+            // Nếu ở chế độ raven (mặc định trên RavenHost / VPS), ƯU TIÊN RAVEN_HTTP_PORT trước WEB_PORT!
+            const preferredConfigPort = platform === 'raven'
+                ? Number(config.RAVEN_HTTP_PORT || config.WEB_PORT)
+                : Number(config.WEB_PORT || config.RAVEN_HTTP_PORT);
+
+            if (Number.isFinite(preferredConfigPort) && preferredConfigPort > 0 && preferredConfigPort <= 65535) {
+                port = preferredConfigPort;
+                portSource = platform === 'raven' && config.RAVEN_HTTP_PORT
+                    ? `Cấu hình config.RAVEN_HTTP_PORT = ${preferredConfigPort}`
+                    : `Cấu hình config.WEB_PORT = ${preferredConfigPort}`;
+            } else {
+                port = fallbackPort;
+                portSource = `Cổng dự phòng fallback (${fallbackPort})`;
+            }
+        }
+    }
+
+    return { platform, detectionSource, port, portSource };
+}
+
+function listenHttpServer(app, initialPort, platform, onListening) {
+    const fixedPort = initialPort;
+    // Trên RavenHost và Render: Cổng là duy nhất được gán qua Allocation Router / Render Proxy.
+    // TUYỆT ĐỐI KHÔNG tăng cổng tự động (+1) vì nếu nghe trên cổng khác (ví dụ 17420 thay vì 17419),
+    // tên miền subdomain.app.ravenhost.space sẽ không thể kết nối tới (lỗi 502/Connection Refused)!
+    // Thay vào đó: Khi gặp EADDRINUSE (do tiến trình cũ vừa tắt đang nhả socket), thử lại chính cổng đó tối đa 5 lần (mỗi lần 1s).
+    const maxRetries = 5;
+    let attempt = 0;
+
+    function tryListen() {
+        const srv = app.listen(fixedPort, '0.0.0.0');
+
+        srv.on('listening', () => {
+            onListening(srv, fixedPort);
+        });
+
+        srv.on('error', (err) => {
+            if (err.code === 'EADDRINUSE' && attempt < maxRetries) {
+                attempt++;
+                console.warn(`[HTTP] ⚠️ Cổng ${fixedPort} đang tạm thời bận (EADDRINUSE). Đang chờ giải phóng socket và thử lại lần ${attempt}/${maxRetries} sau 1 giây...`);
+                setTimeout(tryListen, 1000);
+            } else {
+                console.error(`[HTTP] ❌ Lỗi khởi động máy chủ web trên cổng cố định ${fixedPort}:`, err.message);
+                if (err.code === 'EADDRINUSE') {
+                    console.error(`[HTTP] 💡 Khắc phục: Cổng ${fixedPort} đang bị chiếm bởi tiến trình khác. Hãy kiểm tra các bot/tiến trình Node.js đang chạy ngầm hoặc khởi động lại container trên RavenHost.`);
+                }
+                process.exit(1);
+            }
+        });
+    }
+
+    tryListen();
+}
+
+
+const hostInfo = detectHostPlatformAndPort(BOT_CONFIG, Number(BOT_CONFIG.WEB_PORT) || 3000, 'bot');
+const PLATFORM = hostInfo.platform;
+let HTTP_PORT = hostInfo.port;
+
+console.log(`[HOST] 🌐 Nền tảng Bot: ${PLATFORM.toUpperCase()} (${hostInfo.detectionSource})`);
+console.log(`[HTTP] 🔌 Cổng Web Bot: ${HTTP_PORT} (${hostInfo.portSource})`);
 
 const BOT_ID_RAW = String(BOT_CONFIG.BOT_ID).trim() || '1';
 const BOT_ID_NUMBER_PARSED =
@@ -94,7 +304,8 @@ const BOT_ID =
     String(BOT_ID_RAW || BOT_ID_NUMBER);
 const BOT_LABEL = `Bot ${BOT_ID}`;
 
-const MAX_LOGS = 100;
+const MAX_LOGS = 500;
+const MAX_CHAT_LOGS = 500;
 const RECONNECT_DELAY = 3000;
 const INVENTORY_ACTION_TIMEOUT_MS = 15000;
 const AUTO_START_ON_BOOT = Boolean(BOT_CONFIG.AUTO_START);
@@ -106,8 +317,9 @@ const AFK_MENU_CLICK_DELAY = 700;
 
 // Background inventory / survival managers.
 const AUTO_EAT_INTERVAL_MS = 2000;
-const AUTO_TOTEM_INTERVAL_MS = 1500;
+const AUTO_TOTEM_INTERVAL_MS = 1000;
 const INVENTORY_SCAN_INTERVAL_MS = 1000;
+const SMART_ANTI_AFK_INTERVAL_MS = 38000; // 38s xoay góc nhìn & vung tay nhẹ chống kick
 
 const MC_VERSION = BOT_CONFIG.MC_VERSION;
 const HOSTS = Array.isArray(BOT_CONFIG.MC_HOSTS)
@@ -340,7 +552,8 @@ function loadBotSettings() {
             settings: {
                 autoTotem: settings.autoTotem !== false,
                 antiHungry: settings.antiHungry !== false,
-                autoReconnect: settings.autoReconnect !== false
+                autoReconnect: settings.autoReconnect !== false,
+                antiAfkKick: settings.antiAfkKick !== false
             },
             autoChatSchedules: sanitizeAutoChatSchedules(parsed?.autoChatSchedules),
             botSchedules: sanitizeBotSchedules(parsed?.botSchedules)
@@ -358,11 +571,12 @@ function loadBotSettings() {
 function saveBotSettingsFile(settings, autoChatSchedules, botSchedules) {
     try {
         const payload = {
-            version: 2,
+            version: 3,
             settings: {
                 autoTotem: settings.autoTotem !== false,
                 antiHungry: settings.antiHungry !== false,
-                autoReconnect: settings.autoReconnect !== false
+                autoReconnect: settings.autoReconnect !== false,
+                antiAfkKick: settings.antiAfkKick !== false
             },
             autoChatSchedules: sanitizeAutoChatSchedules(autoChatSchedules)
                 .map(schedule => ({
@@ -476,9 +690,12 @@ function cleanMinecraftText(text) {
 }
 
 function getConfiguredCredentials() {
+    const envUser = process.env.BOT_USERNAME || process.env.USERNAME || process.env.MC_USERNAME || process.env.KINGMC_USERNAME || '';
+    const envPass = process.env.BOT_PASSWORD || process.env.PASSWORD || process.env.MC_PASSWORD || process.env.KINGMC_PASSWORD || '';
+
     return {
-        username: String(BOT_CONFIG.USERNAME || '').trim(),
-        password: String(BOT_CONFIG.PASSWORD || '')
+        username: String(BOT_CONFIG.USERNAME || envUser || '').trim(),
+        password: String(BOT_CONFIG.PASSWORD || envPass || '')
     };
 }
 
@@ -554,6 +771,11 @@ function createBotState() {
         totemTimer: null,
         eatTimer: null,
         autoChatTimer: null,
+        antiAfkTimer: null,
+        farmPruneTimer: null,
+        memoryWatchdogTimer: null,
+        lastRssMb: 0,
+        lastHeapMb: 0,
         autoChatGeneration: 0,
 
         settings: { ...INITIAL_SETTINGS.settings },
@@ -591,6 +813,7 @@ function createBotState() {
 
 const botState = createBotState();
 startBotScheduler(botState);
+startMemoryWatchdog(botState);
 
 function addLog(state, message) {
     const time = new Date().toLocaleTimeString('vi-VN', {
@@ -654,10 +877,10 @@ function addChatLog(
     state.chatLogs.push(line);
     state.chatLogRevision++;
 
-    if (state.chatLogs.length > 200) {
+    if (state.chatLogs.length > MAX_CHAT_LOGS) {
         state.chatLogs.splice(
             0,
-            state.chatLogs.length - 200
+            state.chatLogs.length - MAX_CHAT_LOGS
         );
     }
 
@@ -833,6 +1056,11 @@ function cleanupBotResources(bot) {
         }
     } catch (_) {
     }
+
+    // Gợi ý V8 thu hồi bộ nhớ ngay sau khi đóng/dọn dẹp tài nguyên bot
+    if (typeof global.gc === 'function') {
+        try { global.gc(); } catch (_) {}
+    }
 }
 
 function withTimeout(
@@ -897,6 +1125,16 @@ function clearManagerTimers(state) {
         state.autoChatTimer = null;
     }
 
+    if (state.antiAfkTimer) {
+        clearInterval(state.antiAfkTimer);
+        state.antiAfkTimer = null;
+    }
+
+    if (state.farmPruneTimer) {
+        clearInterval(state.farmPruneTimer);
+        state.farmPruneTimer = null;
+    }
+
     state.autoChatGeneration++;
 
     state.isEating = false;
@@ -951,6 +1189,326 @@ function clearAllTimers(state, includePublicIp = false) {
         clearPublicIpTimer(state);
     }
 }
+
+// ============================================================================
+// 🌟 MODULE SIÊU TỐI ƯU CHO KHU FARM KELP / MOB (HƠN 100K+ ITEMS)
+// ============================================================================
+function applyHighDensityFarmOptimizations(state, bot) {
+    if (!BOT_CONFIG.FARM_OPTIMIZATION.ENABLED || !bot) return;
+
+    // 1. Chặn hoàn toàn Packet hạt bọt nước, âm thanh & animation rớt item
+    if (BOT_CONFIG.FARM_OPTIMIZATION.DROP_PARTICLES_AND_SOUNDS && bot._client) {
+        const dropEvents = [
+            'world_particles', 'sound_effect', 'named_sound_effect', 'update_light',
+            'spawn_entity_experience_orb', 'experience_orb', 'explosion',
+            'block_break_animation', 'entity_effect', 'remove_entity_effect'
+        ];
+        for (const evt of dropEvents) {
+            bot._client.removeAllListeners(evt);
+            bot._client.on(evt, () => {}); // No-op: drop thẳng gói tin, không tốn CPU/RAM parse
+        }
+    }
+
+    // 2. Lắng nghe entitySpawn để cắt tỉa rác tức thì (không để dồn ứ bộ nhớ RAM)
+    if (bot._entitySpawnPruneHandler) {
+        bot.removeListener('entitySpawn', bot._entitySpawnPruneHandler);
+    }
+    bot._entitySpawnPruneHandler = (entity) => {
+        try {
+            if (!entity || !bot.entities) return;
+            const myPos = bot.entity ? bot.entity.position : null;
+            const hasPos = entity.position && typeof entity.position.distanceSquared === 'function';
+            const distSq = (hasPos && myPos) ? entity.position.distanceSquared(myPos) : 99999;
+            const isItemOrOrb = entity.name === 'item' || entity.type === 'object' || entity.entityType === 'item' || entity.type === 'orb';
+            if (isItemOrOrb && distSq > 9) {
+                delete bot.entities[entity.id];
+            } else if (entity.type !== 'player' && distSq > 400) {
+                delete bot.entities[entity.id];
+            }
+        } catch (_) {}
+    };
+    bot.on('entitySpawn', bot._entitySpawnPruneHandler);
+
+    // 3. Vòng lặp dọn dẹp thực thể (Entity Pruning) - Khóa cứng RAM luôn < 120MB
+    if (state.farmPruneTimer) clearInterval(state.farmPruneTimer);
+    state.farmPruneTimer = setInterval(() => {
+        try {
+            if (!bot || !bot.entities) return;
+
+            const myId = bot.entity ? bot.entity.id : -1;
+            const myPos = bot.entity ? bot.entity.position : null;
+            let totalCount = 0;
+            const nonPlayerIds = [];
+
+            for (const id in bot.entities) {
+                totalCount++;
+                if (id == myId) continue;
+                const entity = bot.entities[id];
+                if (!entity) continue;
+
+                // Nếu là item rơi dưới đất hoặc exp orb
+                const isItemOrOrb = entity.name === 'item' || entity.type === 'object' || entity.entityType === 'item' || entity.type === 'orb' || entity.name === 'experience_orb';
+                const hasPos = entity.position && typeof entity.position.distanceSquared === 'function';
+                const distSq = (hasPos && myPos) ? entity.position.distanceSquared(myPos) : 99999;
+
+                if (isItemOrOrb) {
+                    // Nếu cách bot hơn 3 block (ngoài tầm nhặt) -> Xóa sổ khỏi bộ nhớ RAM
+                    if (!myPos || !hasPos || distSq > 9) {
+                        delete bot.entities[id];
+                        continue;
+                    }
+                }
+
+                // Dọn dẹp thực thể quái/vật phẩm ở xa ngoài 20 blocks
+                if (entity.type !== 'player') {
+                    if (distSq > 400) {
+                        delete bot.entities[id];
+                        continue;
+                    }
+                    nonPlayerIds.push({ id, distSq });
+                }
+            }
+
+            // Nếu số lượng entity vượt quá trần cấu hình -> Xóa các thực thể xa nhất
+            const maxEntities = BOT_CONFIG.FARM_OPTIMIZATION.MAX_ENTITIES_IN_MEMORY || 120;
+            if (totalCount > maxEntities && nonPlayerIds.length > 0) {
+                nonPlayerIds.sort((a, b) => b.distSq - a.distSq);
+                for (const item of nonPlayerIds) {
+                    if (totalCount <= maxEntities) break;
+                    delete bot.entities[item.id];
+                    totalCount--;
+                }
+            }
+
+            // 3. Dọn dẹp Chunk ở xa để giải phóng bộ nhớ World Map
+            if (bot.world && myPos) {
+                const botChunkX = Math.floor(myPos.x / 16);
+                const botChunkZ = Math.floor(myPos.z / 16);
+                const cullRadius = BOT_CONFIG.FARM_OPTIMIZATION.CHUNK_CULL_RADIUS;
+
+                if (typeof bot.world.getColumns === 'function') {
+                    const cols = bot.world.getColumns();
+                    if (Array.isArray(cols)) {
+                        for (const col of cols) {
+                            if (!col) continue;
+                            const cx = col.chunkX ?? col.x;
+                            const cz = col.chunkZ ?? col.z;
+                            if (cx !== undefined && cz !== undefined) {
+                                if (Math.abs(cx - botChunkX) > cullRadius || Math.abs(cz - botChunkZ) > cullRadius) {
+                                    if (typeof bot.world.unloadColumn === 'function') {
+                                        bot.world.unloadColumn(cx, cz);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_) {}
+    }, BOT_CONFIG.FARM_OPTIMIZATION.PRUNE_INTERVAL_MS);
+}
+
+// 🛡️ MEMORY WATCHDOG: Giám sát RAM định kỳ, bảo đảm luôn < 300MB
+function startMemoryWatchdog(state) {
+    if (state.memoryWatchdogTimer) clearInterval(state.memoryWatchdogTimer);
+    state.memoryWatchdogTimer = setInterval(() => {
+        try {
+            const mem = process.memoryUsage();
+            const rssMb = Math.round(mem.rss / (1024 * 1024));
+            const heapMb = Math.round(mem.heapUsed / (1024 * 1024));
+            state.lastRssMb = rssMb;
+            state.lastHeapMb = heapMb;
+
+            const limitMb = Number(BOT_CONFIG.RAM_WATCHDOG_LIMIT_MB) || 380;
+            if (rssMb > limitMb) {
+                // Ép dọn dẹp thực thể và chunk
+                if (state.bot && state.bot.entities) {
+                    const myId = state.bot.entity ? state.bot.entity.id : -1;
+                    for (const id in state.bot.entities) {
+                        if (id != myId && state.bot.entities[id]?.type !== 'player') {
+                            delete state.bot.entities[id];
+                        }
+                    }
+                }
+
+                if (state.logs && state.logs.length > 300) state.logs = state.logs.slice(-300);
+                if (state.chatLogs && state.chatLogs.length > 300) state.chatLogs = state.chatLogs.slice(-300);
+
+                if (typeof global.gc === 'function') {
+                    global.gc();
+                }
+
+                addLog(state, `[BỘ NHỚ] Kích hoạt giải phóng RAM khẩn cấp (RSS: ${rssMb} MB / Ngưỡng: ${limitMb} MB).`);
+            }
+        } catch (_) {}
+    }, 30000);
+}
+
+// ============================================================================
+// HỆ THỐNG CẢNH BÁO DISCORD & TELEGRAM WEBHOOK TRỰC TIẾP TỪ BOT
+// ============================================================================
+function getBotDiscordWebhookUrl() {
+    return String(
+        BOT_CONFIG.DISCORD_WEBHOOK_URL ||
+        process.env.DISCORD_WEBHOOK_URL ||
+        process.env.BOT_DISCORD_WEBHOOK ||
+        process.env.WEBHOOK_URL ||
+        ''
+    ).trim();
+}
+
+function getBotTelegramConfig() {
+    return {
+        token: String(BOT_CONFIG.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || '').trim(),
+        chatId: String(BOT_CONFIG.TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT_ID || '').trim()
+    };
+}
+
+async function sendTelegramMessage(token, chatId, text) {
+    if (!token || !chatId) return false;
+    try {
+        const url = `https://api.telegram.org/bot${encodeURIComponent(token)}/sendMessage`;
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: chatId,
+                text,
+                parse_mode: 'HTML'
+            })
+        });
+        return response.ok;
+    } catch (_) {
+        return false;
+    }
+}
+
+async function sendBotDirectAlert(eventType, message, details = {}) {
+    const webhookUrl = getBotDiscordWebhookUrl();
+    const tg = getBotTelegramConfig();
+    if (!webhookUrl && (!tg.token || !tg.chatId)) return;
+
+    let color = 0x3498DB;
+    let emoji = '🤖';
+    if (eventType === 'kicked' || eventType === 'error') { color = 0xE74C3C; emoji = '🚨'; }
+    else if (eventType === 'death') { color = 0xC0392B; emoji = '💀'; }
+    else if (eventType === 'spawn' || eventType === 'afk') { color = 0x2ECC71; emoji = '✅'; }
+
+    // 1. Gửi Discord nếu có webhookUrl
+    if (webhookUrl) {
+        const fields = [
+            { name: '👤 Bot ID / Label', value: `${BOT_LABEL} (ID: ${BOT_ID})`, inline: true },
+            { name: '🌐 Trạng thái', value: eventType.toUpperCase(), inline: true }
+        ];
+        for (const [k, v] of Object.entries(details)) {
+            fields.push({ name: k, value: String(v), inline: true });
+        }
+
+        try {
+            await fetch(webhookUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    username: `KingMC Bot ${BOT_LABEL}`,
+                    embeds: [{
+                        title: `${emoji} [${eventType.toUpperCase()}] ${BOT_LABEL}`,
+                        description: message,
+                        color,
+                        fields,
+                        timestamp: new Date().toISOString()
+                    }]
+                })
+            });
+        } catch (_) {}
+    }
+
+    // 2. Gửi Telegram nếu có token & chatId
+    if (tg.token && tg.chatId) {
+        let tgText = `<b>${emoji} [${eventType.toUpperCase()}] ${BOT_LABEL} (ID: ${BOT_ID})</b>\n`;
+        tgText += `${message}\n`;
+        for (const [k, v] of Object.entries(details)) {
+            tgText += `• <b>${k}:</b> ${v}\n`;
+        }
+        await sendTelegramMessage(tg.token, tg.chatId, tgText);
+    }
+}
+
+// ⚡ INSTANT AUTO TOTEM: Phản xạ tức thì (< 50ms khi nhận damage)
+async function fastEquipTotem(state) {
+    const bot = state.bot;
+    if (!state.settings.autoTotem || !bot || !bot.inventory || state.isEquippingTotem || state.inventoryActionBusy) return;
+
+    if (bot.usingHeldItem && typeof bot.deactivateItem === 'function') {
+        try { bot.deactivateItem(); } catch (_) {}
+    }
+
+    const offhandSlot = getOffhandSlot(bot);
+    const offhandItem = bot.inventory.slots[offhandSlot];
+    if (offhandItem && offhandItem.name === 'totem_of_undying') return;
+
+    let totemItem = null;
+    for (let slot = 9; slot <= 44; slot++) {
+        const item = bot.inventory.slots[slot];
+        if (item && item.name === 'totem_of_undying') {
+            totemItem = item;
+            break;
+        }
+    }
+    if (!totemItem) return;
+
+    state.isEquippingTotem = true;
+    try {
+        await bot.equip(totemItem, 'off-hand');
+        addLog(state, '⚡ [TOTEM] Phản xạ tức thì: Đã lắp Totem vào tay phụ!');
+        scanInventory(state, bot);
+    } catch (_) {} finally {
+        state.isEquippingTotem = false;
+    }
+}
+
+// 🔄 SMART ANTI-AFK KICK: Giả lập hành vi người chơi thật (Natural Cadence, Micro-Look, Swing, Sneak)
+function startSmartAntiAfk(state) {
+    if (state.antiAfkTimer) {
+        clearTimeout(state.antiAfkTimer);
+        clearInterval(state.antiAfkTimer);
+        state.antiAfkTimer = null;
+    }
+
+    function scheduleNext() {
+        if (!state.settings.antiAfkKick || state.status !== 'afk' || !state.ready || !state.bot) return;
+
+        // Tần số ngẫu nhiên tự nhiên (22s - 45s) tránh quy luật cố định
+        const jitterInterval = 22000 + Math.floor(Math.random() * 23000);
+        state.antiAfkTimer = setTimeout(() => {
+            if (state.settings.antiAfkKick && state.status === 'afk' && state.ready && state.bot && state.bot.entity) {
+                try {
+                    const deltaYaw = (Math.random() - 0.5) * 0.35;
+                    const deltaPitch = (Math.random() - 0.5) * 0.2;
+                    const yaw = state.bot.entity.yaw + deltaYaw;
+                    const pitch = Math.max(-1.4, Math.min(1.4, state.bot.entity.pitch + deltaPitch));
+
+                    state.bot.look(yaw, pitch, true, () => {
+                        // 40% cơ hội vung tay (swingArm packet)
+                        if (Math.random() > 0.6 && typeof state.bot.swingArm === 'function') {
+                            state.bot.swingArm('right');
+                        }
+                        // 25% cơ hội nhấp ngồi (sneak) 160ms giả lập thao tác người thật
+                        if (Math.random() > 0.75 && typeof state.bot.setControlState === 'function') {
+                            state.bot.setControlState('sneak', true);
+                            setTimeout(() => {
+                                if (state.bot) state.bot.setControlState('sneak', false);
+                            }, 160);
+                        }
+                    });
+                } catch (_) {}
+            }
+            scheduleNext();
+        }, jitterInterval);
+    }
+
+    scheduleNext();
+}
+
 
 const FOOD_PRIORITY = [
     'golden_apple',
@@ -1672,17 +2230,34 @@ async function autoEatTick(state) {
         return;
     }
 
+    const health =
+        Number.isFinite(bot.health)
+            ? Number(bot.health)
+            : 20;
+
     const food =
         Number.isFinite(bot.food)
             ? Number(bot.food)
             : 20;
 
-    if (food >= 18) {
+    // 🚨 Phản xạ sinh tồn: Nếu máu tụt xuống mức nguy hiểm (< 15 HP), ưu tiên ăn Táo Vàng ngay
+    let emergencyGapple = null;
+    if (health < 15) {
+        for (let slot = 9; slot <= 44; slot++) {
+            const item = bot.inventory.slots[slot];
+            if (item && (item.name === 'golden_apple' || item.name === 'enchanted_golden_apple')) {
+                emergencyGapple = item;
+                break;
+            }
+        }
+    }
+
+    if (!emergencyGapple && food >= 18) {
         state.foodMissingLogged = false;
         return;
     }
 
-    const foodItem = findFoodItem(bot);
+    const foodItem = emergencyGapple || findFoodItem(bot);
 
     if (!foodItem) {
         if (!state.foodMissingLogged) {
@@ -2280,6 +2855,7 @@ function clearBotSchedulerTimer(state) {
     }
 }
 
+
 function startBackgroundManagers(state, bot) {
     clearManagerTimers(state);
 
@@ -2730,6 +3306,10 @@ function confirmAfkAfterClick(state, bot) {
 
         addLog(state, '[FLOW] Xác nhận tọa độ sau click: đã rời LOGIN/LOBBY.');
         addLog(state, '✅ Đã xác nhận trạng thái AFK.');
+
+        // Kích hoạt Anti-AFK Kick & Tối ưu Farm
+        startSmartAntiAfk(state);
+        applyHighDensityFarmOptimizations(state, bot);
         return;
     }
 
@@ -3139,6 +3719,7 @@ function getBotDimension(state) {
 }
 
 function publicBotState(state) {
+    const mem = process.memoryUsage();
     return {
         id: state.id,
         botId: BOT_ID,
@@ -3148,6 +3729,10 @@ function publicBotState(state) {
         status: state.status,
         ready: state.ready,
         ping: getPing(state),
+        rssMb: Math.round(mem.rss / (1024 * 1024)),
+        heapMb: Math.round(mem.heapUsed / (1024 * 1024)),
+        ramRss: Math.round(mem.rss / (1024 * 1024)),
+        ramHeap: Math.round(mem.heapUsed / (1024 * 1024)),
         host: currentHost(state),
         port: PORT,
 
@@ -3187,8 +3772,15 @@ function publicBotState(state) {
         settings: {
             autoTotem: state.settings.autoTotem !== false,
             antiHungry: state.settings.antiHungry !== false,
-            autoReconnect: state.settings.autoReconnect !== false
+            autoReconnect: state.settings.autoReconnect !== false,
+            antiAfkKick: state.settings.antiAfkKick !== false
         },
+
+        totemCount:
+            Number(state.inventoryState?.totemCount || 0),
+
+        foodCount:
+            Number(state.inventoryState?.foodCount || 0),
 
         autoChatScheduleCount:
             state.autoChatSchedules.length,
@@ -3203,7 +3795,19 @@ function publicBotState(state) {
             getBotPosition(state),
 
         dimension:
-            getBotDimension(state)
+            getBotDimension(state),
+
+        ramRss: Math.round(mem.rss / (1024 * 1024)),
+        ramHeap: Math.round(mem.heapUsed / (1024 * 1024)),
+        rssMb: Math.round(mem.rss / (1024 * 1024)),
+        heapMb: Math.round(mem.heapUsed / (1024 * 1024)),
+
+        memory: {
+            rss: Math.round(mem.rss / (1024 * 1024)),
+            heapUsed: Math.round(mem.heapUsed / (1024 * 1024)),
+            rssMb: Math.round(mem.rss / (1024 * 1024)),
+            heapMb: Math.round(mem.heapUsed / (1024 * 1024))
+        }
     };
 }
 
@@ -3231,12 +3835,17 @@ function getReconnectDelay(state) {
             5
         );
 
+    const jitter = Math.floor(Math.random() * 1500);
     return Math.min(
         Math.round(
             RECONNECT_DELAY * multiplier
-        ),
-        15000
+        ) + jitter,
+        20000
     );
+}
+
+function scheduleAutoReconnect(state) {
+    return scheduleReconnect(state);
 }
 
 function scheduleReconnect(state) {
@@ -3421,6 +4030,37 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
         );
     });
 
+    // ⚡ INSTANT TOTEM REFLEX (< 50ms)
+    bot.on('entityHurt', (entity) => {
+        if (state.bot !== bot) return;
+        if (entity === bot.entity) fastEquipTotem(state);
+    });
+
+    // ⚡ Phản xạ tức thì khi Totem phát nổ (Minecraft status 35 = Totem used)
+    bot.on('entityStatus', (entity, status) => {
+        if (state.bot !== bot) return;
+        if (entity === bot.entity && status === 35) {
+            addLog(state, '⚡ [TOTEM] Totem vừa phát nổ cứu mạng! Đang tức tốc lắp Totem mới vào tay phụ...');
+            fastEquipTotem(state);
+            sendBotDirectAlert('totem_popped', 'Totem vừa phát nổ cứu mạng bot!', { 'Máu hiện tại': bot.health, 'Totem còn lại': state.totemCount });
+        }
+    });
+
+    bot.on('health', () => {
+        if (state.bot !== bot) return;
+        if (bot.health <= 6 && !state.lowHealthAlertSent) {
+            state.lowHealthAlertSent = true;
+            sendBotDirectAlert('low_health', `Máu của Bot đang ở mức nguy hiểm (${bot.health}/20 HP)!`, { 'Máu': bot.health, 'Đói': bot.food });
+        } else if (bot.health > 14) {
+            state.lowHealthAlertSent = false;
+        }
+    });
+
+    bot.on('playerCollect', () => {
+        if (state.bot !== bot) return;
+        scanInventory(state, bot);
+    });
+
     bot.on('error', err => {
         if (
             state.bot !== bot ||
@@ -3429,10 +4069,34 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
             return;
         }
 
+        const msg = String(err?.message || err || 'Lỗi không xác định');
+        const code = String(err?.code || '');
+        let diag = msg;
+        if (code === 'ECONNRESET' || msg.includes('ECONNRESET')) {
+            diag = 'Máy chủ KingMC ngắt kết nối đột ngột (ECONNRESET)';
+        } else if (code === 'ETIMEDOUT' || msg.includes('ETIMEDOUT')) {
+            diag = 'Hết thời gian chờ kết nối máy chủ (ETIMEDOUT)';
+        } else if (code === 'ENOTFOUND' || msg.includes('ENOTFOUND')) {
+            diag = 'Không tìm thấy máy chủ sgp.kingmc.vn (ENOTFOUND)';
+        } else if (code === 'EPIPE' || msg.includes('EPIPE')) {
+            diag = 'Mất kết nối đường truyền socket (EPIPE)';
+        } else if (code === 'ECONNREFUSED' || msg.includes('ECONNREFUSED')) {
+            diag = 'Máy chủ từ chối kết nối (Server offline hoặc khởi động lại)';
+        }
+
         addLog(
             state,
-            `Lỗi kết nối: ${err.message}`
+            `[MẠNG] ${diag}`
         );
+
+        const isSocketError = ['ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EPIPE', 'ECONNREFUSED'].some(c => code === c || msg.includes(c));
+        if (isSocketError) {
+            cleanupBotResources(bot);
+        }
+
+        if (state.settings.autoReconnect && !state.reconnectTimer) {
+            scheduleReconnect(state);
+        }
     });
 
     bot.on('kicked', reason => {
@@ -3448,10 +4112,15 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
                 ? reason
                 : JSON.stringify(reason);
 
+        sendBotDirectAlert('kicked', 'Bot đã bị kick khỏi server KingMC.', { 'Lý do': reasonText });
+
         setBotStatus(state, 'kicked');
         state.ready = false;
         clearManagerTimers(state);
         clearLocationTimers(state);
+        clearAfkTimers(state);
+        invalidateInventoryAction(state);
+        cleanupBotResources(bot);
 
         addLog(
             state,
@@ -3535,6 +4204,7 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
         );
 
         startLocationMonitor(state, bot);
+        sendBotDirectAlert('spawn', 'Bot đã spawn thành công vào server KingMC.');
     });
 
     bot.on('death', () => {
@@ -3542,10 +4212,32 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
             state.bot === bot &&
             state.connectionGeneration === connectionGeneration
         ) {
+            sendBotDirectAlert('death', 'Bot đã chết trong game. Đang chuẩn bị tự động hồi sinh...');
             addLog(
                 state,
-                '[LIFE] Bot đã chết.'
+                '[LIFE] Bot đã chết. Đang chuẩn bị tự động hồi sinh...'
             );
+            state.ready = false;
+            setBotStatus(state, 'connecting');
+            clearAfkTimers(state);
+            resetLocationFlowState(state, 'bot đã chết, chuẩn bị hồi sinh');
+
+            setTimeout(() => {
+                if (
+                    state.bot === bot &&
+                    state.connectionGeneration === connectionGeneration &&
+                    !state.manuallyStopped
+                ) {
+                    try {
+                        if (typeof bot.respawn === 'function') {
+                            bot.respawn();
+                            addLog(state, '[LIFE] Đã tự động hồi sinh (respawn). Bot đang quay lại cụm đăng nhập/Lobby...');
+                        }
+                    } catch (e) {
+                        addLog(state, `[LIFE] Lỗi khi tự động hồi sinh: ${e.message}`);
+                    }
+                }
+            }, 2000);
         }
     });
 
@@ -3620,6 +4312,15 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
 
 function connectBot(state) {
     if (state.shuttingDown || state.manuallyStopped) {
+        return;
+    }
+
+    if (!state.username || !state.username.trim()) {
+        setBotStatus(state, 'offline');
+        addLog(
+            state,
+            '[CẢNH BÁO] Chưa cấu hình USERNAME. Vui lòng nhập thông tin tài khoản trên Web hoặc cấu hình BOT_CONFIG trong file bot.js.'
+        );
         return;
     }
 
@@ -3985,528 +4686,1148 @@ const HTML = String.raw`<!doctype html>
 <title>KingMC Bot Manager</title>
 
 <style>
-:root{
-  color-scheme:dark;
-  --bg:#0a0e13;
-  --card:#111820;
-  --card2:#151f29;
-  --border:#273442;
-  --text:#eef4f8;
-  --muted:#95a3b2;
-  --green:#30d158;
-  --red:#ff453a;
-  --yellow:#ffd60a;
-  --blue:#4da3ff;
+:root {
+  color-scheme: dark;
+  --bg: #070a0f;
+  --bg-gradient: radial-gradient(circle at 14% 16%, rgba(26, 42, 66, 0.75) 0%, transparent 45%),
+                 radial-gradient(circle at 86% 84%, rgba(32, 22, 58, 0.65) 0%, transparent 50%),
+                 radial-gradient(circle at 50% 50%, rgba(13, 21, 33, 0.9) 0%, #070a0f 100%);
+  --card: rgba(15, 23, 34, 0.82);
+  --card-hover: rgba(21, 33, 49, 0.92);
+  --card2: rgba(11, 17, 26, 0.7);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-glow: rgba(77, 163, 255, 0.45);
+  --text: #f0f6fc;
+  --muted: #8b9bb4;
+  --green: #30d158;
+  --green-glow: rgba(48, 209, 88, 0.35);
+  --red: #ff453a;
+  --red-glow: rgba(255, 69, 58, 0.35);
+  --yellow: #ffd60a;
+  --yellow-glow: rgba(255, 214, 10, 0.35);
+  --blue: #4da3ff;
+  --blue-glow: rgba(77, 163, 255, 0.35);
+  --accent: #58a6ff;
+  --gold: #f59e0b;
 }
 
-*{
-  box-sizing:border-box
+* {
+  box-sizing: border-box;
 }
 
-body{
-  margin:0;
-  min-height:100vh;
-  background:var(--bg);
-  color:var(--text);
-  font-family:
-    system-ui,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg-gradient);
+  background-attachment: fixed;
+  color: var(--text);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
 }
 
-button,
-input{
-  font:inherit
+h1, h2, h3, p, label {
+  margin: 0;
 }
 
-button{
-  border:1px solid var(--border);
-  transition:background .15s ease,border-color .15s ease,transform .05s ease;
-  border-radius:10px;
-  background:#1a2530;
-  color:var(--text);
-  padding:9px 13px;
-  cursor:pointer
+button, input, select, textarea {
+  font: inherit;
 }
 
-button:hover:not(:disabled){
-  background:#22313f
+button {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: linear-gradient(180deg, #1c2734 0%, #151e28 100%);
+  color: var(--text);
+  padding: 9px 14px;
+  cursor: pointer;
+  font-weight: 600;
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.25);
+  user-select: none;
 }
 
-button:active:not(:disabled){
-  transform:translateY(1px)
+button:hover, button:hover:not(:disabled) {
+  background: linear-gradient(180deg, #253444 0%, #1a2734 100%);
+  border-color: rgba(255, 255, 255, 0.2);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
 }
 
-button:focus-visible,
-input:focus-visible{
-  outline:2px solid #4da3ff;
-  outline-offset:2px
+button:active, button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+button:focus-visible, input:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
 }
 
-button.primary{
-  background:#1769aa;
-  border-color:#2588d2
+button.primary {
+  background: linear-gradient(180deg, #1f7ae0 0%, #1562b8 100%);
+  border-color: #388bfd;
+  box-shadow: 0 2px 8px rgba(31, 122, 224, 0.35);
 }
 
-button.danger{
-  background:#3a1717;
-  border-color:#682525
+button.primary:hover, button.primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, #2b88f0 0%, #1a6fcf 100%);
+  box-shadow: 0 4px 15px rgba(31, 122, 224, 0.5);
 }
 
-button:disabled{
-  opacity:.45;
-  cursor:not-allowed
+button.danger {
+  background: linear-gradient(180deg, #a8282b 0%, #7d1b1d 100%);
+  border-color: #da3633;
+  box-shadow: 0 2px 8px rgba(218, 54, 51, 0.35);
 }
+
+button.danger:hover, button.danger:hover:not(:disabled) {
+  background: linear-gradient(180deg, #c43236 0%, #912022 100%);
+  box-shadow: 0 4px 15px rgba(218, 54, 51, 0.5);
+}
 
-input{
-  width:100%;
-  padding:11px 12px;
-  border-radius:10px;
-  border:1px solid var(--border);
-  background:#0d1319;
-  color:var(--text);
-  outline:none
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none !important;
+}
+
+input, select, textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(10, 16, 24, 0.7);
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+input:focus, select:focus, textarea:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(77, 163, 255, 0.2);
 }
 
-input:focus{
-  border-color:#3d88c7
+.app {
+  width: min(1140px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 24px 0 48px;
+}
+
+.topbar, .header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.page-title {
+  font-size: 24px;
+  font-weight: 850;
+  letter-spacing: -0.02em;
+  margin: 0 0 4px;
+  background: linear-gradient(135deg, #ffffff 30%, #a5c2eb 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.page-subtitle {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0 0 16px;
+}
+
+/* KPI Grid */
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.kpi-card {
+  position: relative;
+  background: var(--card);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px 16px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+  overflow: hidden;
+  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.2s;
+}
+
+.kpi-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.kpi-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--blue), transparent);
+}
+.kpi-card:nth-child(2)::before { background: linear-gradient(90deg, var(--green), transparent); }
+.kpi-card:nth-child(3)::before { background: linear-gradient(90deg, var(--yellow), transparent); }
+.kpi-card:nth-child(4)::before { background: linear-gradient(90deg, var(--red), transparent); }
+.kpi-card:nth-child(5)::before { background: linear-gradient(90deg, var(--gold), transparent); }
+
+.kpi-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.kpi-value {
+  font-size: 24px;
+  font-weight: 900;
+  margin-top: 6px;
+  letter-spacing: -0.02em;
+}
+
+.top-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+  align-items: center;
+}
+
+.search-box {
+  flex: 1;
+  min-width: 230px;
+}
+
+/* Status Filter Tabs */
+.filter-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 18px;
+  flex-wrap: wrap;
+}
+
+.tab-btn {
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 650;
+  border: 1px solid var(--border);
+  background: rgba(14, 21, 31, 0.65);
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.tab-btn:hover {
+  background: rgba(25, 36, 52, 0.85);
+  color: var(--text);
+  transform: translateY(-1px);
+}
+
+.tab-btn.active {
+  background: linear-gradient(180deg, #1f7ae0 0%, #1562b8 100%);
+  color: #fff;
+  border-color: #388bfd;
+  box-shadow: 0 2px 10px rgba(31, 122, 224, 0.4);
+}
+
+/* Grids & Panels */
+.bot-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+  gap: 16px;
+}
+
+.bot-card, .panel {
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--card);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  padding: 18px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
+  transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.22s ease, box-shadow 0.22s ease;
+}
+
+.bot-card {
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+}
+
+.bot-card:hover {
+  border-color: var(--border-glow);
+  transform: translateY(-3px);
+  box-shadow: 0 12px 35px rgba(0, 0, 0, 0.45), 0 0 16px rgba(77, 163, 255, 0.12);
+}
+
+.bot-card h2 {
+  font-size: 18px;
+  margin: 0 0 14px;
+  font-weight: 750;
+}
+
+.card-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.card-quick-actions {
+  display: flex;
+  gap: 7px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.card-quick-actions button {
+  flex: 1;
+  font-size: 11px;
+  padding: 7px 8px;
+  border-radius: 8px;
+}
+
+.small {
+  font-size: 11px;
+  padding: 7px 10px;
+}
+
+/* Sound Alert Toggle Button */
+.sound-btn {
+  font-size: 11px;
+  padding: 7px 12px;
+  border-radius: 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+
+.sound-btn.active {
+  border-color: var(--green);
+  color: var(--green);
+  background: rgba(48, 209, 88, 0.12);
+  box-shadow: 0 0 8px var(--green-glow);
+}
+
+/* Capacity Badge */
+.capacity-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 750;
+  padding: 5px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+}
+
+.capacity-badge.warning {
+  border-color: var(--yellow);
+  color: var(--yellow);
+  background: rgba(255, 214, 10, 0.12);
+}
+
+.capacity-badge.danger {
+  border-color: var(--red);
+  color: var(--red);
+  background: rgba(255, 69, 58, 0.14);
+}
+
+/* Modals */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 100;
+}
+
+@keyframes modalZoomIn {
+  from { opacity: 0; transform: scale(0.93) translateY(12px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.modal-card {
+  width: min(520px, 100%);
+  background: rgba(18, 27, 40, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 18px;
+  padding: 22px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+  animation: modalZoomIn 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.modal-card h3 {
+  margin: 0 0 16px;
+  font-size: 18px;
+  font-weight: 750;
+}
+
+.form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.form-row label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+/* Pulsing Status Indicators */
+@keyframes pulseGreen {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(48, 209, 88, 0.7); }
+  50% { transform: scale(1.15); box-shadow: 0 0 12px 3px rgba(48, 209, 88, 0.4); }
+}
+
+@keyframes pulseYellow {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(255, 214, 10, 0.7); }
+  50% { transform: scale(1.15); box-shadow: 0 0 12px 3px rgba(255, 214, 10, 0.4); }
+}
+
+@keyframes pulseRed {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(255, 69, 58, 0.7); }
+  50% { transform: scale(1.15); box-shadow: 0 0 12px 3px rgba(255, 69, 58, 0.4); }
+}
+
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  margin-bottom: 12px;
 }
 
-.app{
-  width:min(
-    1080px,
-    calc(100% - 28px)
-  );
-  margin:0 auto;
-  padding:28px 0 42px
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+  background: #697582;
+  transition: all 0.25s ease;
 }
 
-h1,
-h2,
-h3,
-p{
-  margin:0
+.dot.green {
+  background: var(--green);
+  animation: pulseGreen 2.2s infinite ease-in-out;
 }
 
-.topbar{
-  display:flex;
-  align-items:center;
-  gap:12px;
-  margin-bottom:18px
+.dot.yellow {
+  background: var(--yellow);
+  animation: pulseYellow 2s infinite ease-in-out;
 }
 
-.detail-title{
-  font-size:22px;
-  font-weight:750
+.dot.red {
+  background: var(--red);
+  animation: pulseRed 2.5s infinite ease-in-out;
 }
 
-.detail-subtitle{
-  color:var(--muted);
-  font-size:12px;
-  margin-top:3px
+.dot.blue {
+  background: var(--blue);
 }
 
-.grid{
-  display:grid;
-  grid-template-columns:
-    1.1fr .9fr;
-  gap:16px
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
 }
 
-.panel{
-  border:1px solid var(--border);
-  border-radius:16px;
-  background:var(--card);
-  padding:17px
+.summary-item {
+  padding: 9px 10px;
+  border-radius: 10px;
+  background: var(--card2);
+  min-width: 0;
+  border: 1px solid rgba(255, 255, 255, 0.04);
 }
 
-.panel h3{
-  font-size:14px;
-  margin-bottom:14px
+.summary-label {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  text-transform: uppercase;
 }
 
-.big-status{
-  display:flex;
-  align-items:center;
-  gap:8px;
-  font-size:18px;
-  font-weight:750;
-  margin-bottom:13px
+.summary-value {
+  font-size: 12px;
+  font-weight: 700;
+  word-break: break-word;
 }
 
-.info{
-  display:grid;
-  grid-template-columns:
-    repeat(
-      2,
-      minmax(0,1fr)
-    );
-  gap:9px
+/* Detail Page Layout */
+.detail-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
 }
 
-.info-item{
-  padding:10px 11px;
-  border-radius:10px;
-  background:var(--card2)
+.detail-header .title-wrap {
+  flex: 1;
 }
 
-.info-label{
-  color:var(--muted);
-  font-size:10px;
-  margin-bottom:4px
+.detail-title {
+  font-size: 24px;
+  font-weight: 850;
+  margin: 0;
 }
 
-.info-value{
-  font-size:14px;
-  word-break:break-all
+.detail-subtitle {
+  color: var(--muted);
+  font-size: 13px;
+  margin-top: 4px;
 }
 
-.controls{
-  display:flex;
-  gap:8px;
-  flex-wrap:wrap;
-  margin-top:14px
+.grid {
+  display: grid;
+  grid-template-columns: 1.15fr 0.85fr;
+  gap: 18px;
 }
 
-.form-row{
-  display:grid;
-  gap:7px;
-  margin-bottom:11px
+.panel h3 {
+  font-size: 15px;
+  font-weight: 750;
+  margin: 0 0 14px;
+  letter-spacing: -0.01em;
 }
 
-label{
-  color:var(--muted);
-  font-size:12px
+.big-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 18px;
+  font-weight: 800;
+  margin-bottom: 14px;
 }
 
-.chat-row{
-  display:flex;
-  gap:8px
+.info {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
 }
 
-.log{
-  height:380px;
-  overflow:auto;
-  background:#080b0f;
-  border:1px solid var(--border);
-  border-radius:10px;
-  padding:10px;
-  font:
-    12px/1.55
-    ui-monospace,
-    SFMono-Regular,
-    Consolas,
-    monospace;
-  white-space:pre-wrap;
-  word-break:break-word
+.info-item {
+  padding: 10px 12px;
+  border-radius: 11px;
+  background: var(--card2);
+  border: 1px solid rgba(255, 255, 255, 0.04);
 }
 
-.line{
-  padding:2px 0
+.info-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  text-transform: uppercase;
 }
 
-.note{
-  margin-top:8px;
-  color:var(--muted);
-  font-size:12px;
-  line-height:1.45
+.info-value {
+  font-size: 14px;
+  font-weight: 700;
+  word-break: break-word;
 }
 
-.toast{
-  position:fixed;
-  right:14px;
-  bottom:14px;
-  display:none;
-  max-width:340px;
-  padding:11px 13px;
-  border:1px solid var(--border);
-  border-radius:10px;
-  background:#18222d;
-  z-index:20
+.controls {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 14px;
 }
 
-.dot{
-  width:9px;
-  height:9px;
-  border-radius:50%;
-  display:inline-block;
-  background:#697582
+.chat-panel {
+  display: flex;
+  flex-direction: column;
 }
 
-.dot.green{
-  background:var(--green)
+.chat-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
 }
 
-.dot.red{
-  background:var(--red)
+.chat-row {
+  display: flex;
+  gap: 8px;
 }
 
-.dot.yellow{
-  background:var(--yellow)
+.chat-form {
+  margin-top: 10px;
 }
 
-.dot.blue{
-  background:var(--blue)
+.chip-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 8px;
 }
 
-.inventory-grid{
-   display:grid;
-   grid-template-columns:repeat(2,minmax(0,1fr));
-   gap:9px;
-   margin-bottom:13px
+.chip {
+  padding: 5px 11px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--text);
+  cursor: pointer;
+  transition: all 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+  user-select: none;
 }
 
-.inventory-stat{
-   padding:10px 11px;
-   border-radius:10px;
-   background:var(--card2)
+.chip:hover {
+  background: rgba(77, 163, 255, 0.22);
+  border-color: var(--blue);
+  color: #fff;
+  transform: translateY(-1px);
+  box-shadow: 0 0 10px var(--blue-glow);
 }
 
-.inventory-stat .info-label{
-   margin-bottom:4px
+.chip:active {
+  transform: scale(0.95);
 }
 
-.inventory-stat .info-value{
-   font-size:14px
+.copyable {
+  cursor: pointer;
+  transition: all 0.18s ease;
 }
 
-.bar{
-   width:100%;
-   height:9px;
-   border-radius:999px;
-   background:#26313b;
-   overflow:hidden;
-   margin-top:6px
+.copyable:hover {
+  border-color: var(--blue);
+  background: rgba(77, 163, 255, 0.08);
+  box-shadow: 0 0 8px var(--blue-glow);
 }
 
-.bar > span{
-   display:block;
-   height:100%;
-   width:0%;
-   transition:width .2s ease
+.log, .chat-log {
+  height: 440px;
+  overflow: auto;
+  background: rgba(8, 12, 17, 0.95);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  padding: 12px;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.5);
 }
 
-.health-bar > span{
-   background:var(--red)
+.line {
+  padding: 2px 0;
 }
 
-.hunger-bar > span{
-   background:var(--yellow)
+.note {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
-.equipment-row{
-   display:grid;
-   grid-template-columns:repeat(5,minmax(0,1fr));
-   gap:7px;
-   margin-bottom:12px
+@keyframes toastSlideIn {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
-.equipment-slot{
-   min-width:0;
-   min-height:70px;
-   border:1px solid var(--border);
-   border-radius:9px;
-   background:#0d1319;
-   display:flex;
-   flex-direction:column;
-   align-items:center;
-   justify-content:center;
-   text-align:center;
-   padding:6px;
-   cursor:pointer
+.toast {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  display: none;
+  max-width: 380px;
+  padding: 12px 16px;
+  border: 1px solid var(--border-glow);
+  border-radius: 12px;
+  background: rgba(22, 33, 48, 0.95);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  z-index: 200;
+  font-size: 13px;
+  font-weight: 600;
+  animation: toastSlideIn 0.22s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-.equipment-slot.dragover,
-.inventory-slot.dragover{
-   border-color:var(--blue);
-   box-shadow:0 0 0 1px var(--blue) inset
+/* Inventory Styles */
+.inventory-area {
+  display: flex;
+  flex-direction: column;
 }
 
-.equipment-slot .equip-label{
-   color:var(--muted);
-   font-size:9px;
-   margin-bottom:4px
+.inventory-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
 }
 
-.inventory-area{
-   margin-top:12px
+.inventory-stat {
+  padding: 10px 12px;
+  border-radius: 11px;
+  background: var(--card2);
+  border: 1px solid rgba(255, 255, 255, 0.04);
 }
 
-.slot-grid{
-   display:grid;
-   grid-template-columns:repeat(9,minmax(0,1fr));
-   gap:5px
+.inventory-stat .info-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  text-transform: uppercase;
 }
 
-.inventory-slot{
-   min-width:0;
-   min-height:55px;
-   padding:5px 4px;
-   border:1px solid var(--border);
-   border-radius:8px;
-   background:#0d1319;
-   display:flex;
-   flex-direction:column;
-   align-items:center;
-   justify-content:center;
-   text-align:center;
-   overflow:hidden;
-   cursor:grab;
-   user-select:none
+.inventory-stat .info-value {
+  font-size: 14px;
+  font-weight: 700;
 }
 
-.inventory-slot:active{
-   cursor:grabbing
+.bar {
+  width: 100%;
+  height: 9px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+  margin-top: 6px;
 }
 
-.inventory-slot.selected{
-   border-color:var(--green);
-   box-shadow:0 0 0 1px var(--green) inset
+.bar > span, .bar>span {
+  display: block;
+  height: 100%;
+  width: 0;
+  transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-.inventory-slot.empty{
-   opacity:.7
+.health-bar > span, .health-bar>span {
+  background: linear-gradient(90deg, #ff453a, #ff6961);
+  box-shadow: 0 0 10px rgba(255, 69, 58, 0.5);
 }
 
-.slot-index{
-   color:var(--muted);
-   font-size:9px;
-   margin-bottom:3px
+.hunger-bar > span, .hunger-bar>span {
+  background: linear-gradient(90deg, #e69d00, #ffd60a);
+  box-shadow: 0 0 10px rgba(255, 214, 10, 0.5);
 }
 
-.slot-name{
-   font-size:9px;
-   line-height:1.2;
-   word-break:break-word
+.equipment-row {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(60px, 1fr));
+  gap: 8px;
+  margin: 8px 0 14px;
 }
 
-.slot-count{
-   font-size:10px;
-   margin-top:3px
+.equipment-slot {
+  min-height: 64px;
+  padding: 8px 4px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(11, 17, 24, 0.85);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.4);
+  text-align: center;
+  font-size: 10px;
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-.inventory-list{
-   display:grid;
-   gap:5px;
-   max-height:180px;
-   overflow:auto;
-   margin-top:9px
+.equipment-slot .equip-label, .equip-label {
+  font-size: 8px;
+  color: var(--muted);
+  font-weight: 700;
+  text-transform: uppercase;
+  margin-bottom: 5px;
 }
 
-.inventory-item-row{
-   display:flex;
-   align-items:center;
-   justify-content:space-between;
-   gap:10px;
-   padding:7px 9px;
-   border-radius:8px;
-   background:var(--card2);
-   font-size:11px
+.equipment-slot.dragover {
+  border-color: var(--green);
+  background: rgba(16, 35, 24, 0.9);
+  box-shadow: 0 0 12px var(--green-glow);
 }
 
-.inventory-item-name{
-   min-width:0;
-   overflow:hidden;
-   text-overflow:ellipsis;
-   white-space:nowrap
+.slot-grid {
+  display: grid;
+  grid-template-columns: repeat(9, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 10px;
 }
 
-.chat-panel{
-   display:flex;
-   flex-direction:column
+.inventory-slot {
+  min-width: 0;
+  min-height: 60px;
+  padding: 6px 4px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: rgba(11, 17, 24, 0.85);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  cursor: pointer;
+  overflow: hidden;
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  user-select: none;
 }
 
-.chat-log{
-   height:310px
+.inventory-slot:hover {
+  border-color: var(--blue);
+  transform: translateY(-2px);
+  box-shadow: 0 5px 12px rgba(0, 0, 0, 0.4), inset 0 1px 3px rgba(255, 255, 255, 0.08);
 }
 
-.chat-form{
-   margin-top:10px
+.inventory-slot:active, .inventory-slot.active {
+  transform: scale(0.96);
 }
 
-.chat-title-row{
-   display:flex;
-   justify-content:space-between;
-   align-items:center;
-   gap:8px
+.inventory-slot.empty {
+  opacity: 0.6;
 }
 
-.revision{
-   color:var(--muted);
-   font-size:10px
+.inventory-slot.selected {
+  border-color: var(--green);
+  box-shadow: 0 0 12px var(--green-glow), inset 0 0 6px rgba(48, 209, 88, 0.3);
+  background: rgba(16, 33, 23, 0.85);
 }
 
-.drop-zone{
-   margin-top:12px;
-   min-height:48px;
-   border:1px dashed var(--border);
-   border-radius:10px;
-   background:#0d1319;
-   color:var(--muted);
-   display:flex;
-   align-items:center;
-   justify-content:center;
-   text-align:center;
-   padding:10px;
-   transition:
-      border-color .15s ease,
-      background .15s ease
+.inventory-slot.dragover, .inventory-slot.selected.dragover {
+  border-color: var(--blue);
+  background: rgba(18, 38, 58, 0.85);
+  box-shadow: 0 0 12px var(--blue-glow);
 }
 
-.drop-zone.dragover{
-   border-color:var(--red);
-   background:#241416;
-   color:var(--text)
+.slot-index {
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 600;
+  margin-bottom: 3px;
 }
 
-.position-value{
-   font-variant-numeric:tabular-nums
+.slot-name {
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1.2;
+  word-break: break-word;
 }
 
+.slot-count {
+  font-size: 10px;
+  font-weight: 800;
+  margin-top: 3px;
+  color: #fff;
+}
+
+.drop-zone {
+  margin-top: 14px;
+  min-height: 50px;
+  border: 2px dashed rgba(255, 255, 255, 0.15);
+  border-radius: 11px;
+  background: rgba(11, 17, 24, 0.5);
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  transition: all 0.2s;
+}
+
+.drop-zone.dragover {
+  border-color: var(--red);
+  background: rgba(45, 18, 20, 0.8);
+  color: var(--text);
+  box-shadow: 0 0 14px var(--red-glow);
+}
+
+.position-value, .revision {
+  font-variant-numeric: tabular-nums;
+}
+
+.inventory-list {
+  display: grid;
+  gap: 6px;
+}
+
+.inventory-item-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--card2);
+}
+
+.inventory-item-name {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* Settings & Schedules */
+.setting-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.18s, border-color 0.18s;
+}
+
+.check-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+.check-row input {
+  width: auto;
+  accent-color: var(--blue);
+  cursor: pointer;
+}
+
+.schedule-list {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.schedule-row {
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 11px;
+  background: linear-gradient(180deg, rgba(21, 31, 41, 0.85) 0%, rgba(17, 26, 34, 0.85) 100%);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  transition: border-color 0.18s, opacity 0.18s, transform 0.18s;
+}
+
+.schedule-row:hover {
+  border-color: rgba(77, 163, 255, 0.45);
+}
+
+.schedule-row.dragging {
+  opacity: 0.5;
+  transform: scale(0.98);
+}
+
+.schedule-row-top {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.schedule-handle {
+  width: 26px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  cursor: grab;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.03);
+  user-select: none;
+}
+
+.schedule-handle:active {
+  cursor: grabbing;
+}
+
+.schedule-row-title {
+  font-size: 12px;
+  font-weight: 800;
+  min-width: 0;
+}
+
+.schedule-inline {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.schedule-inline input, .schedule-inline select {
+  padding: 7px 9px;
+  border-radius: 8px;
+  font-size: 11px;
+  min-width: 0;
+}
+
+.schedule-inline .action-select { width: 94px; }
+.schedule-inline .time-input { width: 90px; }
+.schedule-inline .minutes-input { width: 106px; }
+
+.schedule-row-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: end;
+  margin-top: 8px;
+}
+
+.schedule-row-main textarea {
+  width: 100%;
+  min-height: 52px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  font-size: 12px;
+  resize: vertical;
+}
+
+.schedule-row-main .schedule-field, .schedule-field { display: grid; gap: 4px; }
+.schedule-row-main .schedule-field > span, .schedule-row-main .schedule-field>span, .schedule-field > span, .schedule-field>span { color: var(--muted); font-size: 10px; font-weight: 600; }
+.schedule-meta { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; color: var(--muted); font-size: 10px; }
+
+.scheduler-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 10px 0 8px;
+}
+
+.scheduler-mode-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 220px;
+}
 
-.setting-list{display:grid;gap:9px;margin-bottom:12px}
-.check-row{display:flex;align-items:center;gap:9px;padding:9px 10px;border-radius:10px;background:var(--card2);font-size:12px;cursor:pointer}
-.check-row input{width:auto;accent-color:var(--blue)}
-.schedule-list{display:grid;gap:7px;margin:10px 0}
-.schedule-row{padding:8px 9px;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:linear-gradient(180deg,#151f29,#111a22);box-shadow:0 4px 14px rgba(0,0,0,.12);transition:border-color .15s,opacity .15s}
-.schedule-row:hover{border-color:rgba(77,163,255,.42)}
-.schedule-row.dragging{opacity:.5}
-.schedule-row-top{display:grid;grid-template-columns:24px minmax(0,1fr) auto auto;gap:7px;align-items:center}
-.schedule-handle{width:24px;height:28px;display:flex;align-items:center;justify-content:center;color:var(--muted);cursor:grab;border:1px solid rgba(255,255,255,.06);border-radius:7px;background:rgba(255,255,255,.025);user-select:none}
-.schedule-handle:active{cursor:grabbing}
-.schedule-row-title{font-size:11px;font-weight:800;min-width:0}
-.schedule-inline{display:flex;gap:6px;align-items:center;min-width:0}
-.schedule-inline input,.schedule-inline select{padding:7px 8px;border-radius:8px;font-size:11px;min-width:0}
-.schedule-inline .action-select{width:92px}.schedule-inline .time-input{width:88px}.schedule-inline .minutes-input{width:104px}
-.schedule-row-main{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;align-items:end;margin-top:7px}
-.schedule-row-main textarea{width:100%;min-height:52px;padding:7px 8px;border-radius:8px;font-size:11px;resize:vertical}
-.schedule-row-main .schedule-field{display:grid;gap:4px}
-.schedule-row-main .schedule-field>span,.schedule-field>span{color:var(--muted);font-size:9px}
-.schedule-meta{display:flex;gap:6px;flex-wrap:wrap;align-items:center;color:var(--muted);font-size:9px}
-.scheduler-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin:9px 0 7px}
-.scheduler-mode-box{display:flex;align-items:center;gap:7px;min-width:220px}
-.scheduler-mode-box>span{color:var(--muted);font-size:9px}
-.scheduler-mode-box select{padding:8px 9px;border-radius:8px;font-size:11px}
-.scheduler-note{margin:5px 0 8px;color:var(--muted);font-size:9px;line-height:1.45}
-.compact-save{margin-top:7px}
-.app-footer{margin-top:18px;text-align:center;color:var(--muted);font-size:10px;line-height:1.5;opacity:.9}
-.hidden-field{display:none!important}
-@media(max-width:520px){
-   .inventory-grid{
-     grid-template-columns:1fr
-   }
+.scheduler-mode-box > span, .scheduler-mode-box>span { color: var(--muted); font-size: 11px; font-weight: 600; }
+.scheduler-mode-box select { padding: 8px 10px; border-radius: 9px; font-size: 12px; }
+.scheduler-note { margin: 6px 0 10px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.compact-save { margin-top: 8px; }
+.hidden-field { display: none !important; }
+
+.credential-list {
+  display: grid;
+  gap: 10px;
+  max-height: 60vh;
+  overflow: auto;
+}
+
+.credential-card {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--card2);
+}
+
+.credential-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.credential-value {
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(10, 16, 24, 0.85);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  word-break: break-all;
+  font-size: 12px;
+}
+
+.dragging { opacity: 0.55; }
+.app-footer {
+  margin-top: 24px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+  opacity: 0.85;
+}
+
+.hidden { display: none !important; }
+
+/* Custom Scrollbars */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: rgba(0, 0, 0, 0.2); border-radius: 4px; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.16); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.3); }
+
+@media (max-width: 900px) {
+  .bot-grid { grid-template-columns: 1fr; }
+  .grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 520px) {
+  .info, .inventory-grid { grid-template-columns: 1fr; }
+  .equipment-row { grid-template-columns: repeat(5, minmax(48px, 1fr)); }
+}
+
+.vip-pill {
+  font-size: 11px;
+  font-weight: 800;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.22) 0%, rgba(217, 119, 6, 0.3) 100%);
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  color: #fbbf24;
+  letter-spacing: 0.05em;
+  box-shadow: 0 0 12px rgba(245, 158, 11, 0.2);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
 
-   .equipment-row{
-     grid-template-columns:repeat(5,minmax(48px,1fr))
-   }
+.platform-pill {
+  font-size: 11px;
+  font-weight: 750;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(6, 182, 212, 0.15);
+  border: 1px solid rgba(6, 182, 212, 0.4);
+  color: #38bdf8;
+  letter-spacing: 0.04em;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
 }
 
-@media(max-width:820px){
-  .grid{
-    grid-template-columns:1fr
-  }
+.ram-pill {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  color: #34d399;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
 }
 </style>
 </head>
@@ -4531,9 +5852,16 @@ label{
       <div
         class="detail-subtitle"
       >
-        Quản lý và theo dõi bot
+        Quản lý và theo dõi bot • Siêu VIP Edition
       </div>
 
+    </div>
+
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      <span class="vip-pill">👑 PRO V7</span>
+      <span class="platform-pill">⚡ ${PLATFORM.toUpperCase()}</span>
+      <span class="ram-pill">🧠 RAM: <strong id="topRamUsage">-- MB</strong></span>
+      <button id="soundAlertBtn" class="small sound-btn" type="button" onclick="toggleSoundAlert()">🔕 Âm thanh: TẮT</button>
     </div>
 
   </div>
@@ -4551,9 +5879,9 @@ label{
 
       <div class="info">
 
-        <div class="info-item">
+        <div class="info-item copyable" onclick="copyToClipboard(bot?.username, 'Username')" title="Click để copy Username">
           <div class="info-label">
-            USERNAME
+            USERNAME 📋
           </div>
 
           <div
@@ -4616,9 +5944,9 @@ label{
           </div>
         </div>
 
-        <div class="info-item">
+        <div class="info-item copyable" onclick="copyToClipboard(byId('detailPosition')?.textContent, 'Tọa độ')" title="Click để copy Tọa độ">
           <div class="info-label">
-            COORDINATES
+            COORDINATES 📋
           </div>
 
           <div
@@ -4642,9 +5970,9 @@ label{
           </div>
         </div>
 
-        <div class="info-item">
+        <div class="info-item copyable" onclick="copyToClipboard(bot?.ipAddress, 'IP')" title="Click để copy IP">
           <div class="info-label">
-            BOT IP
+            BOT IP 📋
           </div>
 
           <div
@@ -4708,7 +6036,7 @@ label{
         <input
           id="messageInput"
           autocomplete="off"
-          placeholder="Nhập chat hoặc command..."
+          placeholder="Nhập chat hoặc command... (↑↓ lịch sử)"
         >
 
         <button
@@ -4720,8 +6048,18 @@ label{
 
       </form>
 
+      <div class="chip-row">
+        <button type="button" class="chip" onclick="quickSendCommand('/menu')">⚡ /menu (Slot 24)</button>
+        <button type="button" class="chip" onclick="quickSendCommand('/dn')">🔑 /dn [MK]</button>
+        <button type="button" class="chip" onclick="quickSendCommand('/login')">🔓 /login [MK]</button>
+        <button type="button" class="chip" onclick="quickSendCommand('/bal')">💵 /bal</button>
+        <button type="button" class="chip" onclick="quickSendCommand('/team chat')">🛡️ /team chat</button>
+        <button type="button" class="chip" onclick="quickSendCommand('/spawn')">🏠 /spawn</button>
+        <button type="button" class="chip" onclick="quickSendCommand('/pay')">💰 /pay</button>
+      </div>
+
       <div class="note">
-        Tin nhắn Minecraft và tin gửi từ web được tách riêng khỏi Event Log.
+        Bấm chip để gửi nhanh. Dùng phím ↑ ↓ trong ô nhập để xem lại các lệnh đã gửi.
       </div>
 
     </div>
@@ -4732,6 +6070,7 @@ label{
         <h3>Event Log</h3>
         <div style="display:flex;align-items:center;gap:7px;">
           <div id="eventRevision" class="revision">revision 0</div>
+          <button class="small" type="button" onclick="exportLogsToFile()">📥 Tải Log</button>
           <button class="small danger" type="button" onclick="clearEventHistory()">Xóa lịch sử</button>
         </div>
       </div>
@@ -4747,7 +6086,10 @@ label{
 
       <div class="chat-title-row">
         <h3>Inventory Manager</h3>
-        <div id="inventoryRevision" class="revision">revision 0</div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span id="inventoryCapacity" class="capacity-badge">0/36 ô (0%)</span>
+          <div id="inventoryRevision" class="revision">revision 0</div>
+        </div>
       </div>
 
       <div class="inventory-grid">
@@ -4894,9 +6236,10 @@ label{
       </div>
 
       <div class="setting-list">
-        <label class="check-row"><input id="settingAutoTotem" type="checkbox"> <span>Auto Totem</span></label>
-        <label class="check-row"><input id="settingAntiHungry" type="checkbox"> <span>Anti Hungry / Auto Eat</span></label>
-        <label class="check-row"><input id="settingAutoReconnect" type="checkbox"> <span>Auto Reconnect + tự thử lại LOGIN/DN/MENU</span></label>
+        <label class="check-row"><input id="settingAutoTotem" type="checkbox" onchange="markSettingsDirty()"> <span>Auto Totem phản xạ tức thì (&lt; 50ms)</span></label>
+        <label class="check-row"><input id="settingAntiHungry" type="checkbox" onchange="markSettingsDirty()"> <span>Anti Hungry / Auto Eat</span></label>
+        <label class="check-row"><input id="settingAutoReconnect" type="checkbox" onchange="markSettingsDirty()"> <span>Auto Reconnect + tự thử lại LOGIN/DN/MENU</span></label>
+        <label class="check-row"><input id="settingAntiAfkKick" type="checkbox" onchange="markSettingsDirty()"> <span>Smart Anti-AFK Kick (Xoay đầu, vung tay nhẹ)</span></label>
       </div>
 
       <button id="saveSettingsButton" class="primary" type="button" onclick="saveSettings()">Lưu setting</button>
@@ -5178,6 +6521,12 @@ function renderDimensionLocation() {
 
 function renderBotState() {
   if (!bot) return;
+  if (lastKnownBotStatus && lastKnownBotStatus !== bot.status) {
+    if (bot.status === 'offline' || bot.status === 'kicked') {
+      playAlertTone('danger');
+    }
+  }
+  lastKnownBotStatus = bot.status;
 
   const statusInfo = statusMeta(bot.status, bot.available !== false);
   const status = byId('detailStatus');
@@ -5224,20 +6573,33 @@ function renderBotState() {
   const ip = byId('detailIp');
   if (ip) ip.textContent = bot.ipAddress || '-';
 
+  const topRam = byId('topRamUsage');
+  if (topRam) {
+    const ram = bot.ramRssMb || 0;
+    topRam.textContent = ram ? (ram + ' MB') : '-- MB';
+  }
+
   renderDimensionLocation();
 }
 
 function renderPublicSettings(settingsData) {
-  if (!settingsData || !settingsData.settings) return;
+  if (!settingsData) return;
 
-  const settings = settingsData.settings;
+  // Hỗ trợ cả 2 dạng: { settings: { ... } } (từ POST /api/settings)
+  // và { autoTotem: ... } trực tiếp (từ GET /api/snapshot result.data.settings)
+  const settings = (settingsData.settings && typeof settingsData.settings === 'object')
+    ? settingsData.settings
+    : (typeof settingsData === 'object' ? settingsData : {});
+
   const autoTotem = byId('settingAutoTotem');
   const antiHungry = byId('settingAntiHungry');
   const autoReconnect = byId('settingAutoReconnect');
+  const antiAfkKick = byId('settingAntiAfkKick');
 
   if (autoTotem) autoTotem.checked = settings.autoTotem !== false;
   if (antiHungry) antiHungry.checked = settings.antiHungry !== false;
   if (autoReconnect) autoReconnect.checked = settings.autoReconnect !== false;
+  if (antiAfkKick) antiAfkKick.checked = settings.antiAfkKick !== false;
 }
 
 function clampClientNumber(value, fallback, min, max) {
@@ -5598,7 +6960,8 @@ async function saveSettings() {
     settings: {
       autoTotem: !!(byId('settingAutoTotem') && byId('settingAutoTotem').checked),
       antiHungry: !!(byId('settingAntiHungry') && byId('settingAntiHungry').checked),
-      autoReconnect: !!(byId('settingAutoReconnect') && byId('settingAutoReconnect').checked)
+      autoReconnect: !!(byId('settingAutoReconnect') && byId('settingAutoReconnect').checked),
+      antiAfkKick: !!(byId('settingAntiAfkKick') && byId('settingAntiAfkKick').checked)
     }
   };
 
@@ -5796,13 +7159,56 @@ async function runBotAction(action) {
   }
 }
 
+let commandHistory = [];
+let commandHistoryIndex = -1;
+
+function copyToClipboard(text, label) {
+  if (!text || text === '-') return;
+  const clean = String(text).trim();
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(clean).then(function() {
+      showToast('Đã copy ' + (label || '') + ': ' + clean);
+    }).catch(function() {
+      fallbackCopy(clean, label);
+    });
+  } else {
+    fallbackCopy(clean, label);
+  }
+}
+
+function fallbackCopy(text, label) {
+  try {
+    const el = document.createElement('textarea');
+    el.value = text;
+    el.style.position = 'fixed';
+    el.style.opacity = '0';
+    document.body.appendChild(el);
+    el.select();
+    document.execCommand('copy');
+    document.body.removeChild(el);
+    showToast('Đã copy ' + (label || '') + ': ' + text);
+  } catch (_) {
+    showToast('Không thể copy tự động.');
+  }
+}
+
+async function quickSendCommand(cmd) {
+  const input = byId('messageInput');
+  if (input) input.value = cmd;
+  await sendMessage(new Event('submit'));
+}
+
 async function sendMessage(event) {
-  event.preventDefault();
+  if (event && event.preventDefault) event.preventDefault();
 
   const input = byId('messageInput');
   const text = input ? input.value : '';
 
   if (!text.trim()) return;
+
+  commandHistory.unshift(text.trim());
+  if (commandHistory.length > 50) commandHistory.pop();
+  commandHistoryIndex = -1;
 
   const result = await apiJson('/api/bot/send', {
     method: 'POST',
@@ -5821,6 +7227,17 @@ async function sendMessage(event) {
   if (result.ok) {
     await loadChatLogs(true);
   }
+}
+
+function exportLogsToFile() {
+  const logEl = document.getElementById('logs');
+  const text = (logEl ? logEl.innerText : '') || 'Chưa có log.';
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'kingmc-bot-log-' + new Date().toISOString().slice(0, 10) + '.txt';
+  a.click();
+  showToast('✅ Đã tải file log về máy.');
 }
 
 async function clearEventHistory() {
@@ -5962,6 +7379,17 @@ function createInventorySlot(item, slot, selected) {
 
 function renderInventory() {
   if (!inventory) return;
+  const invSlots = inventory.slots || [];
+  let usedCount = 0;
+  for (let i = 9; i <= 44; i++) {
+    if (invSlots[i]) usedCount++;
+  }
+  const capPercent = Math.round((usedCount / 36) * 100);
+  const capEl = document.getElementById('inventoryCapacity');
+  if (capEl) {
+    capEl.textContent = usedCount + '/36 ô (' + capPercent + '%)';
+    capEl.className = 'capacity-badge' + (capPercent >= 90 ? ' danger' : capPercent >= 75 ? ' warning' : '');
+  }
 
   const health = Math.max(
     0,
@@ -5976,11 +7404,17 @@ function renderInventory() {
   const healthElement = byId('inventoryHealth');
   const foodElement = byId('inventoryFood');
 
-  if (healthElement) healthElement.textContent =
-    health.toFixed(1) + ' / 20';
+  if (healthElement) {
+    const hearts = Math.round(health / 2);
+    const heartsStr = '❤️'.repeat(hearts) + '🖤'.repeat(Math.max(0, 10 - hearts));
+    healthElement.innerHTML = health.toFixed(1) + ' / 20 <span style="font-size:11px;margin-left:4px;" title="' + health + '/20 HP">' + heartsStr + '</span>';
+  }
 
-  if (foodElement) foodElement.textContent =
-    food.toFixed(1) + ' / 20';
+  if (foodElement) {
+    const foods = Math.round(food / 2);
+    const foodStr = '🍖'.repeat(foods) + '🦴'.repeat(Math.max(0, 10 - foods));
+    foodElement.innerHTML = food.toFixed(1) + ' / 20 <span style="font-size:11px;margin-left:4px;" title="' + food + '/20 Đói">' + foodStr + '</span>';
+  }
 
   const healthBar = byId('inventoryHealthBar');
   const foodBar = byId('inventoryFoodBar');
@@ -5999,8 +7433,12 @@ function renderInventory() {
   if (golden) golden.textContent =
     String(inventory.goldenAppleCount || 0);
 
-  if (totem) totem.textContent =
-    String(inventory.totemCount || 0);
+  if (totem) {
+    const tCount = Number(inventory.totemCount || 0);
+    totem.innerHTML = tCount <= 1
+      ? '<span style="color:var(--red);font-weight:bold;">' + tCount + ' 🚨</span>'
+      : '<span style="color:var(--gold);font-weight:bold;">' + tCount + ' 🛡️</span>';
+  }
 
   if (offhand) offhand.textContent =
     String(inventory.offhand || '-').replace(/_/g, ' ');
@@ -6583,7 +8021,8 @@ function markSettingsInputDirty(event) {
   if (
     target.id === 'settingAutoTotem' ||
     target.id === 'settingAntiHungry' ||
-    target.id === 'settingAutoReconnect'
+    target.id === 'settingAutoReconnect' ||
+    target.id === 'settingAntiAfkKick'
   ) {
     markSettingsDirty();
     return;
@@ -6706,20 +8145,111 @@ window.startEquipmentDrag = startEquipmentDrag;
 window.dropEquip = dropEquip;
 window.dropItemToWorld = dropItemToWorld;
 window.unequipEquipment = unequipEquipment;
+window.quickSendCommand = quickSendCommand;
+window.copyToClipboard = copyToClipboard;
+
+
+let soundAlertEnabled = localStorage.getItem('kingmc_sound_alert') === '1';
+let lastKnownBotStatus = null;
+
+function playAlertTone(type = 'warn') {
+  if (!soundAlertEnabled) return;
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = type === 'danger' ? 'sawtooth' : 'sine';
+    const now = ctx.currentTime;
+    if (type === 'danger') {
+      osc.frequency.setValueAtTime(220, now);
+      osc.frequency.exponentialRampToValueAtTime(110, now + 0.35);
+    } else {
+      osc.frequency.setValueAtTime(587.33, now);
+      osc.frequency.exponentialRampToValueAtTime(880, now + 0.3);
+    }
+    gain.gain.setValueAtTime(0.12, now);
+    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.35);
+    osc.start(now);
+    osc.stop(now + 0.35);
+  } catch (_) {}
+}
+
+function toggleSoundAlert() {
+  soundAlertEnabled = !soundAlertEnabled;
+  localStorage.setItem('kingmc_sound_alert', soundAlertEnabled ? '1' : '0');
+  updateSoundAlertButton();
+  if (soundAlertEnabled) playAlertTone('info');
+}
+
+function updateSoundAlertButton() {
+  const btn = document.getElementById('soundAlertBtn');
+  if (!btn) return;
+  if (soundAlertEnabled) {
+    btn.className = 'small sound-btn active';
+    btn.innerHTML = '🔔 Âm thanh: BẬT';
+  } else {
+    btn.className = 'small sound-btn';
+    btn.innerHTML = '🔕 Âm thanh: TẮT';
+  }
+}
+window.toggleSoundAlert = toggleSoundAlert;
 
 (async function init() {
+  updateSoundAlertButton();
+
+  const msgInput = byId('messageInput');
+  if (msgInput) {
+    msgInput.addEventListener('keydown', function(e) {
+      if (e.key === 'ArrowUp') {
+        if (!commandHistory.length) return;
+        e.preventDefault();
+        if (commandHistoryIndex < commandHistory.length - 1) {
+          commandHistoryIndex++;
+          msgInput.value = commandHistory[commandHistoryIndex];
+        }
+      } else if (e.key === 'ArrowDown') {
+        if (!commandHistory.length) return;
+        e.preventDefault();
+        if (commandHistoryIndex > 0) {
+          commandHistoryIndex--;
+          msgInput.value = commandHistory[commandHistoryIndex];
+        } else if (commandHistoryIndex === 0) {
+          commandHistoryIndex = -1;
+          msgInput.value = '';
+        }
+      }
+    });
+  }
+
   await refresh(true);
 })();
 
-setInterval(function() {
-  if (
-    !settingsSaveInFlight &&
-    !autoChatSaveInFlight &&
-    !botScheduleSaveInFlight
-  ) {
-    void refresh(false);
+let refreshTimerId = null;
+function scheduleNextRefresh() {
+  if (refreshTimerId) clearTimeout(refreshTimerId);
+  const delay = document.hidden ? 5000 : 1000;
+  refreshTimerId = setTimeout(() => {
+    if (
+      !settingsSaveInFlight &&
+      !autoChatSaveInFlight &&
+      !botScheduleSaveInFlight
+    ) {
+      void refresh(false);
+    }
+    scheduleNextRefresh();
+  }, delay);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    void refresh(true);
   }
-}, 1000);
+  scheduleNextRefresh();
+});
+
+scheduleNextRefresh();
 
 setInterval(updateUptimeDisplay, 250);
 </script>
@@ -6783,7 +8313,8 @@ function publicSettingsState(state) {
     return {
         autoTotem: state.settings.autoTotem !== false,
         antiHungry: state.settings.antiHungry !== false,
-        autoReconnect: state.settings.autoReconnect !== false
+        autoReconnect: state.settings.autoReconnect !== false,
+        antiAfkKick: state.settings.antiAfkKick !== false
     };
 }
 
@@ -6839,7 +8370,8 @@ app.post('/api/settings', (req, res) => {
     const nextSettings = {
         autoTotem: incoming.autoTotem !== false,
         antiHungry: incoming.antiHungry !== false,
-        autoReconnect: incoming.autoReconnect !== false
+        autoReconnect: incoming.autoReconnect !== false,
+        antiAfkKick: incoming.antiAfkKick !== false
     };
 
     const persisted = saveBotSettingsFile(
@@ -7353,36 +8885,105 @@ app.post(
         }
 
         try {
+            const raw = text.trim();
+            const lower = raw.toLowerCase();
 
-            botState.bot.chat(
-                text
-            );
+            // 1. Tự động gắn mật khẩu cho /dn
+            if (lower === '/dn') {
+                if (!botState.password) {
+                    return res.status(400).json({
+                        error: 'Bot chưa có mật khẩu! Vui lòng lưu mật khẩu trong Cài đặt.'
+                    });
+                }
+                botState.bot.chat(`/dn ${botState.password}`);
+                botState.lastWebChatText = '/dn [PASSWORD]';
+                botState.lastWebChatAt = Date.now();
+                addChatLog(botState, 'WEB', '→ /dn ********');
+                return res.json({
+                    ok: true,
+                    message: 'Đã gửi /dn (kèm mật khẩu đã lưu).'
+                });
+            }
 
-            botState.lastWebChatText =
-                cleanMinecraftText(text);
+            // 2. Tự động gắn mật khẩu cho /login
+            if (lower === '/login') {
+                if (!botState.password) {
+                    return res.status(400).json({
+                        error: 'Bot chưa có mật khẩu! Vui lòng lưu mật khẩu trong Cài đặt.'
+                    });
+                }
+                botState.bot.chat(`/login ${botState.password}`);
+                botState.lastWebChatText = '/login [PASSWORD]';
+                botState.lastWebChatAt = Date.now();
+                addChatLog(botState, 'WEB', '→ /login ********');
+                return res.json({
+                    ok: true,
+                    message: 'Đã gửi /login (kèm mật khẩu đã lưu).'
+                });
+            }
 
-            botState.lastWebChatAt =
-                Date.now();
+            // 3. /menu: gửi lệnh và tự động bấm ô slot 24 đúng 1 lần duy nhất, không lặp lại
+            if (lower === '/menu') {
+                botState.bot.chat('/menu');
+                botState.lastWebChatText = '/menu';
+                botState.lastWebChatAt = Date.now();
+                addChatLog(botState, 'WEB', '→ /menu');
 
+                let slot24Handled = false;
+                const clickSlot24Once = () => {
+                    if (slot24Handled) return;
+                    slot24Handled = true;
+                    setTimeout(() => {
+                        try {
+                            if (botState.bot && botState.bot.currentWindow) {
+                                botState.bot.clickWindow(24, 0, 0);
+                                addLog(botState, '[MENU] Đã click slot 24 (1 lần duy nhất).');
+                            }
+                        } catch (err) {
+                            addLog(botState, `[MENU] Lỗi click slot 24: ${err.message}`);
+                        }
+                    }, 700);
+                };
+
+                if (botState.bot.currentWindow) {
+                    clickSlot24Once();
+                } else {
+                    botState.bot.once('windowOpen', clickSlot24Once);
+                    setTimeout(() => {
+                        if (!slot24Handled && botState.bot) {
+                            botState.bot.removeListener('windowOpen', clickSlot24Once);
+                        }
+                    }, 10000);
+                }
+
+                return res.json({
+                    ok: true,
+                    message: 'Đã gửi /menu (tự động bấm ô 24 một lần).'
+                });
+            }
+
+            // 4. Các lệnh khác (kể cả người dùng tự gõ /dn <pass> hoặc /login <pass>)
+            const isAuthCmd = lower.startsWith('/dn ') || lower.startsWith('/login ');
+            botState.bot.chat(raw);
+            botState.lastWebChatText = isAuthCmd
+                ? `${raw.split(' ')[0]} [PASSWORD]`
+                : cleanMinecraftText(raw);
+            botState.lastWebChatAt = Date.now();
             addChatLog(
                 botState,
                 'WEB',
-                `→ ${text}`
+                isAuthCmd ? `→ ${raw.split(' ')[0]} ********` : `→ ${raw}`
             );
 
             res.json({
                 ok: true,
-                message:
-                    'Đã gửi.'
+                message: 'Đã gửi.'
             });
 
         } catch (err) {
-
             res.status(500).json({
-                error:
-                    `Gửi thất bại: ${err.message}`
+                error: `Gửi thất bại: ${err.message}`
             });
-
         }
     }
 );
@@ -8349,9 +9950,15 @@ app.get(
 app.get(
     '/',
     (req, res) => {
+        const cur = publicSettingsState(botState);
+        let renderedHtml = HTML;
+        if (cur.autoTotem) renderedHtml = renderedHtml.replace('id="settingAutoTotem"', 'id="settingAutoTotem" checked');
+        if (cur.antiHungry) renderedHtml = renderedHtml.replace('id="settingAntiHungry"', 'id="settingAntiHungry" checked');
+        if (cur.autoReconnect) renderedHtml = renderedHtml.replace('id="settingAutoReconnect"', 'id="settingAutoReconnect" checked');
+        if (cur.antiAfkKick) renderedHtml = renderedHtml.replace('id="settingAntiAfkKick"', 'id="settingAntiAfkKick" checked');
         res
             .type('html')
-            .send(HTML);
+            .send(renderedHtml);
     }
 );
 
@@ -8427,20 +10034,25 @@ function scheduleAutoStartOnBoot() {
     botState.afkTimers.push(bootTimer);
 }
 
-const server = app.listen(
-    HTTP_PORT,
-    '0.0.0.0',
-    () => {
-
-        console.log(
-            `[HTTP] Dashboard listening on ${HTTP_PORT} | ` +
-            `Platform ${PLATFORM}`
-        );
-
-        startPublicIpMonitor(botState);
-        scheduleAutoStartOnBoot();
+let server = null;
+listenHttpServer(app, HTTP_PORT, PLATFORM, (serverInstance, activePort) => {
+    server = serverInstance;
+    HTTP_PORT = activePort;
+    console.log('================================================================================');
+    console.log(`  🚀 KINGMC AFK BOT WORKER (PRO V7) ĐÃ KHỞI CHẠY THÀNH CÔNG!`);
+    console.log(`  🌐 WEB DASHBOARD: http://localhost:${activePort} (hoặc domain VPS / Hosting)`);
+    console.log(`  📦 NỀN TẢNG: ${PLATFORM.toUpperCase()} | PORT WEB: ${activePort}`);
+    console.log(`  🎮 SERVER MINECRAFT: ${HOSTS.join(', ')}:${PORT} | PHIÊN BẢN: ${MC_VERSION}`);
+    const creds = getConfiguredCredentials();
+    if (!creds.username || !creds.password) {
+        console.log(`  ⚠️  CHÚ Ý: Chưa cấu hình USERNAME / PASSWORD ở đầu file. Bot đang đợi nhập từ Web UI!`);
+    } else {
+        console.log(`  👤 TÀI KHOẢN: ${creds.username} (Tự động kết nối)`);
     }
-);
+    console.log('================================================================================');
+    startPublicIpMonitor(botState);
+    scheduleAutoStartOnBoot();
+});
 
 // -----------------------------------------------------------------------------
 // Graceful process shutdown
@@ -8509,6 +10121,20 @@ process.on(
     () => shutdownProcess('SIGINT')
 );
 
+process.on('uncaughtException', (err) => {
+    console.error('[PROCESS] Uncaught Exception:', err.message || err);
+    try {
+        addLog(botState, `⚠️ [LỖI HỆ THỐNG] ${err.message || 'Lỗi không xác định'}`);
+    } catch (_) {}
+});
+
+process.on('unhandledRejection', (reason) => {
+    console.error('[PROCESS] Unhandled Rejection:', reason?.message || reason);
+    try {
+        addLog(botState, `⚠️ [LỖI ASYNC] ${reason?.message || 'Promise rejection'}`);
+    } catch (_) {}
+});
+
 // -----------------------------------------------------------------------------
 // FINAL STARTUP STATE
 //
@@ -8563,3 +10189,4 @@ resetInventoryState(botState);
 // Phần này chỉ là marker kết thúc file.
 // Không cần thêm code khác sau đây.
 // ============================================================================
+
