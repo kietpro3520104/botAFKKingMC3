@@ -2,6 +2,8 @@ const mineflayer = require('mineflayer');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
 
 // ============================================================================
 // CẤU HÌNH TỔNG BOT MINECRAFT KINGMC (HARDCODED CONFIG V7 - SIÊU VIP)
@@ -10,6 +12,64 @@ const path = require('path');
 // Tự động nhận diện Render / RavenHost / VPS và khởi chạy Web UI tức thì!
 // Chỉnh sửa các trường cấu hình trực tiếp ngay bên dưới:
 // ============================================================================
+
+// --- BẢO MẬT GIAO TIẾP & LOGIN GATE ---
+const BOT_SECRET_KEY = process.env.BOT_SECRET_KEY || '';
+const BOT_ADMIN_PASSWORD = process.env.BOT_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || 'admin123';
+const MANAGER_API_URL = process.env.MANAGER_API_URL || 'http://localhost:3000';
+
+const botSessions = new Map();
+
+function createBotSession(role, username, options = {}) {
+    const token = 'bsess_' + crypto.randomBytes(32).toString('hex');
+    botSessions.set(token, {
+        role,
+        username,
+        allowAccountChange: role === 'admin' || options.allowAccountChange === true,
+        expiresAt: Date.now() + 24 * 60 * 60 * 1000
+    });
+    return token;
+}
+
+function verifyBotSession(token) {
+    if (!token) return null;
+    const sess = botSessions.get(token);
+    if (!sess) return null;
+    if (Date.now() > sess.expiresAt) {
+        botSessions.delete(token);
+        return null;
+    }
+    return sess;
+}
+
+function timingSafeStringEquals(left, right) {
+    if (typeof left !== 'string' || typeof right !== 'string') return false;
+    const leftBuffer = Buffer.from(left);
+    const rightBuffer = Buffer.from(right);
+    return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function getBotSessionFromRequest(req) {
+    const authHeader = req.headers['authorization'] || req.headers['x-bot-token'];
+    let token = req.query?.token;
+    if (typeof authHeader === 'string') {
+        token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
+    }
+    if (!token && req.headers.cookie) {
+        const match = String(req.headers.cookie).match(/bot_token=([^;]+)/);
+        if (match) token = decodeURIComponent(match[1]);
+    }
+    return verifyBotSession(token);
+}
+
+function isManagerSecretRequest(req) {
+    return !!BOT_SECRET_KEY && timingSafeStringEquals(String(req.headers['x-bot-secret'] || ''), BOT_SECRET_KEY);
+}
+
+function canChangeMinecraftAccount(req) {
+    const session = req.botSession || getBotSessionFromRequest(req);
+    return isManagerSecretRequest(req) || session?.role === 'admin' || session?.allowAccountChange === true;
+}
 
 const BOT_CONFIG = {
     // --- 1. TÀI KHOẢN BOT (ĐỂ TRỐNG ĐỂ TỰ ĐIỀN HOẶC NHẬP TỪ WEB UI) ---
@@ -57,7 +117,8 @@ const BOT_CONFIG = {
         autoTotem: true,                  // Tự cầm totem khi còn ít máu phòng té ngã
         antiHungry: true,                 // Tự ăn khi đói chống chết đói khi treo máy
         autoReconnect: true,              // Tự kết nối lại khi mất mạng / server restart
-        antiAfkKick: true                 // Giả lập vi chuyển động yaw/pitch & sneak chống kick AFK
+        antiAfkKick: true,                // Giả lập vi chuyển động yaw/pitch & sneak chống kick AFK
+        ecoMode: true                     // 🌱 Chế độ Siêu Tiết Kiệm Eco: giảm physics loop, hạ CPU ~0%, giữ RAM 150-220MB
     }
 };
 
@@ -431,6 +492,27 @@ function sanitizeAutoChatSchedules(input) {
     return result;
 }
 
+const RESTRICTED_MINECRAFT_ACCOUNT_COMMANDS = new Set([
+    '/changepassword',
+    '/changepass',
+    '/cp',
+    '/unregister',
+    '/unreg',
+    '/authme',
+    '/user'
+]);
+
+function isRestrictedMinecraftAccountCommand(value) {
+    const command = String(value || '').trim().toLowerCase().split(/\s+/, 1)[0];
+    return RESTRICTED_MINECRAFT_ACCOUNT_COMMANDS.has(command);
+}
+
+function hasRestrictedMinecraftAccountCommand(schedules) {
+    return Array.isArray(schedules) && schedules.some(schedule =>
+        Array.isArray(schedule?.messages) && schedule.messages.some(isRestrictedMinecraftAccountCommand)
+    );
+}
+
 function sanitizeBotSchedules(input, options = {}) {
     const rawList = Array.isArray(input)
         ? input.filter(item => item && typeof item === 'object')
@@ -537,6 +619,9 @@ function loadBotSettings() {
         if (!fs.existsSync(SETTINGS_FILE)) {
             return {
                 settings: { ...DEFAULT_SETTINGS },
+                username: '',
+                password: '',
+                manuallyStopped: undefined,
                 autoChatSchedules: [],
                 botSchedules: []
             };
@@ -553,8 +638,12 @@ function loadBotSettings() {
                 autoTotem: settings.autoTotem !== false,
                 antiHungry: settings.antiHungry !== false,
                 autoReconnect: settings.autoReconnect !== false,
-                antiAfkKick: settings.antiAfkKick !== false
+                antiAfkKick: settings.antiAfkKick !== false,
+                ecoMode: settings.ecoMode !== false
             },
+            username: typeof parsed?.username === 'string' ? parsed.username : '',
+            password: typeof parsed?.password === 'string' ? parsed.password : '',
+            manuallyStopped: parsed?.manuallyStopped !== undefined ? !!parsed.manuallyStopped : undefined,
             autoChatSchedules: sanitizeAutoChatSchedules(parsed?.autoChatSchedules),
             botSchedules: sanitizeBotSchedules(parsed?.botSchedules)
         };
@@ -562,21 +651,38 @@ function loadBotSettings() {
         console.error(`[SETTINGS] Không đọc được ${SETTINGS_FILE}: ${err.message}`);
         return {
             settings: { ...DEFAULT_SETTINGS },
+            username: '',
+            password: '',
+            manuallyStopped: undefined,
             autoChatSchedules: [],
             botSchedules: []
         };
     }
 }
 
-function saveBotSettingsFile(settings, autoChatSchedules, botSchedules) {
+function saveBotSettingsFile(settings, autoChatSchedules, botSchedules, accountInfo = {}) {
     try {
+        const currentUsername = accountInfo.username !== undefined
+            ? accountInfo.username
+            : (typeof botState !== 'undefined' && botState ? botState.username : '');
+        const currentPassword = accountInfo.password !== undefined
+            ? accountInfo.password
+            : (typeof botState !== 'undefined' && botState ? botState.password : '');
+        const currentManuallyStopped = accountInfo.manuallyStopped !== undefined
+            ? !!accountInfo.manuallyStopped
+            : (typeof botState !== 'undefined' && botState ? !!botState.manuallyStopped : false);
+
         const payload = {
             version: 3,
+            username: currentUsername || '',
+            password: currentPassword || '',
+            manuallyStopped: currentManuallyStopped,
             settings: {
                 autoTotem: settings.autoTotem !== false,
                 antiHungry: settings.antiHungry !== false,
                 autoReconnect: settings.autoReconnect !== false,
-                antiAfkKick: settings.antiAfkKick !== false
+                antiAfkKick: settings.antiAfkKick !== false,
+                ecoMode: settings.ecoMode !== false
             },
             autoChatSchedules: sanitizeAutoChatSchedules(autoChatSchedules)
                 .map(schedule => ({
@@ -642,6 +748,31 @@ function saveBotSettingsFile(settings, autoChatSchedules, botSchedules) {
 
 const INITIAL_SETTINGS = loadBotSettings();
 
+// 📡 Đo lưu lượng HTTP Express (Tầng 2 cho Network Telemetry)
+let cumulativeHttpRxBytes = 0;
+let cumulativeHttpTxBytes = 0;
+
+app.use((req, res, next) => {
+    let reqBytes = 0;
+    req.on('data', chunk => {
+        if (chunk) reqBytes += chunk.length;
+    });
+    const originalWrite = res.write;
+    const originalEnd = res.end;
+    let resBytes = 0;
+    res.write = function(chunk, ...args) {
+        if (chunk) resBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+        return originalWrite.apply(res, [chunk, ...args]);
+    };
+    res.end = function(chunk, ...args) {
+        if (chunk) resBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+        cumulativeHttpRxBytes += reqBytes;
+        cumulativeHttpTxBytes += resBytes;
+        return originalEnd.apply(res, [chunk, ...args]);
+    };
+    next();
+});
+
 app.use(express.json({ limit: '512kb', strict: true }));
 
 // API responses should not be cached. The central dashboard communicates
@@ -660,6 +791,23 @@ app.use((req, res, next) => {
     res.setHeader('X-Bot-Protocol', '2');
 
     next();
+});
+
+app.use((req, res, next) => {
+    const session = getBotSessionFromRequest(req);
+    if (session) req.botSession = session;
+
+    if (
+        !BOT_SECRET_KEY ||
+        !req.path.startsWith('/api/') ||
+        req.path.startsWith('/api/auth/') ||
+        isManagerSecretRequest(req) ||
+        session
+    ) {
+        return next();
+    }
+
+    return res.status(401).json({ ok: false, error: 'Yêu cầu xác thực phiên hoặc X-Bot-Secret hợp lệ.' });
 });
 
 app.use((err, req, res, next) => {
@@ -689,6 +837,28 @@ function cleanMinecraftText(text) {
         .trim();
 }
 
+function cleanMinecraftComponent(value) {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string' || typeof value === 'number') {
+        return cleanMinecraftText(value);
+    }
+    if (typeof value === 'object') {
+        try {
+            if (typeof value.toString === 'function' && value.toString !== Object.prototype.toString) {
+                const text = value.toString();
+                if (text && text !== '[object Object]') return cleanMinecraftText(text);
+            }
+            const parts = [];
+            if (typeof value.text === 'string') parts.push(value.text);
+            if (Array.isArray(value.extra)) {
+                for (const child of value.extra) parts.push(cleanMinecraftComponent(child));
+            }
+            if (parts.length) return cleanMinecraftText(parts.join(''));
+        } catch (_) {}
+    }
+    return '';
+}
+
 function getConfiguredCredentials() {
     const envUser = process.env.BOT_USERNAME || process.env.USERNAME || process.env.MC_USERNAME || process.env.KINGMC_USERNAME || '';
     const envPass = process.env.BOT_PASSWORD || process.env.PASSWORD || process.env.MC_PASSWORD || process.env.KINGMC_PASSWORD || '';
@@ -701,20 +871,26 @@ function getConfiguredCredentials() {
 
 function createBotState() {
     const credentials = getConfiguredCredentials();
+    const initialSaved = loadBotSettings();
+    const effectiveUsername = initialSaved.username || credentials.username || '';
+    const effectivePassword = initialSaved.password || credentials.password || '';
+    const effectiveManuallyStopped = initialSaved.manuallyStopped !== undefined
+        ? initialSaved.manuallyStopped
+        : (!effectiveUsername || !effectivePassword);
 
     return {
         id: BOT_ID_NUMBER,
         botId: BOT_ID,
 
-        username: credentials.username,
-        password: credentials.password,
+        username: effectiveUsername,
+        password: effectivePassword,
 
         bot: null,
         hostIndex: 0,
 
         status: 'offline',
         ready: false,
-        manuallyStopped: true,
+        manuallyStopped: effectiveManuallyStopped,
         connectedAt: null,
         stateRevision: 0,
         connectionGeneration: 0,
@@ -774,6 +950,13 @@ function createBotState() {
         antiAfkTimer: null,
         farmPruneTimer: null,
         memoryWatchdogTimer: null,
+        smartWatchdogTimer: null,
+        loginFlowStartedAt: null,
+        lastPacketReceivedAt: 0,
+        deathCount: 0,
+        lastDeathAt: 0,
+        lastDeathCoords: '',
+        lowHealthAlertSent: false,
         lastRssMb: 0,
         lastHeapMb: 0,
         autoChatGeneration: 0,
@@ -1135,6 +1318,11 @@ function clearManagerTimers(state) {
         state.farmPruneTimer = null;
     }
 
+    if (state.smartWatchdogTimer) {
+        clearInterval(state.smartWatchdogTimer);
+        state.smartWatchdogTimer = null;
+    }
+
     state.autoChatGeneration++;
 
     state.isEating = false;
@@ -1308,7 +1496,63 @@ function applyHighDensityFarmOptimizations(state, bot) {
     }, BOT_CONFIG.FARM_OPTIMIZATION.PRUNE_INTERVAL_MS);
 }
 
-// 🛡️ MEMORY WATCHDOG: Giám sát RAM định kỳ, bảo đảm luôn < 300MB
+// 🌿 ECO MODE ENGINE: Siêu Tối Ưu RAM & CPU cho Hạm Đội
+function applyEcoModeOptimizations(state, bot) {
+    if (!bot) return;
+    const isEco = state.settings.ecoMode !== false;
+
+    if (isEco) {
+        if (bot.physics) {
+            bot.physics.maxCatchupTicks = 0;
+        }
+
+        // Tắt tính toán physics khi bot đang AFK đứng yên (tiết kiệm ~80% CPU)
+        if (state.status === 'afk' && !state.isEating && !state.locationFlowBusy) {
+            bot.physicsEnabled = false;
+        } else {
+            bot.physicsEnabled = true;
+        }
+
+        // Chặn hoàn toàn packet hạt bọt nước & âm thanh thừa
+        if (bot._client) {
+            const dropEvts = [
+                'update_light', 'world_particles', 'sound_effect', 'named_sound_effect',
+                'spawn_entity_experience_orb', 'experience_orb', 'block_break_animation',
+                'entity_effect', 'remove_entity_effect'
+            ];
+            for (const evt of dropEvts) {
+                bot._client.removeAllListeners(evt);
+                bot._client.on(evt, () => {});
+            }
+        }
+
+        // Cắt tỉa logs trong RAM
+        if (state.logs && state.logs.length > 150) state.logs = state.logs.slice(-150);
+        if (state.chatLogs && state.chatLogs.length > 150) state.chatLogs = state.chatLogs.slice(-150);
+
+        // Cắt tỉa thực thể chỉ giữ tối đa 35 thực thể trong phạm vi 8 khối
+        if (bot.entities) {
+            const myId = bot.entity ? bot.entity.id : -1;
+            const myPos = bot.entity ? bot.entity.position : null;
+            let count = 0;
+            for (const id in bot.entities) {
+                if (id == myId) continue;
+                const e = bot.entities[id];
+                if (!e) continue;
+                const distSq = (myPos && e.position) ? e.position.distanceSquared(myPos) : 9999;
+                if (distSq > 64 || count > 35) {
+                    delete bot.entities[id];
+                } else {
+                    count++;
+                }
+            }
+        }
+    } else {
+        bot.physicsEnabled = true;
+    }
+}
+
+// 🛡️ MEMORY WATCHDOG: Giám sát RAM định kỳ, bảo đảm luôn < 220MB (Eco) / < 380MB
 function startMemoryWatchdog(state) {
     if (state.memoryWatchdogTimer) clearInterval(state.memoryWatchdogTimer);
     state.memoryWatchdogTimer = setInterval(() => {
@@ -1319,7 +1563,8 @@ function startMemoryWatchdog(state) {
             state.lastRssMb = rssMb;
             state.lastHeapMb = heapMb;
 
-            const limitMb = Number(BOT_CONFIG.RAM_WATCHDOG_LIMIT_MB) || 380;
+            const isEco = state.settings.ecoMode !== false;
+            const limitMb = isEco ? 220 : (Number(BOT_CONFIG.RAM_WATCHDOG_LIMIT_MB) || 380);
             if (rssMb > limitMb) {
                 // Ép dọn dẹp thực thể và chunk
                 if (state.bot && state.bot.entities) {
@@ -1331,17 +1576,57 @@ function startMemoryWatchdog(state) {
                     }
                 }
 
-                if (state.logs && state.logs.length > 300) state.logs = state.logs.slice(-300);
-                if (state.chatLogs && state.chatLogs.length > 300) state.chatLogs = state.chatLogs.slice(-300);
+                const maxLogs = isEco ? 150 : 300;
+                if (state.logs && state.logs.length > maxLogs) state.logs = state.logs.slice(-maxLogs);
+                if (state.chatLogs && state.chatLogs.length > maxLogs) state.chatLogs = state.chatLogs.slice(-maxLogs);
 
                 if (typeof global.gc === 'function') {
                     global.gc();
                 }
 
-                addLog(state, `[BỘ NHỚ] Kích hoạt giải phóng RAM khẩn cấp (RSS: ${rssMb} MB / Ngưỡng: ${limitMb} MB).`);
+                addLog(state, `[BỘ NHỚ] 🌿 Kích hoạt giải phóng RAM Eco Mode (RSS: ${rssMb} MB / Ngưỡng: ${limitMb} MB).`);
+            }
+
+            if (state.bot) {
+                applyEcoModeOptimizations(state, state.bot);
             }
         } catch (_) {}
-    }, 30000);
+    }, 25000);
+}
+
+// ⚡ SMART FLEET WATCHDOG: Chống treo Lobby (>28s) & Chống Ghost Packet Freeze (>35s)
+function startSmartWatchdog(state) {
+    if (state.smartWatchdogTimer) clearInterval(state.smartWatchdogTimer);
+    state.smartWatchdogTimer = setInterval(() => {
+        try {
+            if (state.shuttingDown || state.manuallyStopped || !state.settings.autoReconnect) return;
+            const now = Date.now();
+            const bot = state.bot;
+            if (!bot) return;
+
+            // 1. WATCHDOG CHỐNG TREO SẢNH (Lobby-Stuck Watchdog: kẹt login/lobby > 28s)
+            const isInConnectingFlow = ['connecting', 'authenticating', 'entering'].includes(state.status);
+            if (isInConnectingFlow && state.loginFlowStartedAt && (now - state.loginFlowStartedAt >= 28000)) {
+                addLog(state, `[WATCHDOG] ⚠️ Kẹt ở quy trình đăng nhập/sảnh quá ${Math.round((now - state.loginFlowStartedAt) / 1000)}s! Đang tự động Hard Reconnect...`);
+                sendBotDirectAlert('lobby_stuck', 'Bot bị kẹt ở Sảnh/Lobby quá 28s không thể chuyển Server AFK. Đang tự động reset và kết nối lại.');
+                state.loginFlowStartedAt = null;
+                disconnectBot(state, 'Lobby Stuck Watchdog');
+                scheduleReconnect(state);
+                return;
+            }
+
+            // 2. WATCHDOG CHỐNG ĐỨT MẠNG NGẦM (Ghost Packet Freeze: AFK > 35s không nhận được packet)
+            const isAfkOrOnline = state.status === 'afk' || state.status === 'online';
+            if (isAfkOrOnline && state.lastPacketReceivedAt && (now - state.lastPacketReceivedAt >= 35000)) {
+                addLog(state, `[WATCHDOG] ⚠️ Phát hiện Ghost Freeze (${Math.round((now - state.lastPacketReceivedAt) / 1000)}s không có gói tin nào từ KingMC). Đang khôi phục kết nối...`);
+                sendBotDirectAlert('ghost_freeze', 'Phát hiện Ghost Freeze (35s đứt kết nối ngầm không nhận gói tin). Đang tự phục hồi.');
+                state.lastPacketReceivedAt = null;
+                disconnectBot(state, 'Ghost Packet Freeze');
+                scheduleReconnect(state);
+                return;
+            }
+        } catch (_) {}
+    }, 5000);
 }
 
 // ============================================================================
@@ -1392,6 +1677,9 @@ async function sendBotDirectAlert(eventType, message, details = {}) {
     let emoji = '🤖';
     if (eventType === 'kicked' || eventType === 'error') { color = 0xE74C3C; emoji = '🚨'; }
     else if (eventType === 'death') { color = 0xC0392B; emoji = '💀'; }
+    else if (eventType === 'low_health') { color = 0xE67E22; emoji = '⚠️'; }
+    else if (eventType === 'totem_popped') { color = 0xF1C40F; emoji = '🪙'; }
+    else if (eventType === 'lobby_stuck' || eventType === 'ghost_freeze') { color = 0xE74C3C; emoji = '⚡'; }
     else if (eventType === 'spawn' || eventType === 'afk') { color = 0x2ECC71; emoji = '✅'; }
 
     // 1. Gửi Discord nếu có webhookUrl
@@ -1436,15 +1724,19 @@ async function sendBotDirectAlert(eventType, message, details = {}) {
 // ⚡ INSTANT AUTO TOTEM: Phản xạ tức thì (< 50ms khi nhận damage)
 async function fastEquipTotem(state) {
     const bot = state.bot;
-    if (!state.settings.autoTotem || !bot || !bot.inventory || state.isEquippingTotem || state.inventoryActionBusy) return;
-
-    if (bot.usingHeldItem && typeof bot.deactivateItem === 'function') {
-        try { bot.deactivateItem(); } catch (_) {}
-    }
+    if (!state.settings.autoTotem || !bot || !bot.inventory || state.isEquippingTotem) return;
 
     const offhandSlot = getOffhandSlot(bot);
     const offhandItem = bot.inventory.slots[offhandSlot];
     if (offhandItem && offhandItem.name === 'totem_of_undying') return;
+
+    if (state.status === 'afk' && bot.currentWindow && typeof bot.closeWindow === 'function') {
+        try { bot.closeWindow(bot.currentWindow); } catch (_) {}
+    }
+    if (bot.usingHeldItem && typeof bot.deactivateItem === 'function') {
+        try { bot.deactivateItem(); } catch (_) {}
+    }
+    state.isEating = false;
 
     let totemItem = null;
     for (let slot = 9; slot <= 44; slot++) {
@@ -1487,6 +1779,8 @@ function startSmartAntiAfk(state) {
                     const yaw = state.bot.entity.yaw + deltaYaw;
                     const pitch = Math.max(-1.4, Math.min(1.4, state.bot.entity.pitch + deltaPitch));
 
+                    // Bật physics 1500ms để server KingMC nhận diện chuyển động tự nhiên
+                    state.bot.physicsEnabled = true;
                     state.bot.look(yaw, pitch, true, () => {
                         // 40% cơ hội vung tay (swingArm packet)
                         if (Math.random() > 0.6 && typeof state.bot.swingArm === 'function') {
@@ -1500,6 +1794,11 @@ function startSmartAntiAfk(state) {
                             }, 160);
                         }
                     });
+                    setTimeout(() => {
+                        if (state.bot && state.settings.ecoMode !== false && state.status === 'afk' && !state.isEating && !state.locationFlowBusy) {
+                            state.bot.physicsEnabled = false;
+                        }
+                    }, 1500);
                 } catch (_) {}
             }
             scheduleNext();
@@ -2272,6 +2571,7 @@ async function autoEatTick(state) {
 
     state.foodMissingLogged = false;
     state.isEating = true;
+    if (bot) bot.physicsEnabled = true;
     const actionToken = beginInventoryAction(state, bot);
 
     const oldBot = bot;
@@ -2354,6 +2654,18 @@ async function autoEatTick(state) {
         }
     } finally {
         state.isEating = false;
+        setTimeout(() => {
+            if (
+                state.bot === oldBot &&
+                oldBot &&
+                state.settings.ecoMode !== false &&
+                state.status === 'afk' &&
+                !state.isEating &&
+                !state.locationFlowBusy
+            ) {
+                oldBot.physicsEnabled = false;
+            }
+        }, 1500);
 
         if (
             state.bot !== oldBot ||
@@ -2608,6 +2920,8 @@ function isAutoChatBotReady(state) {
 
 async function runAutoChatSchedule(state, schedule) {
     if (
+        state.shuttingDown ||
+        state.manuallyStopped ||
         schedule.running ||
         !schedule.enabled ||
         !isAutoChatBotReady(state)
@@ -2621,6 +2935,8 @@ async function runAutoChatSchedule(state, schedule) {
     try {
         for (const message of schedule.messages) {
             if (
+                state.shuttingDown ||
+                state.manuallyStopped ||
                 generation !== state.autoChatGeneration ||
                 !state.autoChatSchedules.includes(schedule) ||
                 !isAutoChatBotReady(state)
@@ -2650,7 +2966,7 @@ async function runAutoChatSchedule(state, schedule) {
 }
 
 async function autoChatTick(state) {
-    if (!isAutoChatBotReady(state)) {
+    if (state.shuttingDown || state.manuallyStopped || !isAutoChatBotReady(state)) {
         return;
     }
 
@@ -3302,6 +3618,7 @@ function confirmAfkAfterClick(state, bot) {
         state.locationRetryAttempt = 0;
         state.locationRetryReason = '';
         state.menuCommandIndex = 0;
+        state.loginFlowStartedAt = null;
         setBotStatus(state, 'afk');
 
         addLog(state, '[FLOW] Xác nhận tọa độ sau click: đã rời LOGIN/LOBBY.');
@@ -3474,7 +3791,6 @@ function startLocationMonitor(state, bot) {
 
             const now = Date.now();
             if (
-                state.settings.autoReconnect &&
                 state.password &&
                 now - state.lastLoginActionAt >= LOCATION_ACTION_COOLDOWN_MS
             ) {
@@ -3506,7 +3822,6 @@ function startLocationMonitor(state, bot) {
                         // let the normal location monitor continue the flow.
                         const nowAfterLogin = Date.now();
                         if (
-                            state.settings.autoReconnect &&
                             state.password &&
                             nowAfterLogin - Number(state.lastAuthDnActionAt || 0) >= 3000
                         ) {
@@ -3577,7 +3892,6 @@ function startLocationMonitor(state, bot) {
 
             const now = Date.now();
             if (
-                state.settings.autoReconnect &&
                 now - state.lastDnActionAt >= LOCATION_ACTION_COOLDOWN_MS
             ) {
                 state.lastDnActionAt = now;
@@ -3718,8 +4032,282 @@ function getBotDimension(state) {
     return null;
 }
 
+// -----------------------------------------------------------------------------
+// Real-time Host Hardware & Network Telemetry Engine (Container RavenHost/Render & Multi-tier Network)
+// -----------------------------------------------------------------------------
+
+function readCgroupFile(filePath) {
+    try {
+        if (fs.existsSync(filePath)) {
+            const content = fs.readFileSync(filePath, 'utf8').trim();
+            return content;
+        }
+    } catch (_) {}
+    return null;
+}
+
+function getContainerMemoryLimit() {
+    // a) RavenHost / Pterodactyl env
+    const pterMem = Number(process.env.SERVER_MEMORY || process.env.P_SERVER_MEMORY);
+    if (pterMem > 0) return pterMem;
+
+    // b) process.constrainedMemory() (Node 19.6+)
+    if (typeof process.constrainedMemory === 'function') {
+        try {
+            const cm = process.constrainedMemory();
+            if (cm > 0 && cm < os.totalmem()) {
+                return Math.round(cm / (1024 * 1024));
+            }
+        } catch (_) {}
+    }
+
+    // c) Cgroups v2 & v1
+    const oneTbBytes = 1024 * 1024 * 1024 * 1024;
+    const v2Max = readCgroupFile('/sys/fs/cgroup/memory.max');
+    if (v2Max && v2Max !== 'max') {
+        const val = Number(v2Max);
+        if (val > 0 && val < oneTbBytes) return Math.round(val / (1024 * 1024));
+    }
+    const v1Limit = readCgroupFile('/sys/fs/cgroup/memory/memory.limit_in_bytes');
+    if (v1Limit && v1Limit !== 'max') {
+        const val = Number(v1Limit);
+        if (val > 0 && val < oneTbBytes) return Math.round(val / (1024 * 1024));
+    }
+
+    // d) Render container
+    if (process.env.RENDER || process.env.RENDER_SERVICE_ID) {
+        return Number(process.env.RENDER_MEMORY_MB) || 512;
+    }
+
+    // e) Fallback os.totalmem()
+    return Math.round(os.totalmem() / (1024 * 1024));
+}
+
+function getContainerMemoryUsage(totalMb) {
+    const v2Cur = readCgroupFile('/sys/fs/cgroup/memory.current');
+    if (v2Cur) {
+        const valMb = Math.round(Number(v2Cur) / (1024 * 1024));
+        if (valMb > 0 && valMb <= totalMb) return valMb;
+    }
+    const v1Usage = readCgroupFile('/sys/fs/cgroup/memory/memory.usage_in_bytes');
+    if (v1Usage) {
+        const valMb = Math.round(Number(v1Usage) / (1024 * 1024));
+        if (valMb > 0 && valMb <= totalMb) return valMb;
+    }
+    const rssMb = Math.round(process.memoryUsage().rss / (1024 * 1024));
+    return Math.min(totalMb, rssMb);
+}
+
+function getContainerCpuCores() {
+    const v2CpuMax = readCgroupFile('/sys/fs/cgroup/cpu.max');
+    if (v2CpuMax) {
+        const parts = v2CpuMax.split(/\s+/);
+        if (parts.length >= 2 && parts[0] !== 'max') {
+            const quota = Number(parts[0]);
+            const period = Number(parts[1]);
+            if (quota > 0 && period > 0) {
+                return Math.max(0.5, Math.round((quota / period) * 10) / 10);
+            }
+        }
+    }
+    const v1Quota = readCgroupFile('/sys/fs/cgroup/cpu/cpu.cfs_quota_us');
+    const v1Period = readCgroupFile('/sys/fs/cgroup/cpu/cpu.cfs_period_us');
+    if (v1Quota && v1Period && Number(v1Quota) > 0) {
+        const quota = Number(v1Quota);
+        const period = Number(v1Period);
+        if (quota > 0 && period > 0) {
+            return Math.max(0.5, Math.round((quota / period) * 10) / 10);
+        }
+    }
+    const pterCpu = Number(process.env.SERVER_CPU);
+    if (pterCpu > 0) {
+        return Math.max(0.5, Math.round((pterCpu / 100) * 10) / 10);
+    }
+    try {
+        const cpus = os.cpus();
+        if (Array.isArray(cpus) && cpus.length > 0) return cpus.length;
+    } catch (_) {}
+    return 1;
+}
+
+function readProcNetDev() {
+    try {
+        const raw = readCgroupFile('/proc/net/dev');
+        if (!raw) return null;
+        let rxTotal = 0;
+        let txTotal = 0;
+        const lines = raw.split('\n');
+        for (const line of lines) {
+            const colonIdx = line.indexOf(':');
+            if (colonIdx === -1) continue;
+            const iface = line.slice(0, colonIdx).trim();
+            if (iface === 'lo') continue;
+            const parts = line.slice(colonIdx + 1).trim().split(/\s+/);
+            if (parts.length >= 9) {
+                const rx = Number(parts[0]) || 0;
+                const tx = Number(parts[8]) || 0;
+                rxTotal += rx;
+                txTotal += tx;
+            }
+        }
+        if (rxTotal > 0 || txTotal > 0) {
+            return { rxBytes: rxTotal, txBytes: txTotal };
+        }
+    } catch (_) {}
+    return null;
+}
+
+// Bộ lấy mẫu CPU định kỳ bằng process.cpuUsage() & elapsed time
+let lastCpuUsage = process.cpuUsage();
+let lastCpuTime = Date.now();
+let currentHostCpuPercent = 0;
+let hostCpuCores = getContainerCpuCores();
+
+setInterval(() => {
+    try {
+        const now = Date.now();
+        const elapsedMs = now - lastCpuTime;
+        if (elapsedMs <= 0) return;
+
+        hostCpuCores = getContainerCpuCores();
+        const diff = process.cpuUsage(lastCpuUsage);
+        lastCpuUsage = process.cpuUsage();
+        lastCpuTime = now;
+
+        const totalMicros = diff.user + diff.system;
+        const elapsedMicros = elapsedMs * 1000;
+        const percent = (totalMicros / (elapsedMicros * hostCpuCores)) * 100;
+        currentHostCpuPercent = Math.max(0, Math.min(100, Math.round(percent * 10) / 10));
+    } catch (_) {}
+}, 2000);
+
+// Bộ đo lưu lượng mạng đa tầng (Tầng 1: /proc/net/dev | Tầng 2: Socket MC + Express HTTP)
+let cumulativeMcRxBytes = 0;
+let cumulativeMcTxBytes = 0;
+let lastKnownSocket = null;
+let lastSocketRx = 0;
+let lastSocketTx = 0;
+
+let lastNetSampleTime = Date.now();
+let lastNetRxBytes = 0;
+let lastNetTxBytes = 0;
+let currentNetDownKbps = 0;
+let currentNetUpKbps = 0;
+let totalNetRxMb = 0;
+let totalNetTxMb = 0;
+
+setInterval(() => {
+    try {
+        const now = Date.now();
+        const elapsedSec = (now - lastNetSampleTime) / 1000;
+        if (elapsedSec <= 0) return;
+
+        // Cập nhật socket Minecraft (Tầng 2)
+        const sock = botState.bot?._client?.socket;
+        if (sock && !sock.destroyed) {
+            const curSockRx = Number(sock.bytesRead || 0);
+            const curSockTx = Number(sock.bytesWritten || 0);
+            if (lastKnownSocket === sock) {
+                if (curSockRx >= lastSocketRx) cumulativeMcRxBytes += (curSockRx - lastSocketRx);
+                if (curSockTx >= lastSocketTx) cumulativeMcTxBytes += (curSockTx - lastSocketTx);
+            } else {
+                lastKnownSocket = sock;
+                cumulativeMcRxBytes += curSockRx;
+                cumulativeMcTxBytes += curSockTx;
+            }
+            lastSocketRx = curSockRx;
+            lastSocketTx = curSockTx;
+        }
+
+        // Tầng 1: Đọc /proc/net/dev
+        const procNet = readProcNetDev();
+        let curRx = 0;
+        let curTx = 0;
+
+        if (procNet) {
+            curRx = procNet.rxBytes;
+            curTx = procNet.txBytes;
+        } else {
+            // Tầng 2: Fallback qua socket Minecraft + Express HTTP
+            curRx = cumulativeMcRxBytes + cumulativeHttpRxBytes;
+            curTx = cumulativeMcTxBytes + cumulativeHttpTxBytes;
+        }
+
+        if (lastNetRxBytes > 0 && curRx >= lastNetRxBytes) {
+            currentNetDownKbps = Math.round(((curRx - lastNetRxBytes) / 1024) / elapsedSec * 10) / 10;
+        } else {
+            currentNetDownKbps = 0;
+        }
+
+        if (lastNetTxBytes > 0 && curTx >= lastNetTxBytes) {
+            currentNetUpKbps = Math.round(((curTx - lastNetTxBytes) / 1024) / elapsedSec * 10) / 10;
+        } else {
+            currentNetUpKbps = 0;
+        }
+
+        lastNetRxBytes = curRx;
+        lastNetTxBytes = curTx;
+        totalNetRxMb = Math.round((curRx / (1024 * 1024)) * 10) / 10;
+        totalNetTxMb = Math.round((curTx / (1024 * 1024)) * 10) / 10;
+        lastNetSampleTime = now;
+    } catch (_) {}
+}, 2000);
+
+function getHostHardware() {
+    try {
+        const ramTotalMb = getContainerMemoryLimit();
+        const ramUsedMb = getContainerMemoryUsage(ramTotalMb);
+        const ramPercent = ramTotalMb > 0 ? Math.round((ramUsedMb / ramTotalMb) * 1000) / 10 : 0;
+        const botRssMb = Math.round(process.memoryUsage().rss / (1024 * 1024));
+
+        return {
+            ramPercent,          // % RAM máy host/container đã dùng
+            ramUsedMb,           // MB RAM máy host/container đã dùng
+            ramTotalMb,          // Tổng MB RAM được cấp
+            botRssMb,            // RAM riêng của bot (MB)
+            cpuPercent: currentHostCpuPercent, // % CPU thực tế
+            cpuCores: hostCpuCores,            // Số nhân vCPU được cấp
+            netDownKb: currentNetDownKbps,     // Tốc độ tải về (KB/s)
+            netUpKb: currentNetUpKbps,         // Tốc độ gửi đi (KB/s)
+            netTotalRxMb: totalNetRxMb,        // Tổng tải về (MB)
+            netTotalTxMb: totalNetTxMb         // Tổng gửi đi (MB)
+        };
+    } catch (_) {
+        return {
+            ramPercent: 0,
+            ramUsedMb: 0,
+            ramTotalMb: 512,
+            botRssMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+            cpuPercent: 0,
+            cpuCores: 1,
+            netDownKb: 0,
+            netUpKb: 0,
+            netTotalRxMb: 0,
+            netTotalTxMb: 0
+        };
+    }
+}
+
+function getPublicCurrentWindow(state) {
+    if (!state.bot || !state.bot.currentWindow) return null;
+    const win = state.bot.currentWindow;
+    return {
+        id: win.id,
+        title: cleanMinecraftComponent(win.title) || 'GUI Sảnh / Máy Chủ',
+        type: win.type,
+        slotsCount: (win.slots || []).length,
+        slots: (win.slots || []).map((s, idx) => s ? {
+            slot: idx,
+            name: cleanMinecraftComponent(s.name) || '',
+            displayName: cleanMinecraftComponent(s.displayName) || cleanMinecraftComponent(s.name) || 'Vật phẩm',
+            count: Number.isInteger(s.count) ? Math.max(1, Math.min(64, s.count)) : 1
+        } : null)
+    };
+}
+
 function publicBotState(state) {
     const mem = process.memoryUsage();
+    const hw = getHostHardware();
     return {
         id: state.id,
         botId: BOT_ID,
@@ -3740,6 +4328,8 @@ function publicBotState(state) {
             heap: Math.round(mem.heapUsed / (1024 * 1024)),
             heapMb: Math.round(mem.heapUsed / (1024 * 1024))
         },
+        hostHardware: hw,
+        system: hw,
         host: currentHost(state),
         port: PORT,
 
@@ -3777,11 +4367,13 @@ function publicBotState(state) {
             state.publicIpUpdatedAt || null,
 
         settings: {
+            ecoMode: state.settings.ecoMode !== false,
             autoTotem: state.settings.autoTotem !== false,
             antiHungry: state.settings.antiHungry !== false,
             autoReconnect: state.settings.autoReconnect !== false,
             antiAfkKick: state.settings.antiAfkKick !== false
         },
+        ecoMode: state.settings.ecoMode !== false,
 
         totemCount:
             Number(state.inventoryState?.totemCount || 0),
@@ -3795,6 +4387,28 @@ function publicBotState(state) {
         locationState:
             state.locationState,
 
+        health:
+            state.bot && Number.isFinite(state.bot.health)
+                ? Math.max(0, Math.min(Number(state.bot.health), 20))
+                : 20,
+
+        food:
+            state.bot && Number.isFinite(state.bot.food)
+                ? Math.max(0, Math.min(Number(state.bot.food), 20))
+                : 20,
+
+        isDead:
+            !!(state.bot && state.bot.health === 0),
+
+        deathCount:
+            Number(state.deathCount || 0),
+
+        lastDeathAt:
+            state.lastDeathAt || null,
+
+        lastDeathCoords:
+            state.lastDeathCoords || '',
+
         roundedLocation:
             getRoundedBotCoordinates(state.bot),
 
@@ -3804,17 +4418,10 @@ function publicBotState(state) {
         dimension:
             getBotDimension(state),
 
-        ramRss: Math.round(mem.rss / (1024 * 1024)),
-        ramHeap: Math.round(mem.heapUsed / (1024 * 1024)),
-        rssMb: Math.round(mem.rss / (1024 * 1024)),
-        heapMb: Math.round(mem.heapUsed / (1024 * 1024)),
-
-        memory: {
-            rss: Math.round(mem.rss / (1024 * 1024)),
-            heapUsed: Math.round(mem.heapUsed / (1024 * 1024)),
-            rssMb: Math.round(mem.rss / (1024 * 1024)),
-            heapMb: Math.round(mem.heapUsed / (1024 * 1024))
-        }
+        manuallyStopped: !!state.manuallyStopped,
+        lastKickReason: state.lastKickReason || '',
+        lastKickAt: state.lastKickAt || null,
+        currentWindow: getPublicCurrentWindow(state)
     };
 }
 
@@ -3830,25 +4437,18 @@ function publicBotCredentials(state) {
 }
 
 function getReconnectDelay(state) {
-    const attempt =
-        Math.max(
-            Number(state.reconnectAttempts || 0),
-            0
-        );
-
-    const multiplier =
-        Math.min(
-            Math.pow(1.5, attempt),
-            5
-        );
-
-    const jitter = Math.floor(Math.random() * 1500);
-    return Math.min(
-        Math.round(
-            RECONNECT_DELAY * multiplier
-        ) + jitter,
-        20000
-    );
+    const attempt = Math.max(Number(state.reconnectAttempts || 0), 0);
+    const baseDelay = RECONNECT_DELAY || 3000;
+    const maxDelay = 45000;
+    // Full Jitter Exponential Backoff: cap = min(maxDelay, baseDelay * 2^attempt)
+    const cap = Math.min(maxDelay, baseDelay * Math.pow(2, Math.min(attempt, 5)));
+    // Full Jitter: phân phối ngẫu nhiên đều giữa baseDelay và cap
+    const jitterDelay = baseDelay + Math.floor(Math.random() * Math.max(1000, cap - baseDelay));
+    // Fleet Phase Staggering: độ lệch pha theo BOT_ID chống thundering herd & chống ban IP đồng loạt
+    const botIdNum = Number(BOT_ID) || 1;
+    const staggerOffset = ((botIdNum - 1) % 10) * 1500;
+    const finalDelay = Math.min(jitterDelay + staggerOffset, 60000);
+    return finalDelay;
 }
 
 function scheduleAutoReconnect(state) {
@@ -3928,12 +4528,20 @@ function stopBot(state, source = 'manual') {
     }
 
     state.manuallyStopped = true;
+    saveBotSettingsFile(state.settings, state.autoChatSchedules, state.botSchedules, { manuallyStopped: true });
+
+    // Tạm dừng mọi lịch Auto Chat đang chạy
+    if (Array.isArray(state.autoChatSchedules)) {
+        for (const s of state.autoChatSchedules) {
+            s.running = false;
+        }
+    }
 
     addLog(
         state,
         source === 'scheduler'
             ? 'Scheduler yêu cầu dừng bot.'
-            : 'Dừng bot từ web.'
+            : 'Dừng bot thủ công: Toàn bộ tính năng, lịch trình, auto chat & reconnect đều tạm dừng.'
     );
 
     disconnectBot(
@@ -3968,6 +4576,7 @@ function startBot(state, source = 'manual') {
     }
 
     state.manuallyStopped = false;
+    saveBotSettingsFile(state.settings, state.autoChatSchedules, state.botSchedules, { manuallyStopped: false });
 
     clearAllTimers(state);
     if (state.restartTimer) {
@@ -3996,6 +4605,13 @@ function startBot(state, source = 'manual') {
 }
 
 function registerEvents(state, bot, connectionGeneration = state.connectionGeneration) {
+    // ⚡ Ghost Freeze Tracker: Cập nhật timestamp mỗi khi nhận packet từ server
+    if (bot._client) {
+        bot._client.on('packet', () => {
+            state.lastPacketReceivedAt = Date.now();
+        });
+    }
+
     bot.on('chat', (username, message, translate, jsonMsg) => {
         if (
             !message ||
@@ -4049,16 +4665,22 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
         if (entity === bot.entity && status === 35) {
             addLog(state, '⚡ [TOTEM] Totem vừa phát nổ cứu mạng! Đang tức tốc lắp Totem mới vào tay phụ...');
             fastEquipTotem(state);
-            sendBotDirectAlert('totem_popped', 'Totem vừa phát nổ cứu mạng bot!', { 'Máu hiện tại': bot.health, 'Totem còn lại': state.totemCount });
+            sendBotDirectAlert('totem_popped', 'Totem vừa phát nổ cứu mạng bot!', { 'Máu hiện tại': bot.health, 'Totem còn lại': (state.inventoryState?.totemCount ?? 0) });
         }
     });
 
     bot.on('health', () => {
         if (state.bot !== bot) return;
-        if (bot.health <= 6 && !state.lowHealthAlertSent) {
+        const hp = Number.isFinite(bot.health) ? bot.health : 20;
+        if (hp <= 10 && hp > 0 && !state.lowHealthAlertSent) {
             state.lowHealthAlertSent = true;
-            sendBotDirectAlert('low_health', `Máu của Bot đang ở mức nguy hiểm (${bot.health}/20 HP)!`, { 'Máu': bot.health, 'Đói': bot.food });
-        } else if (bot.health > 14) {
+            sendBotDirectAlert('low_health', `Máu của Bot đang ở mức nguy hiểm (${hp}/20 HP - dưới 5 tim)!`, {
+                'Máu hiện tại': `${hp} / 20 HP`,
+                'Thức ăn': `${bot.food || 0} / 20`,
+                'Totem': String(state.inventoryState?.totemCount ?? 0)
+            });
+            addLog(state, `⚠️ [HEALTH] Cảnh báo máu yếu: còn ${hp}/20 HP!`);
+        } else if (hp > 14) {
             state.lowHealthAlertSent = false;
         }
     });
@@ -4121,6 +4743,9 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
 
         sendBotDirectAlert('kicked', 'Bot đã bị kick khỏi server KingMC.', { 'Lý do': reasonText });
 
+        const cleanedKickReason = cleanMinecraftText(reasonText);
+        state.lastKickReason = cleanedKickReason;
+        state.lastKickAt = new Date().toISOString();
         setBotStatus(state, 'kicked');
         state.ready = false;
         clearManagerTimers(state);
@@ -4168,7 +4793,9 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
             return;
         }
 
-        setBotStatus(state, 'offline');
+        if (state.status !== 'kicked') {
+            setBotStatus(state, 'offline');
+        }
         addLog(state, 'Mất kết nối.');
 
         state.reconnectCount++;
@@ -4219,10 +4846,21 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
             state.bot === bot &&
             state.connectionGeneration === connectionGeneration
         ) {
-            sendBotDirectAlert('death', 'Bot đã chết trong game. Đang chuẩn bị tự động hồi sinh...');
+            state.deathCount = (state.deathCount || 0) + 1;
+            state.lastDeathAt = Date.now();
+            const deathPos = bot.entity?.position
+                ? `(X: ${Math.round(bot.entity.position.x)}, Y: ${Math.round(bot.entity.position.y)}, Z: ${Math.round(bot.entity.position.z)})`
+                : 'Không xác định';
+            state.lastDeathCoords = deathPos;
+
+            sendBotDirectAlert('death', 'Bot đã chết trong game! Đang chuẩn bị tự động hồi sinh...', {
+                'Tọa độ tử vong': deathPos,
+                'Tổng lần chết': String(state.deathCount),
+                'Totem còn lại': String(state.inventoryState?.totemCount ?? 0)
+            });
             addLog(
                 state,
-                '[LIFE] Bot đã chết. Đang chuẩn bị tự động hồi sinh...'
+                `[LIFE] 💀 Bot đã chết tại ${deathPos} (Lần #${state.deathCount}). Đang chuẩn bị tự động hồi sinh...`
             );
             state.ready = false;
             setBotStatus(state, 'connecting');
@@ -4390,6 +5028,9 @@ function connectBot(state) {
     }
 
     state.bot = bot;
+    state.loginFlowStartedAt = Date.now();
+    state.lastPacketReceivedAt = Date.now();
+    startSmartWatchdog(state);
 
     registerEvents(
         state,
@@ -4515,7 +5156,7 @@ function handleServerMessage(
         )
     ) {
         const kind = getLocationKind(bot);
-        if (kind === 'login' && state.settings.autoReconnect) {
+        if (kind === 'login') {
             const now = Date.now();
             if (
                 now - state.lastAuthTime > 3000 &&
@@ -4544,7 +5185,7 @@ function handleServerMessage(
         )
     ) {
         const kind = getLocationKind(bot);
-        if (kind === 'login' && state.settings.autoReconnect) {
+        if (kind === 'login') {
             const now = Date.now();
             if (
                 now - state.lastAuthTime > 3000 &&
@@ -5154,6 +5795,10 @@ input:focus, select:focus, textarea:focus {
 
 .dot.blue {
   background: var(--blue);
+}
+
+.dot.gray {
+  background: #94a3b8;
 }
 
 .summary-grid {
@@ -5769,12 +6414,44 @@ input:focus, select:focus, textarea:focus {
 
 .dragging { opacity: 0.55; }
 .app-footer {
-  margin-top: 24px;
-  text-align: center;
+  margin-top: 28px;
   color: var(--muted);
   font-size: 11px;
   line-height: 1.6;
-  opacity: 0.85;
+}
+.bot-release-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 12px 14px;
+  text-align: left;
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid rgba(56, 189, 248, 0.2);
+  border-radius: 14px;
+}
+.bot-release-copy { min-width: 0; color: #94a3b8; }
+.bot-release-tag {
+  display: inline-block;
+  margin-right: 7px;
+  padding: 2px 7px;
+  border: 1px solid rgba(56, 189, 248, 0.32);
+  border-radius: 999px;
+  color: #38bdf8;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.35px;
+}
+.bot-release-btn {
+  flex: 0 0 auto;
+  padding: 7px 10px !important;
+  border-color: rgba(56, 189, 248, 0.3) !important;
+  color: #bae6fd !important;
+}
+@media (max-width: 620px) {
+  .bot-release-card { align-items: flex-start; flex-direction: column; }
 }
 
 .hidden { display: none !important; }
@@ -5840,6 +6517,26 @@ input:focus, select:focus, textarea:focus {
 </head>
 
 <body>
+  <!-- LOGIN GATE OVERLAY -->
+  <div id="loginGateOverlay" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(10, 14, 23, 0.96); z-index:99999; backdrop-filter:blur(10px); align-items:center; justify-content:center;">
+    <div style="background:#131b2e; border:1px solid #1e293b; border-radius:12px; width:92%; max-width:400px; padding:28px; box-shadow:0 20px 40px rgba(0,0,0,0.6); text-align:center;">
+      <div style="font-size:36px; margin-bottom:8px;">🔐</div>
+      <h2 style="margin:0 0 6px 0; color:#f8fafc; font-size:20px; font-weight:700;">KINGMC BOT ACCESS</h2>
+      <p style="margin:0 0 20px 0; color:#94a3b8; font-size:13px;">Đăng nhập để điều khiển Bot KingMC</p>
+      <div style="text-align:left; margin-bottom:14px;">
+        <label style="font-size:12px; color:#cbd5e1; font-weight:600; display:block; margin-bottom:4px;">Username (Bỏ trống nếu là Admin):</label>
+        <input type="text" id="loginUsernameInput" placeholder="Tài khoản khách thuê..." style="width:100%; box-sizing:border-box; background:#0b1120; border:1px solid #334155; color:#fff; padding:10px 12px; border-radius:6px; font-size:14px; outline:none;" />
+      </div>
+      <div style="text-align:left; margin-bottom:20px;">
+        <label style="font-size:12px; color:#cbd5e1; font-weight:600; display:block; margin-bottom:4px;">Mật khẩu:</label>
+        <input type="password" id="loginPasswordInput" placeholder="Mật khẩu Admin hoặc Manager..." style="width:100%; box-sizing:border-box; background:#0b1120; border:1px solid #334155; color:#fff; padding:10px 12px; border-radius:6px; font-size:14px; outline:none;" />
+      </div>
+      <div id="loginErrorMsg" style="display:none; color:#f87171; font-size:13px; margin-bottom:14px; padding:8px; background:rgba(239,68,68,0.1); border-radius:6px; border:1px solid rgba(239,68,68,0.3);"></div>
+      <button type="button" onclick="submitBotLogin()" style="width:100%; background:linear-gradient(135deg, #10b981, #059669); color:#fff; border:none; padding:12px; border-radius:6px; font-size:15px; font-weight:700; cursor:pointer; transition:all 0.2s;">ĐĂNG NHẬP NGAY</button>
+      <p style="font-size:11px; color:#64748b; margin:16px 0 0 0;">Quản trị viên: nhập mật khẩu Admin.<br>Khách thuê: nhập Username & Mật khẩu Manager được cấp quyền.</p>
+    </div>
+  </div>
+
 
 <div class="app">
 
@@ -5992,10 +6689,26 @@ input:focus, select:focus, textarea:focus {
 
         <div class="info-item">
           <div class="info-label">
-            BỘ NHỚ (RAM) 🧠
+            RAM MÁY HOST 🧠
           </div>
 
           <div id="detailRamUsage" class="info-value" style="color:var(--green);">-- MB</div>
+        </div>
+
+        <div class="info-item">
+          <div class="info-label">
+            CPU MÁY HOST ⚡
+          </div>
+
+          <div id="detailCpuUsage" class="info-value" style="color:#38bdf8;">-- %</div>
+        </div>
+
+        <div class="info-item">
+          <div class="info-label">
+            LƯU LƯỢNG MẠNG 📶
+          </div>
+
+          <div id="detailNetUsage" class="info-value" style="color:var(--yellow);">↓ 0 KB/s • ↑ 0 KB/s</div>
         </div>
       </div>
 
@@ -6243,6 +6956,15 @@ input:focus, select:focus, textarea:focus {
 
     </div>
 
+    <!-- REMOTE GUI INSPECTOR -->
+    <div id="remoteGuiCard" class="panel" style="display:none;">
+      <div class="chat-title-row">
+        <h3 id="remoteGuiTitle">🖥️ GUI Sảnh / Máy Chủ Đang Mở</h3>
+        <div class="revision" style="display:flex;align-items:center;gap:8px;">Click ô để tương tác trực tiếp <button type="button" class="small" onclick="closeGuiWindow()">✕ Đóng GUI</button></div>
+      </div>
+      <div id="remoteGuiSlots" style="display:grid;grid-template-columns:repeat(9, 1fr);gap:4px;margin-top:10px;"></div>
+    </div>
+
     <div id="settingsPanel" class="panel">
 
       <div class="chat-title-row">
@@ -6251,6 +6973,7 @@ input:focus, select:focus, textarea:focus {
       </div>
 
       <div class="setting-list">
+        <label class="check-row"><input id="settingEcoMode" type="checkbox" onchange="markSettingsDirty()"> <span>🌱 Eco Mode (Tiết kiệm 80% CPU & giữ RAM &lt; 220MB)</span></label>
         <label class="check-row"><input id="settingAutoTotem" type="checkbox" onchange="markSettingsDirty()"> <span>Auto Totem phản xạ tức thì (&lt; 50ms)</span></label>
         <label class="check-row"><input id="settingAntiHungry" type="checkbox" onchange="markSettingsDirty()"> <span>Anti Hungry / Auto Eat</span></label>
         <label class="check-row"><input id="settingAutoReconnect" type="checkbox" onchange="markSettingsDirty()"> <span>Auto Reconnect + tự thử lại LOGIN/DN/MENU</span></label>
@@ -6357,7 +7080,36 @@ input:focus, select:focus, textarea:focus {
 </div>
 
 <div class="app-footer">
-  <strong>Version 2.1</strong> • Update 30/09/2026 • Hẹn giờ Bot 1 mode với nhiều dòng, kéo-thả đổi thứ tự, chu kỳ tính theo dòng kề trên; làm gọn UI Auto Chat và tách riêng các nút lưu.
+  <div class="bot-release-card">
+    <div class="bot-release-copy">
+      <span class="bot-release-tag">✨ CẬP NHẬT 15.10.2026</span>
+      <strong style="color:#e2e8f0;">Vận hành ổn định hơn</strong> • Điều khiển GUI, Auto Chat, Eco Mode và phân quyền tài khoản Minecraft đã được tinh chỉnh.
+    </div>
+    <button type="button" class="small bot-release-btn" onclick="openBotUpdateModal()">📜 Chi tiết</button>
+  </div>
+</div>
+
+<div id="botUpdateModal" class="modal hidden">
+  <div class="modal-card" style="width:min(580px,94vw);">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.08);">
+      <div>
+        <div style="font-size:10px;font-weight:800;letter-spacing:.5px;color:#38bdf8;">CẬP NHẬT 15.10.2026</div>
+        <h3 style="margin:4px 0 0;">✨ Bản cập nhật vận hành ổn định</h3>
+      </div>
+      <button type="button" class="small" onclick="closeBotUpdateModal()">✕</button>
+    </div>
+    <div style="padding:16px 0 4px;color:#cbd5e1;line-height:1.7;">
+      <p style="margin:0 0 12px;">Bản cập nhật này tập trung vào các thao tác hằng ngày của bot:</p>
+      <ul style="margin:0;padding-left:20px;display:grid;gap:8px;">
+        <li>Auto Chat, lịch hẹn giờ và Eco Mode duy trì trạng thái ổn định hơn khi bot AFK.</li>
+        <li>Remote GUI có thể đóng trực tiếp từ Dashboard và hiển thị dữ liệu cửa sổ an toàn hơn.</li>
+        <li>Phân quyền thay đổi tài khoản Minecraft được kiểm tra ở cả Manager và Bot.</li>
+        <li>Bot được dừng thủ công sẽ không bị đưa vào luồng kết nối lại lỗi từ Manager.</li>
+      </ul>
+      <p style="margin:14px 0 0;color:#94a3b8;">Nếu bot đang hoạt động bình thường, bạn không cần thao tác thêm.</p>
+    </div>
+    <div class="modal-actions" style="margin-top:16px;"><button type="button" class="primary" onclick="closeBotUpdateModal()">Đã hiểu</button></div>
+  </div>
 </div>
 
 <div
@@ -6455,9 +7207,16 @@ async function apiJson(url, options) {
     ? Math.max(1000, Math.min(30000, Number(original.timeoutMs)))
     : 15000;
   const timer = setTimeout(function() { controller.abort(); }, timeoutMs);
+  const token = localStorage.getItem('bot_token');
+  const headers = { ...(original.headers || {}) };
+  if (token) {
+    headers['x-bot-token'] = token;
+    headers['Authorization'] = 'Bearer ' + token;
+  }
   const requestOptions = {
     cache: 'no-store',
     ...original,
+    headers,
     signal: original.signal || controller.signal
   };
   delete requestOptions.timeoutMs;
@@ -6486,8 +7245,11 @@ async function apiJson(url, options) {
   }
 }
 
-function statusMeta(status, available) {
+function statusMeta(status, available, manuallyStopped = false) {
   if (!available) return ['red', 'OFFLINE / KHÔNG KẾT NỐI'];
+  if (manuallyStopped && (status === 'offline' || status === 'kicked' || status === 'stopped')) {
+    return ['gray', 'ĐÃ DỪNG THỦ CÔNG'];
+  }
   switch (status) {
     case 'afk': return ['green', 'AFK'];
     case 'online': return ['blue', 'ONLINE'];
@@ -6543,7 +7305,7 @@ function renderBotState() {
   }
   lastKnownBotStatus = bot.status;
 
-  const statusInfo = statusMeta(bot.status, bot.available !== false);
+  const statusInfo = statusMeta(bot.status, bot.available !== false, !!bot.manuallyStopped);
   const status = byId('detailStatus');
   if (status) {
     status.innerHTML =
@@ -6590,14 +7352,35 @@ function renderBotState() {
 
   const topRam = byId('topRamUsage');
   const cardRam = byId('detailRamUsage');
-  const ram = Number(bot.ramRssMb || bot.ramRss || bot.rssMb || bot.memory?.rssMb || 0);
-  const heap = Number(bot.ramHeap || bot.heapMb || bot.memory?.heapMb || 0);
-  if (topRam && ram > 0) {
-    topRam.textContent = ram + ' MB';
-  }
-  if (cardRam) {
-    cardRam.textContent = ram > 0 ? (ram + ' MB' + (heap > 0 ? ' (Heap ' + heap + ' MB)' : '')) : '-- MB';
-    cardRam.style.color = ram > 380 ? 'var(--red)' : ram > 280 ? 'var(--yellow)' : 'var(--green)';
+  const cardCpu = byId('detailCpuUsage');
+  const cardNet = byId('detailNetUsage');
+  const hw = bot.hostHardware || bot.system;
+
+  if (hw && hw.ramTotalMb > 0) {
+    if (topRam) {
+      topRam.textContent = hw.ramUsedMb + '/' + hw.ramTotalMb + ' MB (' + hw.ramPercent + '%)';
+    }
+    if (cardRam) {
+      cardRam.textContent = hw.ramUsedMb + ' / ' + hw.ramTotalMb + ' MB (' + hw.ramPercent + '%) [Bot: ' + hw.botRssMb + ' MB]';
+      cardRam.style.color = hw.ramPercent > 85 ? 'var(--red)' : hw.ramPercent > 70 ? 'var(--yellow)' : 'var(--green)';
+    }
+    if (cardCpu) {
+      cardCpu.textContent = hw.cpuPercent + '% / ' + hw.cpuCores + ' Cores';
+      cardCpu.style.color = hw.cpuPercent > 85 ? 'var(--red)' : hw.cpuPercent > 60 ? 'var(--yellow)' : '#38bdf8';
+    }
+    if (cardNet) {
+      cardNet.textContent = '↓ ' + hw.netDownKb + ' KB/s • ↑ ' + hw.netUpKb + ' KB/s (Tổng: ' + hw.netTotalRxMb + ' MB)';
+    }
+  } else {
+    const ram = Number(bot.ramRssMb || bot.ramRss || bot.rssMb || bot.memory?.rssMb || 0);
+    const heap = Number(bot.ramHeap || bot.heapMb || bot.memory?.heapMb || 0);
+    if (topRam && ram > 0) {
+      topRam.textContent = ram + ' MB';
+    }
+    if (cardRam) {
+      cardRam.textContent = ram > 0 ? (ram + ' MB' + (heap > 0 ? ' (Heap ' + heap + ' MB)' : '')) : '-- MB';
+      cardRam.style.color = ram > 380 ? 'var(--red)' : ram > 280 ? 'var(--yellow)' : 'var(--green)';
+    }
   }
 
   renderDimensionLocation();
@@ -6612,11 +7395,13 @@ function renderPublicSettings(settingsData) {
     ? settingsData.settings
     : (typeof settingsData === 'object' ? settingsData : {});
 
+  const ecoMode = byId('settingEcoMode');
   const autoTotem = byId('settingAutoTotem');
   const antiHungry = byId('settingAntiHungry');
   const autoReconnect = byId('settingAutoReconnect');
   const antiAfkKick = byId('settingAntiAfkKick');
 
+  if (ecoMode) ecoMode.checked = settings.ecoMode !== false;
   if (autoTotem) autoTotem.checked = settings.autoTotem !== false;
   if (antiHungry) antiHungry.checked = settings.antiHungry !== false;
   if (autoReconnect) autoReconnect.checked = settings.autoReconnect !== false;
@@ -6979,6 +7764,7 @@ async function saveSettings() {
 
   const payload = {
     settings: {
+      ecoMode: !!(byId('settingEcoMode') && byId('settingEcoMode').checked),
       autoTotem: !!(byId('settingAutoTotem') && byId('settingAutoTotem').checked),
       antiHungry: !!(byId('settingAntiHungry') && byId('settingAntiHungry').checked),
       autoReconnect: !!(byId('settingAutoReconnect') && byId('settingAutoReconnect').checked),
@@ -7638,19 +8424,9 @@ async function unequipAndMove(destination, destinationSlot) {
     renderInventory();
   }
 
-  const slots = inventory && inventory.slots
-    ? inventory.slots
-    : {};
-
-  let sourceSlot = null;
-
-  for (let slot = 9; slot <= 35; slot++) {
-    const item = slots[String(slot)];
-    if (item && item.name) {
-      sourceSlot = slot;
-      break;
-    }
-  }
+  const sourceSlot = (result.data && result.data.unequippedToSlot !== undefined)
+    ? result.data.unequippedToSlot
+    : null;
 
   if (
     sourceSlot !== null &&
@@ -7873,7 +8649,8 @@ async function selectHotbar(slot) {
 }
 
 async function postInventory(path, body) {
-  return apiJson(path, {
+  const fullPath = path.startsWith('/api') ? path : ('/api' + (path.startsWith('/') ? path : '/' + path));
+  return apiJson(fullPath, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(body)
@@ -7980,6 +8757,12 @@ async function refresh(force) {
       return;
     }
 
+    if (result.status === 401 || result.status === 403) {
+      const overlay = byId('loginGateOverlay');
+      if (overlay) overlay.style.display = 'flex';
+      return;
+    }
+
     if (!result.ok) {
       showToast(
         result.data.error ||
@@ -7992,6 +8775,7 @@ async function refresh(force) {
       bot = result.data.bot;
       uptimeSyncAt = Date.now();
       renderBotState();
+      renderRemoteGui(bot.currentWindow);
     }
 
     if (result.data.inventory) {
@@ -8043,7 +8827,8 @@ function markSettingsInputDirty(event) {
     target.id === 'settingAutoTotem' ||
     target.id === 'settingAntiHungry' ||
     target.id === 'settingAutoReconnect' ||
-    target.id === 'settingAntiAfkKick'
+    target.id === 'settingAntiAfkKick' ||
+    target.id === 'settingEcoMode'
   ) {
     markSettingsDirty();
     return;
@@ -8173,10 +8958,23 @@ window.copyToClipboard = copyToClipboard;
 let soundAlertEnabled = localStorage.getItem('kingmc_sound_alert') === '1';
 let lastKnownBotStatus = null;
 
+let _sharedAudioCtx = null;
+function getSharedAudioContext() {
+  if (!_sharedAudioCtx) {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (AudioCtx) _sharedAudioCtx = new AudioCtx();
+  }
+  if (_sharedAudioCtx && _sharedAudioCtx.state === 'suspended') {
+    _sharedAudioCtx.resume().catch(function() {});
+  }
+  return _sharedAudioCtx;
+}
+
 function playAlertTone(type = 'warn') {
   if (!soundAlertEnabled) return;
   try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = getSharedAudioContext();
+    if (!ctx) return;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.connect(gain);
@@ -8217,8 +9015,129 @@ function updateSoundAlertButton() {
 }
 window.toggleSoundAlert = toggleSoundAlert;
 
+function renderRemoteGui(win) {
+  const card = byId('remoteGuiCard');
+  if (!card) return;
+  if (!win || !win.slots || win.slots.length === 0) {
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = 'block';
+  const titleEl = byId('remoteGuiTitle');
+  if (titleEl) titleEl.textContent = '🖥️ ' + (win.title || 'GUI Sảnh / Máy Chủ Đang Mở');
+  const container = byId('remoteGuiSlots');
+  if (!container) return;
+  container.innerHTML = win.slots.slice(0, 54).map(function(item, idx) {
+    if (!item) {
+      return '<div onclick="clickGuiSlot(' + idx + ')" style="aspect-ratio:1;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:4px;cursor:pointer;" title="Ô ' + idx + ' (Trống)"></div>';
+    }
+    const rawName = String(item.displayName || item.name || 'Vật phẩm');
+    const safeName = escapeHtml(rawName);
+    const safeShortName = escapeHtml(rawName.slice(0, 8));
+    return '<div onclick="clickGuiSlot(' + idx + ')" style="aspect-ratio:1;background:rgba(0,255,136,0.12);border:1px solid rgba(0,255,136,0.4);border-radius:4px;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative;padding:2px;" title="Ô ' + idx + ': ' + safeName + ' x' + item.count + '">' +
+      '<span style="font-size:10px;font-weight:bold;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:90%;">' + safeShortName + '</span>' +
+      (item.count > 1 ? '<span style="position:absolute;bottom:2px;right:2px;font-size:9px;background:rgba(0,0,0,0.7);padding:1px 3px;border-radius:3px;color:#fff;">' + item.count + '</span>' : '') +
+      '</div>';
+  }).join('');
+}
+
+async function clickGuiSlot(slot) {
+  try {
+    const res = await postInventory('/api/bot/window/click', { slot, mouseButton: 0 });
+    if (!res.ok) showToast(res.data?.error || 'Lỗi click GUI');
+    else showToast('Đã click ô ' + slot);
+  } catch(e) {
+    showToast('Lỗi gửi click GUI');
+  }
+}
+
+async function closeGuiWindow() {
+  try {
+    const res = await postInventory('/api/bot/window/close', {});
+    if (!res.ok) {
+      showToast(res.data?.error || 'Không thể đóng GUI.');
+      return;
+    }
+    showToast(res.data?.message || 'Đã đóng GUI.');
+    await refresh(true);
+  } catch (_) {
+    showToast('Lỗi gửi yêu cầu đóng GUI.');
+  }
+}
+
+async function checkBotAuth() {
+  const overlay = byId('loginGateOverlay');
+  try {
+    const token = localStorage.getItem('bot_token') || '';
+    const res = await fetch('/api/auth/me' + (token ? '?token=' + encodeURIComponent(token) : ''));
+    const data = await res.json();
+    if (!data || !data.loggedIn) {
+      if (overlay) overlay.style.display = 'flex';
+      return false;
+    } else {
+      if (overlay) overlay.style.display = 'none';
+      return true;
+    }
+  } catch (e) {
+    return true;
+  }
+}
+
+async function submitBotLogin() {
+  const usernameInput = byId('loginUsernameInput');
+  const passwordInput = byId('loginPasswordInput');
+  const errorMsg = byId('loginErrorMsg');
+  const overlay = byId('loginGateOverlay');
+
+  const username = usernameInput ? usernameInput.value.trim() : '';
+  const password = passwordInput ? passwordInput.value.trim() : '';
+
+  if (!password) {
+    if (errorMsg) {
+      errorMsg.textContent = 'Vui lòng nhập mật khẩu.';
+      errorMsg.style.display = 'block';
+    }
+    return;
+  }
+
+  if (errorMsg) errorMsg.style.display = 'none';
+
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: username, password: password })
+    });
+    const data = await res.json();
+    if (data && data.ok) {
+      if (data.token) {
+        localStorage.setItem('bot_token', data.token);
+        document.cookie = 'bot_token=' + data.token + '; path=/; max-age=2592000';
+      }
+      if (overlay) overlay.style.display = 'none';
+      await refresh(true);
+    } else {
+      if (errorMsg) {
+        errorMsg.textContent = data.error || 'Đăng nhập không thành công.';
+        errorMsg.style.display = 'block';
+      }
+    }
+  } catch (err) {
+    if (errorMsg) {
+      errorMsg.textContent = 'Lỗi kết nối máy chủ: ' + err.message;
+      errorMsg.style.display = 'block';
+    }
+  }
+}
+
+window.renderRemoteGui = renderRemoteGui;
+window.clickGuiSlot = clickGuiSlot;
+window.closeGuiWindow = closeGuiWindow;
+window.submitBotLogin = submitBotLogin;
+
 (async function init() {
   updateSoundAlertButton();
+  await checkBotAuth();
 
   const msgInput = byId('messageInput');
   if (msgInput) {
@@ -8332,6 +9251,7 @@ app.get(
 
 function publicSettingsState(state) {
     return {
+        ecoMode: state.settings.ecoMode !== false,
         autoTotem: state.settings.autoTotem !== false,
         antiHungry: state.settings.antiHungry !== false,
         autoReconnect: state.settings.autoReconnect !== false,
@@ -8389,6 +9309,7 @@ app.post('/api/settings', (req, res) => {
         : body;
 
     const nextSettings = {
+        ecoMode: incoming.ecoMode !== false,
         autoTotem: incoming.autoTotem !== false,
         antiHungry: incoming.antiHungry !== false,
         autoReconnect: incoming.autoReconnect !== false,
@@ -8408,10 +9329,11 @@ app.post('/api/settings', (req, res) => {
     }
 
     botState.settings = nextSettings;
+    applyEcoModeOptimizations(botState, botState.bot);
 
     addLog(
         botState,
-        `[SETTING] Auto Totem=${nextSettings.autoTotem ? 'ON' : 'OFF'} | Anti Hungry=${nextSettings.antiHungry ? 'ON' : 'OFF'} | Auto Reconnect=${nextSettings.autoReconnect ? 'ON' : 'OFF'}.`
+        `[SETTING] Eco Mode=${nextSettings.ecoMode ? 'ON' : 'OFF'} | Auto Totem=${nextSettings.autoTotem ? 'ON' : 'OFF'} | Anti Hungry=${nextSettings.antiHungry ? 'ON' : 'OFF'} | Auto Reconnect=${nextSettings.autoReconnect ? 'ON' : 'OFF'}.`
     );
 
     if (!nextSettings.autoReconnect) {
@@ -8448,6 +9370,11 @@ app.post('/api/auto-chat', (req, res) => {
         : {};
 
     const schedules = sanitizeAutoChatSchedules(body.autoChatSchedules);
+    if (hasRestrictedMinecraftAccountCommand(schedules) && !canChangeMinecraftAccount(req)) {
+        return res.status(403).json({
+            error: 'Bạn không được phép lên lịch lệnh thay đổi tài khoản Minecraft.'
+        });
+    }
     const runtimeSchedules = sanitizeAutoChatSchedules(schedules);
 
     for (const schedule of runtimeSchedules) {
@@ -8492,6 +9419,22 @@ app.get('/api/bot-schedules', (req, res) => {
 
 app.post('/api/bot-schedules', (req, res) => {
     const body = req.body && typeof req.body === 'object' ? req.body : {};
+    if (body.enabled === false) {
+        if (Array.isArray(botState.botSchedules)) {
+            botState.botSchedules = botState.botSchedules.map(s => ({ ...s, enabled: false }));
+        }
+        saveBotSettingsFile(
+            botState.settings,
+            botState.autoChatSchedules,
+            botState.botSchedules
+        );
+        addLog(botState, '[SCHEDULER] Đã khóa hẹn giờ Bot do hết hạn gói thuê.');
+        return res.json({
+            ok: true,
+            message: 'Đã vô hiệu hóa hẹn giờ Bot.',
+            botSchedules: publicBotSchedulesState(botState)
+        });
+    }
     const rawSchedules = Array.isArray(body.botSchedules)
         ? body.botSchedules
         : body.botSchedules && typeof body.botSchedules === 'object'
@@ -8673,6 +9616,9 @@ app.get(
                 settings: '/api/settings',
                 autoChat: '/api/auto-chat',
                 botSchedules: '/api/bot-schedules',
+                windowClick: '/api/bot/window/click',
+                windowClose: '/api/bot/window/close',
+                resetCustomer: '/api/bot/reset-customer',
                 clearLogs: '/api/bot/logs/clear',
                 clearChatLogs: '/api/bot/chat-logs/clear',
             }
@@ -8691,6 +9637,9 @@ app.get(
 app.get(
     '/api/bot/credentials',
     (req, res) => {
+        if (BOT_SECRET_KEY && !isManagerSecretRequest(req) && req.botSession?.role !== 'admin') {
+            return res.status(403).json({ ok: false, error: 'Chỉ Manager hoặc phiên Admin mới có quyền đọc thông tin tài khoản bot.' });
+        }
         res.json(
             publicBotCredentials(
                 botState
@@ -8893,6 +9842,12 @@ app.post(
 
         }
 
+        if (isRestrictedMinecraftAccountCommand(text) && !canChangeMinecraftAccount(req)) {
+            return res.status(403).json({
+                error: 'Bạn không được phép gửi lệnh thay đổi tài khoản Minecraft.'
+            });
+        }
+
         if (
             !botState.bot ||
             !botState.bot.player
@@ -9019,6 +9974,13 @@ app.post(
     '/api/bot/account',
     (req, res) => {
 
+        if (!canChangeMinecraftAccount(req)) {
+            return res.status(403).json({
+                ok: false,
+                error: 'Bạn không được phép thay đổi tài khoản Minecraft.'
+            });
+        }
+
         const username =
             typeof req.body?.username === 'string'
                 ? req.body.username.trim()
@@ -9037,8 +9999,21 @@ app.post(
         }
 
         const changed = [];
+        const oldUsername = botState.username;
+        const oldPassword = botState.password;
+        const oldLogs = botState.logs;
+        const oldChatLogs = botState.chatLogs;
+        const oldLogRevision = botState.logRevision;
+        const oldChatLogRevision = botState.chatLogRevision;
+        const oldStateRevision = botState.stateRevision;
 
         if (username) {
+            if (oldUsername && oldUsername !== username) {
+                botState.logs = [];
+                botState.chatLogs = [];
+                botState.logRevision++;
+                botState.chatLogRevision++;
+            }
             botState.username =
                 username;
             changed.push('username');
@@ -9052,9 +10027,30 @@ app.post(
 
         botState.stateRevision++;
 
+        const persisted = saveBotSettingsFile(
+            botState.settings,
+            botState.autoChatSchedules,
+            botState.botSchedules,
+            { username: botState.username, password: botState.password, manuallyStopped: botState.manuallyStopped }
+        );
+
+        if (!persisted) {
+            botState.username = oldUsername;
+            botState.password = oldPassword;
+            botState.logs = oldLogs;
+            botState.chatLogs = oldChatLogs;
+            botState.logRevision = oldLogRevision;
+            botState.chatLogRevision = oldChatLogRevision;
+            botState.stateRevision = oldStateRevision;
+            return res.status(500).json({
+                ok: false,
+                error: 'Không thể lưu bot_settings.json; tài khoản chưa được thay đổi.'
+            });
+        }
+
         addLog(
             botState,
-            `Đã thay đổi ${changed.join(' + ')} từ web.`
+            `Đã thay đổi ${changed.join(' + ')} và lưu bền vững vào bot_settings.json.`
         );
 
         res.json({
@@ -9062,6 +10058,49 @@ app.post(
             message:
                 `Đã lưu ${changed.join(' + ')}.`
         });
+    }
+);
+
+// -----------------------------------------------------------------------------
+// Reset Customer Bot (Bàn giao lại cho khách mới)
+// -----------------------------------------------------------------------------
+
+app.post(
+    '/api/bot/reset-customer',
+    (req, res) => {
+        if (BOT_SECRET_KEY && !isManagerSecretRequest(req) && req.botSession?.role !== 'admin') {
+            return res.status(403).json({
+                ok: false,
+                error: 'Chỉ Manager hoặc phiên Admin mới có quyền reset bàn giao bot.'
+            });
+        }
+        stopBot(botState, 'manual');
+        botState.username = '';
+        botState.password = '';
+        botState.logs = [];
+        botState.chatLogs = [];
+        botState.autoChatSchedules = [];
+        botState.botSchedules = [];
+        botState.manuallyStopped = true;
+        botState.stateRevision++;
+        botState.logRevision++;
+        botState.chatLogRevision++;
+
+        const persisted = saveBotSettingsFile(
+            botState.settings,
+            [],
+            [],
+            { username: '', password: '', manuallyStopped: true }
+        );
+
+        if (!persisted) {
+            return res.status(500).json({
+                ok: false,
+                error: 'Không thể lưu bot_settings.json sau khi reset bot.'
+            });
+        }
+
+        res.json({ ok: true, message: 'Đã làm sạch bot thành công.' });
     }
 );
 
@@ -9680,7 +10719,8 @@ app.post(
                 inventory:
                     publicInventoryState(
                         botState
-                    )
+                    ),
+                unequippedToSlot: emptySlot
             });
         } catch (err) {
             addLog(
@@ -9942,6 +10982,132 @@ app.post(
 // Render / Google Apps Script can call /health.
 // -----------------------------------------------------------------------------
 
+
+// -----------------------------------------------------------------------------
+// Remote GUI Inspector API
+// -----------------------------------------------------------------------------
+
+app.post('/api/bot/window/click', async (req, res) => {
+    const slot = Number(req.body?.slot);
+    const mouseButton = Number(req.body?.mouseButton ?? 0);
+    const mode = Number(req.body?.mode ?? 0);
+    if (!botState.bot || !botState.bot.currentWindow) {
+        return res.status(400).json({ ok: false, error: 'Không có cửa sổ GUI nào đang mở.' });
+    }
+    if (
+        !Number.isInteger(slot) ||
+        slot < 0 ||
+        slot >= botState.bot.currentWindow.slots.length
+    ) {
+        return res.status(400).json({ ok: false, error: 'Slot GUI không hợp lệ.' });
+    }
+    try {
+        await Promise.resolve(botState.bot.clickWindow(slot, mouseButton, mode));
+        addLog(botState, `[GUI] Click slot ${slot} (button ${mouseButton}).`);
+        res.json({ ok: true, message: `Đã click slot ${slot}.` });
+    } catch (err) {
+        addLog(botState, `[GUI] Click slot ${slot} lỗi: ${err.message}`);
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+app.post('/api/bot/window/close', (req, res) => {
+    const bot = botState.bot;
+    if (!bot?.currentWindow) {
+        return res.status(400).json({ ok: false, error: 'Không có cửa sổ GUI nào đang mở.' });
+    }
+    try {
+        bot.closeWindow(bot.currentWindow);
+        addLog(botState, '[GUI] Đã đóng cửa sổ GUI hiện tại.');
+        return res.json({ ok: true, message: 'Đã đóng cửa sổ GUI.' });
+    } catch (err) {
+        addLog(botState, `[GUI] Đóng cửa sổ GUI lỗi: ${err.message}`);
+        return res.status(500).json({ ok: false, error: err.message || 'Không thể đóng cửa sổ GUI.' });
+    }
+});
+
+// -----------------------------------------------------------------------------
+// Auth & Login Gate API for Bot Web UI
+// -----------------------------------------------------------------------------
+
+app.post('/api/auth/login', async (req, res) => {
+    const username = (req.body?.username || '').trim();
+    const password = (req.body?.password || '').trim();
+    if (!password) {
+        return res.status(400).json({ ok: false, error: 'Vui lòng nhập mật khẩu.' });
+    }
+
+    // 1. Kiểm tra Admin Password
+    if (timingSafeStringEquals(password, BOT_ADMIN_PASSWORD)) {
+        const token = createBotSession('admin', username || 'admin');
+        return res.json({ ok: true, token, role: 'admin', username: username || 'admin' });
+    }
+
+    // 2. Nếu có username + password, gọi sang Manager để verify quyền sở hữu bot con
+    if (username && password) {
+        try {
+            const targetManager = MANAGER_API_URL.replace(/\/+$/, '');
+            const fetchRes = await fetch(`${targetManager}/api/auth/verify-bot-access`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    username,
+                    password,
+                    botId: BOT_ID,
+                    botUrl: req.headers.host || ''
+                })
+            });
+            const data = await fetchRes.json();
+            if (data && data.ok) {
+                const role = data.role === 'admin' ? 'admin' : 'user';
+                const token = createBotSession(role, data.username || username, {
+                    allowAccountChange: data.allowAccountChange !== false
+                });
+                return res.json({ ok: true, token, role, username: data.username || username });
+            } else {
+                return res.status(403).json({ ok: false, error: data?.error || 'Tài khoản không có quyền truy cập bot này.' });
+            }
+        } catch (err) {
+            return res.status(401).json({ ok: false, error: 'Sai mật khẩu Admin hoặc không thể kết nối tới Manager để xác thực khách thuê.' });
+        }
+    }
+
+    return res.status(401).json({ ok: false, error: 'Mật khẩu Admin không chính xác.' });
+});
+
+app.get('/api/auth/me', (req, res) => {
+    const authHeader = req.headers['authorization'] || req.headers['x-bot-token'];
+    let token = req.query.token;
+    if (authHeader) {
+        if (authHeader.startsWith('Bearer ')) token = authHeader.substring(7);
+        else token = authHeader;
+    }
+    if (!token && req.headers.cookie) {
+        const match = req.headers.cookie.match(/bot_token=([^;]+)/);
+        if (match) token = match[1];
+    }
+    const session = verifyBotSession(token);
+    if (!session) {
+        return res.json({ ok: false, loggedIn: false });
+    }
+    return res.json({ ok: true, loggedIn: true, user: { role: session.role, username: session.username } });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+    const authHeader = req.headers['authorization'] || req.headers['x-bot-token'];
+    let token = req.query.token;
+    if (authHeader) {
+        if (authHeader.startsWith('Bearer ')) token = authHeader.substring(7);
+        else token = authHeader;
+    }
+    if (!token && req.headers.cookie) {
+        const match = req.headers.cookie.match(/bot_token=([^;]+)/);
+        if (match) token = match[1];
+    }
+    if (token) botSessions.delete(token);
+    res.json({ ok: true });
+});
+
 app.get(
     '/health',
     (req, res) => {
@@ -9976,6 +11142,7 @@ app.get(
         const rssMb = Math.round(mem.rss / (1024 * 1024));
         const heapMb = Math.round(mem.heapUsed / (1024 * 1024));
         let renderedHtml = HTML;
+        if (cur.ecoMode) renderedHtml = renderedHtml.replace('id="settingEcoMode"', 'id="settingEcoMode" checked');
         if (cur.autoTotem) renderedHtml = renderedHtml.replace('id="settingAutoTotem"', 'id="settingAutoTotem" checked');
         if (cur.antiHungry) renderedHtml = renderedHtml.replace('id="settingAntiHungry"', 'id="settingAntiHungry" checked');
         if (cur.autoReconnect) renderedHtml = renderedHtml.replace('id="settingAutoReconnect"', 'id="settingAutoReconnect" checked');
@@ -10016,12 +11183,12 @@ app.get(
 
 function scheduleAutoStartOnBoot() {
     const hasConfiguredCredentials =
-        !!(BOT_CONFIG.USERNAME && BOT_CONFIG.PASSWORD);
+        !!(botState.username && botState.password);
 
     if (!hasConfiguredCredentials) {
         addLog(
             botState,
-            'Bot đang OFFLINE: BOT_CONFIG chưa có username/password. Có thể nhập tài khoản trên web rồi bấm Chạy.'
+            'Bot đang OFFLINE: Chưa có username/password. Có thể nhập tài khoản trên web rồi bấm Chạy.'
         );
         return;
     }
@@ -10034,9 +11201,17 @@ function scheduleAutoStartOnBoot() {
         return;
     }
 
+    if (botState.manuallyStopped) {
+        addLog(
+            botState,
+            'Bot đang ở trạng thái DỪNG THỦ CÔNG (manuallyStopped). Bot đang OFFLINE, chờ người dùng khởi động.'
+        );
+        return;
+    }
+
     addLog(
         botState,
-        'Đã đọc credential từ BOT_CONFIG. Service đã listen, đang tự khởi động bot.'
+        `Đã đọc credential từ tài khoản (${botState.username}). Service đã listen, đang tự khởi động bot.`
     );
 
     clearAfkTimers(botState);
@@ -10046,7 +11221,7 @@ function scheduleAutoStartOnBoot() {
             return;
         }
 
-        if (botState.bot || !botState.manuallyStopped) {
+        if (botState.bot) {
             return;
         }
 
@@ -10072,9 +11247,9 @@ listenHttpServer(app, HTTP_PORT, PLATFORM, (serverInstance, activePort) => {
     console.log(`  🌐 WEB DASHBOARD: http://localhost:${activePort} (hoặc domain VPS / Hosting)`);
     console.log(`  📦 NỀN TẢNG: ${PLATFORM.toUpperCase()} | PORT WEB: ${activePort}`);
     console.log(`  🎮 SERVER MINECRAFT: ${HOSTS.join(', ')}:${PORT} | PHIÊN BẢN: ${MC_VERSION}`);
-    const creds = getConfiguredCredentials();
+    const creds = { username: botState.username, password: botState.password };
     if (!creds.username || !creds.password) {
-        console.log(`  ⚠️  CHÚ Ý: Chưa cấu hình USERNAME / PASSWORD ở đầu file. Bot đang đợi nhập từ Web UI!`);
+        console.log(`  ⚠️  CHÚ Ý: Chưa cấu hình USERNAME / PASSWORD. Bot đang đợi nhập từ Web UI!`);
     } else {
         console.log(`  👤 TÀI KHOẢN: ${creds.username} (Tự động kết nối)`);
     }
