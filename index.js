@@ -6,72 +6,16 @@ const os = require('os');
 const crypto = require('crypto');
 
 // ============================================================================
-// CẤU HÌNH TỔNG BOT MINECRAFT KINGMC (HARDCODED CONFIG V7 - SIÊU VIP)
+// CẤU HÌNH TỔNG BOT MINECRAFT KINGMC (PURE RENDER OPTIMIZED V11.3)
 //
-// Quăng file này lên VPS / Hosting dưới dạng index.js hoặc bot.js.
-// Tự động nhận diện Render / RavenHost / VPS và khởi chạy Web UI tức thì!
+// Triển khai file này lên Render Web Service hoặc VPS dưới dạng index.js / bot.js.
+// Tự động nhận diện Render Cloud Native (PORT 10000) và khởi chạy Web UI tức thì!
 // Chỉnh sửa các trường cấu hình trực tiếp ngay bên dưới:
 // ============================================================================
-
-// --- BẢO MẬT GIAO TIẾP & LOGIN GATE ---
-const BOT_SECRET_KEY = process.env.BOT_SECRET_KEY || '';
-const BOT_ADMIN_PASSWORD = process.env.BOT_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || 'admin123';
-const MANAGER_API_URL = process.env.MANAGER_API_URL || 'http://localhost:3000';
-
-const botSessions = new Map();
-
-function createBotSession(role, username, options = {}) {
-    const token = 'bsess_' + crypto.randomBytes(32).toString('hex');
-    botSessions.set(token, {
-        role,
-        username,
-        allowAccountChange: role === 'admin' || options.allowAccountChange === true,
-        expiresAt: Date.now() + 24 * 60 * 60 * 1000
-    });
-    return token;
-}
-
-function verifyBotSession(token) {
-    if (!token) return null;
-    const sess = botSessions.get(token);
-    if (!sess) return null;
-    if (Date.now() > sess.expiresAt) {
-        botSessions.delete(token);
-        return null;
-    }
-    return sess;
-}
-
-function timingSafeStringEquals(left, right) {
-    if (typeof left !== 'string' || typeof right !== 'string') return false;
-    const leftBuffer = Buffer.from(left);
-    const rightBuffer = Buffer.from(right);
-    return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
-}
-
-function getBotSessionFromRequest(req) {
-    const authHeader = req.headers['authorization'] || req.headers['x-bot-token'];
-    let token = req.query?.token;
-    if (typeof authHeader === 'string') {
-        token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
-    }
-    if (!token && req.headers.cookie) {
-        const match = String(req.headers.cookie).match(/bot_token=([^;]+)/);
-        if (match) token = decodeURIComponent(match[1]);
-    }
-    return verifyBotSession(token);
-}
-
-function isManagerSecretRequest(req) {
-    return !!BOT_SECRET_KEY && timingSafeStringEquals(String(req.headers['x-bot-secret'] || ''), BOT_SECRET_KEY);
-}
-
-function canChangeMinecraftAccount(req) {
-    const session = req.botSession || getBotSessionFromRequest(req);
-    return isManagerSecretRequest(req) || session?.role === 'admin' || session?.allowAccountChange === true;
-}
-
 const BOT_CONFIG = {
+    // --- 0. KHÓA BẢO MẬT NỘI BỘ MANAGER <-> BOT CON ---
+    BOT_SECRET_KEY: '',                   // Khóa bí mật giao tiếp dịch vụ nội bộ
+
     // --- 1. TÀI KHOẢN BOT (ĐỂ TRỐNG ĐỂ TỰ ĐIỀN HOẶC NHẬP TỪ WEB UI) ---
     USERNAME: '',                         // Tên tài khoản Minecraft ingame (VD: 'AFK_PRO_01')
     PASSWORD: '',                         // Mật khẩu /login trong server KingMC (VD: 'matkhau123')
@@ -86,10 +30,9 @@ const BOT_CONFIG = {
     TELEGRAM_BOT_TOKEN: '',               // Token Bot Telegram (VD: '123456789:ABCdefGhI...')
     TELEGRAM_CHAT_ID: '',                 // ID cuộc trò chuyện Telegram nhận thông báo
 
-    // --- 4. CỔNG MÁY CHỦ WEB & NỀN TẢNG HOSTING (TỰ ĐỘNG GÁN 100%) ---
-    PLATFORM: 'auto',                     // 'auto' (Tự nhận diện Render / RavenHost / Local VPS)
-    WEB_PORT: 3000,                       // Cổng Web dự phòng khi test Local PC (Render & RavenHost tự động gán 100%)
-    RAVEN_HTTP_PORT: null,                // Cổng RavenHost: ĐỂ NULL ĐỂ TỰ ĐỘNG LẤY TỪ PANEL RAVENHOST (SERVER_PORT)
+    // --- 4. CỔNG MÁY CHỦ WEB & NỀN TẢNG HOSTING (THUẦN RENDER CLOUD) ---
+    PLATFORM: 'auto',                     // 'auto' (Tự nhận diện Render Cloud Web Service / Local PC)
+    WEB_PORT: 10000,                      // Cổng Web mặc định trên Render (Render tự gán PORT=10000; test Local dự phòng 3000)
     BOT_ID: '1',                          // ID định danh của bot
 
     // --- 5. TỐI ƯU HÓA BỘ NHỚ & CHỐNG TRÀN RAM (WATCHDOG 300-500MB) ---
@@ -122,6 +65,111 @@ const BOT_CONFIG = {
     }
 };
 
+const BOT_SECRET_KEY = String(process.env.BOT_SECRET_KEY || BOT_CONFIG.BOT_SECRET_KEY || 'kingmc_sentinel_internal_secret_2026_v93').trim();
+const BOT_ADMIN_PASSWORD = process.env.BOT_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || 'admin123';
+const MANAGER_API_URL = process.env.MANAGER_API_URL || 'http://localhost:3000';
+
+function isManagerSecretRequest(req) {
+    return !!BOT_SECRET_KEY && timingSafeStringEquals(String(req.headers['x-bot-secret'] || ''), BOT_SECRET_KEY);
+}
+
+function isTrustedManagerRequest(req) {
+    return isManagerSecretRequest(req);
+}
+
+const botSessions = new Map();
+
+function createBotSession(role, username, options = {}) {
+    const token = 'bsess_' + crypto.randomBytes(32).toString('hex');
+    botSessions.set(token, {
+        role,
+        username,
+        passwordHash: options.passwordHash || '',
+        allowAccountChange: role === 'admin' || options.allowAccountChange === true,
+        expiresAt: Date.now() + 24 * 60 * 60 * 1000
+    });
+    return token;
+}
+
+function verifyBotSession(token) {
+    if (!token) return null;
+    const sess = botSessions.get(token);
+    if (!sess) return null;
+    if (Date.now() > sess.expiresAt) {
+        botSessions.delete(token);
+        return null;
+    }
+    if (typeof botState !== 'undefined' && botState && botState.syncedAuth) {
+        if (sess.role === 'admin') {
+            if (botState.syncedAuth.adminPasswordHash) {
+                if (sess.passwordHash) {
+                    if (sess.passwordHash !== botState.syncedAuth.adminPasswordHash) {
+                        botSessions.delete(token);
+                        return null;
+                    }
+                } else {
+                    if (verifyScryptPassword(BOT_ADMIN_PASSWORD, botState.syncedAuth.adminPasswordHash)) {
+                        sess.passwordHash = botState.syncedAuth.adminPasswordHash;
+                    } else {
+                        botSessions.delete(token);
+                        return null;
+                    }
+                }
+            }
+        } else if (sess.role === 'user') {
+            const syncedUsers = Array.isArray(botState.syncedAuth.users) ? botState.syncedAuth.users : [];
+            const u = syncedUsers.find(x => x.username.toLowerCase() === (sess.username || '').toLowerCase());
+            if (!u) {
+                botSessions.delete(token);
+                return null;
+            }
+            if (u.status !== 'active' || (u.expiresAt && Date.now() > Date.parse(u.expiresAt))) {
+                botSessions.delete(token);
+                return null;
+            }
+            if (u.passwordHash) {
+                if (!sess.passwordHash || sess.passwordHash !== u.passwordHash) {
+                    botSessions.delete(token);
+                    return null;
+                }
+            }
+        }
+    }
+    return sess;
+}
+
+function timingSafeStringEquals(left, right) {
+    if (typeof left !== 'string' || typeof right !== 'string') return false;
+    const leftBuffer = Buffer.from(left);
+    const rightBuffer = Buffer.from(right);
+    return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function getBotSessionFromRequest(req) {
+    const authHeader = req.headers['authorization'] || req.headers['x-bot-token'];
+    let token = req.query?.token;
+    if (typeof authHeader === 'string') {
+        token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
+    }
+    if (!token && req.headers.cookie) {
+        const match = String(req.headers.cookie).match(/bot_token=([^;]+)/);
+        if (match) token = decodeURIComponent(match[1]);
+    }
+    return verifyBotSession(token);
+}
+
+
+
+function canChangeMinecraftAccount(req) {
+    const session = req.botSession || getBotSessionFromRequest(req);
+    if (isTrustedManagerRequest(req)) {
+        const allowHdr = req.headers['x-manager-allow-account-change'];
+        if (allowHdr !== undefined) return allowHdr === '1';
+        return true;
+    }
+    return session?.role === 'admin' || session?.allowAccountChange === true;
+}
+
 const app = express();
 
 function readPositiveInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
@@ -136,9 +184,7 @@ function readPositiveInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER
 
 
 // ============================================================================
-// HỆ THỐNG TỰ ĐỘNG NHẬN DIỆN NỀN TẢNG (RENDER / RAVENHOST.SPACE) & PHÁT HIỆN PORT
-// ============================================================================
-// HỆ THỐNG TỰ ĐỘNG NHẬN DIỆN NỀN TẢNG (RENDER / RAVENHOST.SPACE) & PHÁT HIỆN PORT SIÊU CHUẨN
+// HỆ THỐNG TỰ ĐỘNG NHẬN DIỆN NỀN TẢNG THUẦN RENDER CLOUD & PHÁT HIỆN PORT
 // ============================================================================
 
 function extractCliArgs() {
@@ -179,8 +225,7 @@ function extractCliArgs() {
 function detectHostPlatformAndPort(config, fallbackPort, role = 'bot') {
     const cli = extractCliArgs();
 
-    // 1. Dấu hiệu Render theo tài liệu chính thức (https://render.com/docs/environment-variables):
-    // Render luôn luôn inject RENDER="true", RENDER_SERVICE_ID, RENDER_INSTANCE_ID,...
+    // 1. Dấu hiệu Render Cloud Native theo tài liệu chính thức (https://render.com/docs/environment-variables):
     const isRender = !!(
         (process.env.RENDER && String(process.env.RENDER).toLowerCase() === 'true') ||
         process.env.RENDER_SERVICE_ID ||
@@ -189,121 +234,39 @@ function detectHostPlatformAndPort(config, fallbackPort, role = 'bot') {
         process.env.RENDER_EXTERNAL_HOSTNAME
     );
 
-    // 2. Dấu hiệu RavenHost (ravenhost.space) / Pterodactyl Panel:
-    // Theo tài liệu https://ravenhost.space/docs/subdomains:
-    // panel.ravenhost.space chạy container Pterodactyl, cấp phát port qua SERVER_PORT
-    // hoặc PORT trên container, và định tuyến subdomain http://yourhost.app.ravenhost.space:PORT
-    const isRaven = !!(
-        process.env.P_SERVER_UUID ||
-        process.env.P_SERVER_LOCATION ||
-        process.env.SERVER_PORT ||
-        process.env.P_SERVER_PORT ||
-        process.env.SERVER_MEMORY ||
-        process.env.RAVEN_PORT ||
-        process.env.RAVEN_HTTP_PORT ||
-        process.env.RAVEN_ENV ||
-        (process.env.HOSTNAME && (process.env.HOSTNAME.includes('ravenhost') || process.env.HOSTNAME.includes('pterodactyl'))) ||
-        (!isRender && process.env.PORT) // Trên RavenHost/Pterodactyl, app nhận allocation port từ biến PORT hoặc SERVER_PORT
-    );
-
-    let platform = 'auto';
-    let detectionSource = 'mặc định';
+    let platform = isRender ? 'render' : 'local';
+    let detectionSource = isRender
+        ? 'Biến môi trường Render chính thức (process.env.RENDER / RENDER_SERVICE_ID)'
+        : 'Môi trường Local PC / VPS độc lập (Render Compatible Mode)';
 
     const configuredPlatform = String(config.PLATFORM || 'auto').trim().toLowerCase();
 
-    // Thứ tự ưu tiên nền tảng:
-    // Ưu tiên 1: Tham số dòng lệnh CLI (--platform=...)
-    if (cli.platform === 'render' || cli.platform === 'raven') {
+    if (cli.platform === 'render' || cli.platform === 'local') {
         platform = cli.platform;
         detectionSource = `Tham số dòng lệnh CLI (--platform=${cli.platform})`;
-    }
-    // Ưu tiên 2: Người dùng chủ động ép cứng cấu hình trong code (config.PLATFORM)
-    else if (configuredPlatform === 'render' || configuredPlatform === 'raven') {
+    } else if (configuredPlatform === 'render' || configuredPlatform === 'local') {
         platform = configuredPlatform;
         detectionSource = `Cấu hình ép buộc config.PLATFORM = '${configuredPlatform}'`;
     }
-    // Ưu tiên 3: Tự nhận diện Render từ biến môi trường chính thức (process.env.RENDER)
-    else if (isRender) {
-        platform = 'render';
-        detectionSource = 'Biến môi trường Render chính thức (process.env.RENDER)';
-    }
-    // Ưu tiên 4: Tự nhận diện RavenHost (ravenhost.space / Pterodactyl Panel)
-    else if (isRaven) {
-        platform = 'raven';
-        if (process.env.SERVER_PORT) {
-            detectionSource = `RavenHost / Pterodactyl Panel (SERVER_PORT = ${process.env.SERVER_PORT})`;
-        } else if (process.env.P_SERVER_UUID) {
-            detectionSource = `RavenHost Container (P_SERVER_UUID = ${process.env.P_SERVER_UUID})`;
-        } else if (process.env.PORT) {
-            detectionSource = `RavenHost App Allocation (PORT = ${process.env.PORT})`;
-        } else {
-            detectionSource = 'Môi trường RavenHost (ravenhost.space)';
-        }
-    }
-    // Ưu tiên 5: Fallback mặc định
-    else {
-        platform = 'raven';
-        detectionSource = 'Mặc định Local PC / VPS độc lập (Raven mode)';
-    }
 
-    // 3. Phân giải Cổng (Port) theo chuẩn tài liệu ravenhost.space và render.com:
-    let port = fallbackPort;
+    // 2. Phân giải Cổng (Port) - Render Web Service mặc định 10000
+    let port = fallbackPort || 10000;
     let portSource = 'mặc định';
 
-    // ƯU TIÊN CAO NHẤT: Tham số dòng lệnh CLI (--port=XXXX, --port XXXX, -p XXXX, hoặc số nguyên ở argv)
-    // Thường được cấp bởi startup command trong Panel Pterodactyl egg của RavenHost: "node index.js --port={{SERVER_PORT}}"
     if (cli.port) {
         port = cli.port;
-        portSource = `Tham số dòng lệnh CLI / Pterodactyl Startup (--port = ${cli.port})`;
-    } else if (platform === 'render') {
-        // Tài liệu Render: Web Service nhận port từ biến PORT do Render cấp phát, mặc định cổng 10000
-        const renderPort = Number(process.env.PORT);
-        if (Number.isFinite(renderPort) && renderPort > 0 && renderPort <= 65535) {
-            port = renderPort;
-            portSource = `Render cấp tự động (process.env.PORT = ${renderPort})`;
-        } else {
-            port = 10000;
-            portSource = 'Render mặc định (10000)';
+        portSource = `Tham số dòng lệnh CLI (--port = ${cli.port})`;
+    } else if (process.env.PORT) {
+        const envPort = Number(process.env.PORT);
+        if (Number.isFinite(envPort) && envPort > 0 && envPort <= 65535) {
+            port = envPort;
+            portSource = `Render Web Service (process.env.PORT = ${envPort})`;
         }
-    } else {
-        // Tài liệu ravenhost.space (https://ravenhost.space/docs/subdomains):
-        // Container Pterodactyl cấp port qua SERVER_PORT hoặc PORT.
-        const rawPort = process.env.SERVER_PORT ||
-                        process.env.P_SERVER_PORT ||
-                        process.env.PORT ||
-                        process.env.RAVEN_HTTP_PORT ||
-                        process.env.RAVEN_PORT;
-
-        const parsedPort = Number(rawPort);
-        if (Number.isFinite(parsedPort) && parsedPort > 0 && parsedPort <= 65535) {
-            port = parsedPort;
-            if (process.env.SERVER_PORT) {
-                portSource = `RavenHost Panel cấp tự động (process.env.SERVER_PORT = ${parsedPort})`;
-            } else if (process.env.P_SERVER_PORT) {
-                portSource = `Panel Pterodactyl cấp (process.env.P_SERVER_PORT = ${parsedPort})`;
-            } else if (process.env.PORT) {
-                portSource = `RavenHost App Allocation (process.env.PORT = ${parsedPort})`;
-            } else if (process.env.RAVEN_HTTP_PORT) {
-                portSource = `Biến môi trường RAVEN_HTTP_PORT = ${parsedPort}`;
-            } else {
-                portSource = `Biến môi trường RAVEN_PORT = ${parsedPort}`;
-            }
-        } else {
-            // Khi không có biến môi trường:
-            // Nếu ở chế độ raven (mặc định trên RavenHost / VPS), ƯU TIÊN RAVEN_HTTP_PORT trước WEB_PORT!
-            const preferredConfigPort = platform === 'raven'
-                ? Number(config.RAVEN_HTTP_PORT || config.WEB_PORT)
-                : Number(config.WEB_PORT || config.RAVEN_HTTP_PORT);
-
-            if (Number.isFinite(preferredConfigPort) && preferredConfigPort > 0 && preferredConfigPort <= 65535) {
-                port = preferredConfigPort;
-                portSource = platform === 'raven' && config.RAVEN_HTTP_PORT
-                    ? `Cấu hình config.RAVEN_HTTP_PORT = ${preferredConfigPort}`
-                    : `Cấu hình config.WEB_PORT = ${preferredConfigPort}`;
-            } else {
-                port = fallbackPort;
-                portSource = `Cổng dự phòng fallback (${fallbackPort})`;
-            }
+    } else if (config.WEB_PORT) {
+        const cfgPort = Number(config.WEB_PORT);
+        if (Number.isFinite(cfgPort) && cfgPort > 0 && cfgPort <= 65535) {
+            port = cfgPort;
+            portSource = `Cấu hình config.WEB_PORT = ${cfgPort}`;
         }
     }
 
@@ -312,10 +275,6 @@ function detectHostPlatformAndPort(config, fallbackPort, role = 'bot') {
 
 function listenHttpServer(app, initialPort, platform, onListening) {
     const fixedPort = initialPort;
-    // Trên RavenHost và Render: Cổng là duy nhất được gán qua Allocation Router / Render Proxy.
-    // TUYỆT ĐỐI KHÔNG tăng cổng tự động (+1) vì nếu nghe trên cổng khác (ví dụ 17420 thay vì 17419),
-    // tên miền subdomain.app.ravenhost.space sẽ không thể kết nối tới (lỗi 502/Connection Refused)!
-    // Thay vào đó: Khi gặp EADDRINUSE (do tiến trình cũ vừa tắt đang nhả socket), thử lại chính cổng đó tối đa 5 lần (mỗi lần 1s).
     const maxRetries = 5;
     let attempt = 0;
 
@@ -334,7 +293,7 @@ function listenHttpServer(app, initialPort, platform, onListening) {
             } else {
                 console.error(`[HTTP] ❌ Lỗi khởi động máy chủ web trên cổng cố định ${fixedPort}:`, err.message);
                 if (err.code === 'EADDRINUSE') {
-                    console.error(`[HTTP] 💡 Khắc phục: Cổng ${fixedPort} đang bị chiếm bởi tiến trình khác. Hãy kiểm tra các bot/tiến trình Node.js đang chạy ngầm hoặc khởi động lại container trên RavenHost.`);
+                    console.error(`[HTTP] 💡 Khắc phục: Cổng ${fixedPort} đang bị chiếm bởi tiến trình khác. Hãy kiểm tra các bot/tiến trình Node.js đang chạy ngầm trên máy.`);
                 }
                 process.exit(1);
             }
@@ -345,7 +304,7 @@ function listenHttpServer(app, initialPort, platform, onListening) {
 }
 
 
-const hostInfo = detectHostPlatformAndPort(BOT_CONFIG, Number(BOT_CONFIG.WEB_PORT) || 3000, 'bot');
+const hostInfo = detectHostPlatformAndPort(BOT_CONFIG, Number(BOT_CONFIG.WEB_PORT) || 10000, 'bot');
 const PLATFORM = hostInfo.platform;
 let HTTP_PORT = hostInfo.port;
 
@@ -614,6 +573,54 @@ function sanitizeBotSchedules(input, options = {}) {
     }];
 }
 
+// ----------------------------------------------------------------------------
+// ENTERPRISE AUTH SYNC & SCRYPT VERIFICATION
+// ----------------------------------------------------------------------------
+const AUTH_CACHE_FILE = path.join(path.dirname(SETTINGS_FILE), 'bot_auth_cache.json');
+
+function verifyScryptPassword(supplied, stored) {
+    if (!supplied || !stored) return false;
+    if (!stored.startsWith('scrypt$')) {
+        return timingSafeStringEquals(supplied, stored);
+    }
+    const parts = stored.split('$');
+    if (parts.length !== 4) return false;
+    const [, , salt, originalHash] = parts;
+    try {
+        const derivedKey = crypto.scryptSync(supplied, salt, 64, { N: 16384, r: 8, p: 1 });
+        const originalBuffer = Buffer.from(originalHash, 'hex');
+        if (originalBuffer.length !== derivedKey.length) return false;
+        return crypto.timingSafeEqual(originalBuffer, derivedKey);
+    } catch (_) {
+        return false;
+    }
+}
+
+function loadBotAuthCache() {
+    try {
+        if (fs.existsSync(AUTH_CACHE_FILE)) {
+            const raw = fs.readFileSync(AUTH_CACHE_FILE, 'utf8');
+            const data = JSON.parse(raw);
+            if (data && typeof data === 'object') return data;
+        }
+    } catch (e) {
+        console.error('[AUTH_SYNC] Lỗi đọc bot_auth_cache.json:', e.message);
+    }
+    return null;
+}
+
+function saveBotAuthCache(cacheData) {
+    try {
+        const tmp = AUTH_CACHE_FILE + '.tmp-' + process.pid + '-' + Date.now();
+        fs.writeFileSync(tmp, JSON.stringify(cacheData, null, 2), 'utf8');
+        fs.renameSync(tmp, AUTH_CACHE_FILE);
+        return true;
+    } catch (e) {
+        console.error('[AUTH_SYNC] Lỗi ghi bot_auth_cache.json:', e.message);
+        return false;
+    }
+}
+
 function loadBotSettings() {
     try {
         if (!fs.existsSync(SETTINGS_FILE)) {
@@ -633,7 +640,9 @@ function loadBotSettings() {
             ? parsed.settings
             : {};
 
+        const hasSavedCredentials = typeof parsed?.username === 'string';
         return {
+            hasSavedCredentials,
             settings: {
                 autoTotem: settings.autoTotem !== false,
                 antiHungry: settings.antiHungry !== false,
@@ -641,7 +650,7 @@ function loadBotSettings() {
                 antiAfkKick: settings.antiAfkKick !== false,
                 ecoMode: settings.ecoMode !== false
             },
-            username: typeof parsed?.username === 'string' ? parsed.username : '',
+            username: hasSavedCredentials ? parsed.username : '',
             password: typeof parsed?.password === 'string' ? parsed.password : '',
             manuallyStopped: parsed?.manuallyStopped !== undefined ? !!parsed.manuallyStopped : undefined,
             autoChatSchedules: sanitizeAutoChatSchedules(parsed?.autoChatSchedules),
@@ -798,10 +807,10 @@ app.use((req, res, next) => {
     if (session) req.botSession = session;
 
     if (
-        !BOT_SECRET_KEY ||
+        req.path === '/health' ||
         !req.path.startsWith('/api/') ||
         req.path.startsWith('/api/auth/') ||
-        isManagerSecretRequest(req) ||
+        isTrustedManagerRequest(req) ||
         session
     ) {
         return next();
@@ -872,8 +881,12 @@ function getConfiguredCredentials() {
 function createBotState() {
     const credentials = getConfiguredCredentials();
     const initialSaved = loadBotSettings();
-    const effectiveUsername = initialSaved.username || credentials.username || '';
-    const effectivePassword = initialSaved.password || credentials.password || '';
+    const effectiveUsername = initialSaved.hasSavedCredentials
+        ? initialSaved.username
+        : (credentials.username || '');
+    const effectivePassword = initialSaved.hasSavedCredentials
+        ? initialSaved.password
+        : (credentials.password || '');
     const effectiveManuallyStopped = initialSaved.manuallyStopped !== undefined
         ? initialSaved.manuallyStopped
         : (!effectiveUsername || !effectivePassword);
@@ -884,6 +897,7 @@ function createBotState() {
 
         username: effectiveUsername,
         password: effectivePassword,
+        syncedAuth: loadBotAuthCache(),
 
         bot: null,
         hostIndex: 0,
@@ -4033,7 +4047,7 @@ function getBotDimension(state) {
 }
 
 // -----------------------------------------------------------------------------
-// Real-time Host Hardware & Network Telemetry Engine (Container RavenHost/Render & Multi-tier Network)
+// Real-time Host Hardware & Network Telemetry Engine (Render Container & Multi-tier Network)
 // -----------------------------------------------------------------------------
 
 function readCgroupFile(filePath) {
@@ -4047,9 +4061,10 @@ function readCgroupFile(filePath) {
 }
 
 function getContainerMemoryLimit() {
-    // a) RavenHost / Pterodactyl env
-    const pterMem = Number(process.env.SERVER_MEMORY || process.env.P_SERVER_MEMORY);
-    if (pterMem > 0) return pterMem;
+    // a) Render container environment limit
+    if (process.env.RENDER || process.env.RENDER_SERVICE_ID) {
+        return Number(process.env.RENDER_MEMORY_MB) || 512;
+    }
 
     // b) process.constrainedMemory() (Node 19.6+)
     if (typeof process.constrainedMemory === 'function') {
@@ -4074,12 +4089,7 @@ function getContainerMemoryLimit() {
         if (val > 0 && val < oneTbBytes) return Math.round(val / (1024 * 1024));
     }
 
-    // d) Render container
-    if (process.env.RENDER || process.env.RENDER_SERVICE_ID) {
-        return Number(process.env.RENDER_MEMORY_MB) || 512;
-    }
-
-    // e) Fallback os.totalmem()
+    // d) Fallback os.totalmem()
     return Math.round(os.totalmem() / (1024 * 1024));
 }
 
@@ -4741,7 +4751,9 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
                 ? reason
                 : JSON.stringify(reason);
 
-        sendBotDirectAlert('kicked', 'Bot đã bị kick khỏi server KingMC.', { 'Lý do': reasonText });
+        if (!state.manuallyStopped) {
+            sendBotDirectAlert('kicked', 'Bot đã bị kick khỏi server KingMC.', { 'Lý do': reasonText });
+        }
 
         const cleanedKickReason = cleanMinecraftText(reasonText);
         state.lastKickReason = cleanedKickReason;
@@ -5331,7 +5343,7 @@ const HTML = String.raw`<!doctype html>
     name="viewport"
     content="width=device-width,initial-scale=1"
 >
-<title>KingMC Bot Manager</title>
+<title>KBOT Worker — ${BOT_LABEL} • Cloud AFK Engine V10.0</title>
 
 <style>
 :root {
@@ -6414,44 +6426,12 @@ input:focus, select:focus, textarea:focus {
 
 .dragging { opacity: 0.55; }
 .app-footer {
-  margin-top: 28px;
+  margin-top: 24px;
+  text-align: center;
   color: var(--muted);
   font-size: 11px;
   line-height: 1.6;
-}
-.bot-release-card {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  max-width: 900px;
-  margin: 0 auto;
-  padding: 12px 14px;
-  text-align: left;
-  background: rgba(15, 23, 42, 0.55);
-  border: 1px solid rgba(56, 189, 248, 0.2);
-  border-radius: 14px;
-}
-.bot-release-copy { min-width: 0; color: #94a3b8; }
-.bot-release-tag {
-  display: inline-block;
-  margin-right: 7px;
-  padding: 2px 7px;
-  border: 1px solid rgba(56, 189, 248, 0.32);
-  border-radius: 999px;
-  color: #38bdf8;
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.35px;
-}
-.bot-release-btn {
-  flex: 0 0 auto;
-  padding: 7px 10px !important;
-  border-color: rgba(56, 189, 248, 0.3) !important;
-  color: #bae6fd !important;
-}
-@media (max-width: 620px) {
-  .bot-release-card { align-items: flex-start; flex-direction: column; }
+  opacity: 0.85;
 }
 
 .hidden { display: none !important; }
@@ -6513,32 +6493,70 @@ input:focus, select:focus, textarea:focus {
   align-items: center;
   gap: 5px;
 }
+.password-input-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+}
+.password-input-wrap input {
+  padding-right: 42px !important;
+  width: 100%;
+  box-sizing: border-box;
+}
+.password-toggle-btn {
+  position: absolute;
+  right: 8px;
+  background: transparent !important;
+  border: none !important;
+  color: #94a3b8 !important;
+  padding: 4px 6px !important;
+  cursor: pointer;
+  box-shadow: none !important;
+  font-size: 14px;
+}
+.hidden { display: none !important; }
 </style>
 </head>
 
 <body>
   <!-- LOGIN GATE OVERLAY -->
-  <div id="loginGateOverlay" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(10, 14, 23, 0.96); z-index:99999; backdrop-filter:blur(10px); align-items:center; justify-content:center;">
-    <div style="background:#131b2e; border:1px solid #1e293b; border-radius:12px; width:92%; max-width:400px; padding:28px; box-shadow:0 20px 40px rgba(0,0,0,0.6); text-align:center;">
-      <div style="font-size:36px; margin-bottom:8px;">🔐</div>
-      <h2 style="margin:0 0 6px 0; color:#f8fafc; font-size:20px; font-weight:700;">KINGMC BOT ACCESS</h2>
-      <p style="margin:0 0 20px 0; color:#94a3b8; font-size:13px;">Đăng nhập để điều khiển Bot KingMC</p>
+  <div id="loginGateOverlay" style="display:flex; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(6, 11, 22, 0.96); z-index:99999; backdrop-filter:blur(14px); align-items:center; justify-content:center; padding:16px;">
+    <div style="background:linear-gradient(145deg, #101a33 0%, #0a1122 100%); border:1px solid rgba(56, 189, 248, 0.3); border-radius:18px; width:100%; max-width:420px; padding:30px 24px; box-shadow:0 25px 60px rgba(0,0,0,0.8), 0 0 35px rgba(16, 185, 129, 0.15); text-align:center;">
+      <div style="font-size:38px; margin-bottom:8px; filter:drop-shadow(0 0 12px rgba(56, 189, 248, 0.5));">🛡️</div>
+      <h2 style="margin:0 0 4px 0; color:#f8fafc; font-size:21px; font-weight:850; letter-spacing:-0.01em;">KBOT WORKER V10.0</h2>
+      <p style="margin:0 0 16px 0; color:#94a3b8; font-size:12.5px; line-height:1.4;">Cổng Điều Khiển Bot AFK KingMC • Cloud Engine</p>
+
+      <!-- Nút Discord Hỗ Trợ 24/7 -->
+      <a href="https://discord.gg/mJWX5Xp3z" target="_blank" rel="noopener noreferrer" style="display:flex; align-items:center; justify-content:center; gap:10px; width:100%; box-sizing:border-box; margin-bottom:18px; padding:11px 14px; background:linear-gradient(135deg, #5865F2 0%, #4752C4 100%); color:#fff; border-radius:10px; text-decoration:none; font-size:12.5px; font-weight:800; box-shadow:0 6px 18px rgba(88, 101, 242, 0.35); transition:all 0.2s;" title="Tham gia Discord Hỗ Trợ 24/7">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+          <path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.929 1.793 8.18 1.793 12.061 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.894.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/>
+        </svg>
+        <span>Gia Nhập Discord Hỗ Trợ 24/7</span>
+      </a>
+
       <div style="text-align:left; margin-bottom:14px;">
-        <label style="font-size:12px; color:#cbd5e1; font-weight:600; display:block; margin-bottom:4px;">Username (Bỏ trống nếu là Admin):</label>
-        <input type="text" id="loginUsernameInput" placeholder="Tài khoản khách thuê..." style="width:100%; box-sizing:border-box; background:#0b1120; border:1px solid #334155; color:#fff; padding:10px 12px; border-radius:6px; font-size:14px; outline:none;" />
+        <label style="font-size:11.5px; color:#cbd5e1; font-weight:700; display:block; margin-bottom:4px; letter-spacing:0.3px;">TÀI KHOẢN (Bỏ trống nếu là Admin):</label>
+        <input type="text" id="loginUsernameInput" placeholder="Tài khoản khách thuê..." style="width:100%; box-sizing:border-box; background:#080e1c; border:1px solid #1e293b; color:#fff; padding:10px 12px; border-radius:8px; font-size:13.5px; outline:none;" />
       </div>
       <div style="text-align:left; margin-bottom:20px;">
-        <label style="font-size:12px; color:#cbd5e1; font-weight:600; display:block; margin-bottom:4px;">Mật khẩu:</label>
-        <input type="password" id="loginPasswordInput" placeholder="Mật khẩu Admin hoặc Manager..." style="width:100%; box-sizing:border-box; background:#0b1120; border:1px solid #334155; color:#fff; padding:10px 12px; border-radius:6px; font-size:14px; outline:none;" />
+        <label style="font-size:11.5px; color:#cbd5e1; font-weight:700; display:block; margin-bottom:4px; letter-spacing:0.3px;">MẬT KHẨU TRUY CẬP:</label>
+        <div class="password-input-wrap">
+          <input type="password" id="loginPasswordInput" placeholder="Mật khẩu Admin hoặc Manager..." style="width:100%; box-sizing:border-box; background:#080e1c; border:1px solid #1e293b; color:#fff; padding:10px 12px; border-radius:8px; font-size:13.5px; outline:none;" />
+          <button type="button" class="password-toggle-btn" onclick="toggleBotPasswordVisibility('loginPasswordInput', this)">👁</button>
+        </div>
       </div>
-      <div id="loginErrorMsg" style="display:none; color:#f87171; font-size:13px; margin-bottom:14px; padding:8px; background:rgba(239,68,68,0.1); border-radius:6px; border:1px solid rgba(239,68,68,0.3);"></div>
-      <button type="button" onclick="submitBotLogin()" style="width:100%; background:linear-gradient(135deg, #10b981, #059669); color:#fff; border:none; padding:12px; border-radius:6px; font-size:15px; font-weight:700; cursor:pointer; transition:all 0.2s;">ĐĂNG NHẬP NGAY</button>
-      <p style="font-size:11px; color:#64748b; margin:16px 0 0 0;">Quản trị viên: nhập mật khẩu Admin.<br>Khách thuê: nhập Username & Mật khẩu Manager được cấp quyền.</p>
+      <div id="loginErrorMsg" style="display:none; color:#f87171; font-size:12.5px; margin-bottom:14px; padding:9px 12px; background:rgba(239,68,68,0.12); border-radius:8px; border:1px solid rgba(239,68,68,0.35);"></div>
+      <button type="button" onclick="submitBotLogin()" style="width:100%; background:linear-gradient(135deg, #10b981 0%, #059669 100%); color:#fff; border:none; padding:12px; border-radius:10px; font-size:14.5px; font-weight:800; cursor:pointer; letter-spacing:0.4px; box-shadow:0 4px 14px rgba(16,185,129,0.35); transition:all 0.2s;">ĐĂNG NHẬP VÀO BOT</button>
+      <div style="font-size:11px; color:#64748b; margin:14px 0 0 0; line-height:1.45;">
+        • Quản trị viên: Nhập mật khẩu Admin.<br>
+        • Khách thuê: Nhập Username &amp; Mật khẩu được Manager phân quyền.
+      </div>
     </div>
   </div>
 
 
-<div class="app">
+<div id="mainApp" class="app hidden">
 
 <section class="detail active">
 
@@ -6553,19 +6571,16 @@ input:focus, select:focus, textarea:focus {
         ${BOT_LABEL}
       </div>
 
-      <div
-        class="detail-subtitle"
-      >
-        Quản lý và theo dõi bot • Siêu VIP Edition
-      </div>
+      <div class="detail-subtitle">Quản lý và điều khiển bot AFK KingMC tự động • KBOT Cloud Edition</div>
 
     </div>
 
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-      <span class="vip-pill">👑 PRO V7</span>
+      <span class="vip-pill">👑 KBOT V10.0</span>
       <span class="platform-pill">⚡ ${PLATFORM.toUpperCase()}</span>
       <span class="ram-pill">🧠 RAM: <strong id="topRamUsage">-- MB</strong></span>
       <button id="soundAlertBtn" class="small sound-btn" type="button" onclick="toggleSoundAlert()">🔕 Âm thanh: TẮT</button>
+      <button id="botLogoutBtn" class="small danger hidden" type="button" onclick="botLogout()">🚪 Đăng xuất</button>
     </div>
 
   </div>
@@ -7025,7 +7040,7 @@ input:focus, select:focus, textarea:focus {
 
     </div>
 
-    <div class="panel">
+    <div class="panel" id="botAccountPanel">
 
       <h3>Tài khoản</h3>
 
@@ -7049,12 +7064,15 @@ input:focus, select:focus, textarea:focus {
           Password
         </label>
 
-        <input
-          id="passwordInput"
-          type="password"
-          autocomplete="new-password" spellcheck="false"
-          placeholder="Password mới (có thể để trống)"
-        >
+        <div class="password-input-wrap">
+          <input
+            id="passwordInput"
+            type="password"
+            autocomplete="new-password" spellcheck="false"
+            placeholder="Password mới (có thể để trống)"
+          >
+          <button type="button" class="password-toggle-btn" onclick="toggleBotPasswordVisibility('passwordInput', this)">👁</button>
+        </div>
 
       </div>
 
@@ -7080,35 +7098,132 @@ input:focus, select:focus, textarea:focus {
 </div>
 
 <div class="app-footer">
-  <div class="bot-release-card">
-    <div class="bot-release-copy">
-      <span class="bot-release-tag">✨ CẬP NHẬT 15.10.2026</span>
-      <strong style="color:#e2e8f0;">Vận hành ổn định hơn</strong> • Điều khiển GUI, Auto Chat, Eco Mode và phân quyền tài khoản Minecraft đã được tinh chỉnh.
+  <div class="bot-release-card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;width:100%;">
+    <div>
+      <strong>KBOT Worker V11.3</strong> • Pure Render Cloud Engine • Session Revocation & Atomic Rollback.
     </div>
     <button type="button" class="small bot-release-btn" onclick="openBotUpdateModal()">📜 Chi tiết</button>
   </div>
 </div>
 
 <div id="botUpdateModal" class="modal hidden">
-  <div class="modal-card" style="width:min(580px,94vw);">
-    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.08);">
-      <div>
-        <div style="font-size:10px;font-weight:800;letter-spacing:.5px;color:#38bdf8;">CẬP NHẬT 15.10.2026</div>
-        <h3 style="margin:4px 0 0;">✨ Bản cập nhật vận hành ổn định</h3>
+  <div class="modal-card" style="max-width:620px; max-height:85vh; display:flex; flex-direction:column;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,0.08);">
+      <h3 style="margin:0;font-size:18px;">📜 Lịch Sử Phát Triển KBOT Worker (V1.0 - V11.3)</h3>
+      <button class="small" type="button" onclick="closeBotUpdateModal()">✕</button>
+    </div>
+    <div style="max-height:calc(85vh - 120px);overflow-y:auto;font-size:12.5px;line-height:1.6;color:var(--text);padding-right:8px;">
+      <!-- V11.3 -->
+      <div style="margin-bottom:16px;border-left:3px solid #10b981;padding-left:12px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+          <strong style="color:#34d399;font-size:13.5px;">🚀 V11.3 KBOT Cloud Native Edition (Pure Render Optimized)</strong>
+          <span style="background:rgba(16,185,129,0.2);color:#34d399;border:1px solid rgba(16,185,129,0.4);border-radius:4px;font-size:9.5px;font-weight:800;padding:2px 6px;">LATEST</span>
+        </div>
+        <ul style="margin:4px 0 0 16px;padding:0;">
+          <li>Tối ưu hóa độc quyền cho Render Web Service, nhận diện PORT 10000 fallback, thanh trừng toàn bộ logic nền tảng cũ.</li>
+          <li>Thu hồi phiên đăng nhập tức thì (Real-time Session Revocation) khi tài khoản đổi mật khẩu hoặc bị vô hiệu hóa trên Manager.</li>
+          <li>Cập nhật thời hạn cookie phiên đăng nhập đồng bộ chuẩn 24 giờ (86400s).</li>
+          <li>Lưu trữ nguyên tử an toàn cho endpoint reset bàn giao khách và cấu hình lịch trình bot-schedules.</li>
+          <li>Cơ chế snapshot revision checking giảm thiểu 90% băng thông và tải CPU khi bot đang AFK ổn định.</li>
+          <li>Khắc phục triệt để lỗi báo động còi giả khi chủ động dừng/khởi động lại bot từ Web UI.</li>
+        </ul>
       </div>
-      <button type="button" class="small" onclick="closeBotUpdateModal()">✕</button>
+
+      <!-- V10.0 -->
+      <div style="margin-bottom:16px;border-left:3px solid #38bdf8;padding-left:12px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+          <strong style="color:#38bdf8;font-size:13px;">🚀 V10.0 KBOT Commercial Pro (16.10.2026)</strong>
+        </div>
+        <ul style="margin:4px 0 0 16px;padding:0;">
+          <li>Nâng cấp thương hiệu thương mại KBOT Worker, tối ưu hóa toàn diện cho người thuê bot KingMC.</li>
+          <li>Tích hợp nút kết nối cộng đồng Discord hỗ trợ kỹ thuật và mua key 24/7.</li>
+          <li>Đồng bộ đa máy chủ (Multi-Host Sync) Real-Time 500ms giữa Manager và Bot Worker.</li>
+        </ul>
+      </div>
+
+      <!-- V9.3 -->
+      <div style="margin-bottom:16px;border-left:3px solid #38bdf8;padding-left:12px;">
+        <strong style="color:#38bdf8;font-size:13px;">🛡️ V9.3 Real-Time & Security (15.10.2026)</strong>
+        <ul style="margin:4px 0 0 16px;padding:0;">
+          <li>Khóa nội bộ Service-to-Service (<code>BOT_SECRET_KEY</code>) ngăn chặn 100% can thiệp trái phép.</li>
+          <li>Đồng bộ tài khoản khách thuê an toàn từ Manager bằng chuẩn mã hóa scrypt qua <code>bot_auth_cache.json</code>.</li>
+          <li>Bảo vệ Login Gate chống lộ thông tin khi F5; thêm nút Đăng xuất trên topbar.</li>
+          <li>Nút con mắt (👁 / 🙈) ẩn/hiện mật khẩu ingame và chip lệnh nhanh (/dn, /login, /pay) không auto-send.</li>
+          <li>Reset bàn giao khách mới làm sạch 100% RAM và file, không hồi sinh credentials.</li>
+        </ul>
+      </div>
+
+      <!-- V8.2 -->
+      <div style="margin-bottom:16px;border-left:3px solid #94a3b8;padding-left:12px;">
+        <strong style="color:#cbd5e1;font-size:13px;">🌱 V8.2 Eco Sentinel (12.10.2026)</strong>
+        <ul style="margin:4px 0 0 16px;padding:0;">
+          <li>Chế độ Siêu Tiết Kiệm Eco: giảm 80% CPU & giữ RAM dưới 220MB khi AFK tĩnh.</li>
+          <li>Bộ đo phần cứng RAM/CPU chuẩn Container cgroups.</li>
+          <li>Bộ dọn rác thực thể Farm (Farm Item Entity Pruner) chống tràn 512MB RAM.</li>
+        </ul>
+      </div>
+
+      <!-- V7.0 -->
+      <div style="margin-bottom:16px;border-left:3px solid #94a3b8;padding-left:12px;">
+        <strong style="color:#cbd5e1;font-size:13px;">👑 V7.0 Multi-Tenant RBAC & License Key (08.10.2026)</strong>
+        <ul style="margin:4px 0 0 16px;padding:0;">
+          <li>Hệ thống phân quyền Admin/User; bảo vệ thông tin tài khoản bot trước khách thuê.</li>
+          <li>Khóa chống brute-force đăng nhập; quản lý Giftcode gia hạn tự động.</li>
+        </ul>
+      </div>
+
+      <!-- V6.1 -->
+      <div style="margin-bottom:16px;border-left:3px solid #94a3b8;padding-left:12px;">
+        <strong style="color:#cbd5e1;font-size:13px;">⚡ V6.1 (V6.0) Smart Watchdog & Auto-Healing (02.10.2026)</strong>
+        <ul style="margin:4px 0 0 16px;padding:0;">
+          <li>Tự động nhận diện tọa độ AUTH (5, 119, 4) và LOBBY (1, 41, 1), tự click slot 24 vào server cày cuốc.</li>
+          <li>Auto Totem tay phụ khi máu &le; 5 tim; Auto Ăn khi đói; Watchdog chống kẹt sảnh quá 28s.</li>
+        </ul>
+      </div>
+
+      <!-- V5.0 -->
+      <div style="margin-bottom:16px;border-left:3px solid #94a3b8;padding-left:12px;">
+        <strong style="color:#cbd5e1;font-size:13px;">🎒 V5.0 Remote Inventory Virtualization (25.09.2026)</strong>
+        <ul style="margin:4px 0 0 16px;padding:0;">
+          <li>Quản lý hòm đồ 36 ô ảo từ xa, kéo thả trang bị, vứt đồ ra thế giới, theo dõi máu/đói.</li>
+        </ul>
+      </div>
+
+      <!-- V4.0 -->
+      <div style="margin-bottom:16px;border-left:3px solid #94a3b8;padding-left:12px;">
+        <strong style="color:#cbd5e1;font-size:13px;">⏰ V4.0 Dual-Engine Task Scheduler (18.09.2026)</strong>
+        <ul style="margin:4px 0 0 16px;padding:0;">
+          <li>Hẹn giờ bật/tắt bot theo giờ cố định hoặc chu kỳ lặp; hàng đợi Auto Chat rao bán shop thông minh.</li>
+        </ul>
+      </div>
+
+      <!-- V3.0 -->
+      <div style="margin-bottom:16px;border-left:3px solid #94a3b8;padding-left:12px;">
+        <strong style="color:#cbd5e1;font-size:13px;">🔔 V3.0 Webhook Telemetry (10.09.2026)</strong>
+        <ul style="margin:4px 0 0 16px;padding:0;">
+          <li>Tích hợp Webhook Discord & Telegram thông báo tức thời khi chết, mất mạng, sắp hết Totem.</li>
+        </ul>
+      </div>
+
+      <!-- V2.0 -->
+      <div style="margin-bottom:16px;border-left:3px solid #94a3b8;padding-left:12px;">
+        <strong style="color:#cbd5e1;font-size:13px;">🌐 V2.0 (V2.1) Multi-Bot Cluster (01.09.2026)</strong>
+        <ul style="margin:4px 0 0 16px;padding:0;">
+          <li>Quản lý hạm đội bot tập trung, thống kê KPI và điều khiển hàng loạt.</li>
+        </ul>
+      </div>
+
+      <!-- V1.0 -->
+      <div style="margin-bottom:10px;border-left:3px solid #94a3b8;padding-left:12px;">
+        <strong style="color:#cbd5e1;font-size:13px;">🚀 V1.0 Genesis Worker (15.08.2026)</strong>
+        <ul style="margin:4px 0 0 16px;padding:0;">
+          <li>Khởi tạo worker bot Mineflayer kết nối KingMC và Web UI điều khiển độc lập.</li>
+        </ul>
+      </div>
     </div>
-    <div style="padding:16px 0 4px;color:#cbd5e1;line-height:1.7;">
-      <p style="margin:0 0 12px;">Bản cập nhật này tập trung vào các thao tác hằng ngày của bot:</p>
-      <ul style="margin:0;padding-left:20px;display:grid;gap:8px;">
-        <li>Auto Chat, lịch hẹn giờ và Eco Mode duy trì trạng thái ổn định hơn khi bot AFK.</li>
-        <li>Remote GUI có thể đóng trực tiếp từ Dashboard và hiển thị dữ liệu cửa sổ an toàn hơn.</li>
-        <li>Phân quyền thay đổi tài khoản Minecraft được kiểm tra ở cả Manager và Bot.</li>
-        <li>Bot được dừng thủ công sẽ không bị đưa vào luồng kết nối lại lỗi từ Manager.</li>
-      </ul>
-      <p style="margin:14px 0 0;color:#94a3b8;">Nếu bot đang hoạt động bình thường, bạn không cần thao tác thêm.</p>
+    <div class="modal-actions" style="margin-top:12px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.06);">
+      <button class="primary" type="button" onclick="closeBotUpdateModal()">Đã hiểu</button>
     </div>
-    <div class="modal-actions" style="margin-top:16px;"><button type="button" class="primary" onclick="closeBotUpdateModal()">Đã hiểu</button></div>
   </div>
 </div>
 
@@ -7296,12 +7411,17 @@ function renderDimensionLocation() {
     : dimension;
 }
 
+let manualStopRequested = false;
+
 function renderBotState() {
   if (!bot) return;
   if (lastKnownBotStatus && lastKnownBotStatus !== bot.status) {
-    if (bot.status === 'offline' || bot.status === 'kicked') {
+    if ((bot.status === 'offline' || bot.status === 'kicked') && !bot.manuallyStopped && !manualStopRequested) {
       playAlertTone('danger');
     }
+  }
+  if (bot.status !== 'offline' && bot.status !== 'kicked') {
+    manualStopRequested = false;
   }
   lastKnownBotStatus = bot.status;
 
@@ -7921,6 +8041,10 @@ async function restartBot() {
 async function runBotAction(action) {
   if (actionRequestInFlight) return;
 
+  if (action === 'stop' || action === 'restart') {
+    manualStopRequested = true;
+  }
+
   invalidatePendingReads();
   actionRequestInFlight = true;
 
@@ -7999,10 +8123,15 @@ function fallbackCopy(text, label) {
   }
 }
 
-async function quickSendCommand(cmd) {
+function quickSendCommand(cmd) {
   const input = byId('messageInput');
-  if (input) input.value = cmd;
-  await sendMessage(new Event('submit'));
+  if (!input) return;
+  const raw = String(cmd || '').trim();
+  const needsSpace = ['/dn', '/login', '/pay'].includes(raw.toLowerCase());
+  const finalCmd = needsSpace ? (raw + ' ') : raw;
+  input.value = finalCmd;
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
 }
 
 async function sendMessage(event) {
@@ -8673,6 +8802,7 @@ async function loadLogs(force, expectedGeneration = refreshGeneration) {
   try {
     const result = await apiJson('/api/bot/logs');
 
+    if (!isPollingActive || byId('mainApp')?.classList.contains('hidden')) return;
     if (expectedGeneration !== null && expectedGeneration !== refreshGeneration) return;
     if (!result.ok) return;
 
@@ -8712,6 +8842,7 @@ async function loadChatLogs(force, expectedGeneration = refreshGeneration) {
   try {
     const result = await apiJson('/api/bot/chat-logs');
 
+    if (!isPollingActive || byId('mainApp')?.classList.contains('hidden')) return;
     if (expectedGeneration !== null && expectedGeneration !== refreshGeneration) return;
     if (!result.ok) return;
 
@@ -8739,7 +8870,16 @@ async function loadChatLogs(force, expectedGeneration = refreshGeneration) {
   }
 }
 
+let lastSnapshotRev = '';
+let isPollingActive = false;
+
 async function refresh(force) {
+  if (!isPollingActive || byId('mainApp')?.classList.contains('hidden')) {
+    refreshQueued = false;
+    refreshInFlight = false;
+    return;
+  }
+
   if (refreshInFlight) {
     if (force) refreshQueued = true;
     return;
@@ -8749,7 +8889,10 @@ async function refresh(force) {
   const generation = ++refreshGeneration;
 
   try {
-    const result = await apiJson('/api/snapshot');
+    const url = (force || !lastSnapshotRev)
+      ? '/api/snapshot'
+      : '/api/snapshot?rev=' + encodeURIComponent(lastSnapshotRev);
+    const result = await apiJson(url);
 
     if (
       generation !== refreshGeneration
@@ -8758,6 +8901,14 @@ async function refresh(force) {
     }
 
     if (result.status === 401 || result.status === 403) {
+      isPollingActive = false;
+      refreshQueued = false;
+      if (refreshTimerId) {
+        clearTimeout(refreshTimerId);
+        refreshTimerId = null;
+      }
+      byId('mainApp')?.classList.add('hidden');
+      byId('botLogoutBtn')?.classList.add('hidden');
       const overlay = byId('loginGateOverlay');
       if (overlay) overlay.style.display = 'flex';
       return;
@@ -8769,6 +8920,14 @@ async function refresh(force) {
         'Không thể lấy trạng thái bot.'
       );
       return;
+    }
+
+    if (result.data && result.data.unchanged) {
+      return;
+    }
+
+    if (result.data && result.data.rev) {
+      lastSnapshotRev = result.data.rev;
     }
 
     if (result.data.bot) {
@@ -8806,6 +8965,8 @@ async function refresh(force) {
     refreshInFlight = false;
 
     if (
+      isPollingActive &&
+      !byId('mainApp')?.classList.contains('hidden') &&
       refreshQueued &&
       !actionRequestInFlight &&
       !inventoryActionInFlight &&
@@ -8815,6 +8976,8 @@ async function refresh(force) {
     ) {
       refreshQueued = false;
       void refresh(true);
+    } else {
+      refreshQueued = false;
     }
   }
 }
@@ -9067,19 +9230,41 @@ async function closeGuiWindow() {
 
 async function checkBotAuth() {
   const overlay = byId('loginGateOverlay');
+  const mainApp = byId('mainApp');
+  const logoutBtn = byId('botLogoutBtn');
+  const accountPanel = byId('botAccountPanel');
   try {
     const token = localStorage.getItem('bot_token') || '';
     const res = await fetch('/api/auth/me' + (token ? '?token=' + encodeURIComponent(token) : ''));
     const data = await res.json();
-    if (!data || !data.loggedIn) {
-      if (overlay) overlay.style.display = 'flex';
-      return false;
-    } else {
+    if (data && data.loggedIn) {
       if (overlay) overlay.style.display = 'none';
+      if (mainApp) mainApp.classList.remove('hidden');
+      if (logoutBtn) logoutBtn.classList.remove('hidden');
+      if (accountPanel) {
+        if (data.user?.role !== 'admin' && data.user?.allowAccountChange === false) {
+          accountPanel.style.display = 'none';
+        } else {
+          accountPanel.style.display = '';
+        }
+      }
+      isPollingActive = true;
       return true;
+    } else {
+      isPollingActive = false;
+      if (overlay) overlay.style.display = 'flex';
+      if (mainApp) mainApp.classList.add('hidden');
+      if (logoutBtn) logoutBtn.classList.add('hidden');
+      if (refreshTimerId) { clearTimeout(refreshTimerId); refreshTimerId = null; }
+      return false;
     }
   } catch (e) {
-    return true;
+    isPollingActive = false;
+    if (overlay) overlay.style.display = 'flex';
+    if (mainApp) mainApp.classList.add('hidden');
+    if (logoutBtn) logoutBtn.classList.add('hidden');
+    if (refreshTimerId) { clearTimeout(refreshTimerId); refreshTimerId = null; }
+    return false;
   }
 }
 
@@ -9088,9 +9273,12 @@ async function submitBotLogin() {
   const passwordInput = byId('loginPasswordInput');
   const errorMsg = byId('loginErrorMsg');
   const overlay = byId('loginGateOverlay');
+  const mainApp = byId('mainApp');
+  const logoutBtn = byId('botLogoutBtn');
+  const accountPanel = byId('botAccountPanel');
 
   const username = usernameInput ? usernameInput.value.trim() : '';
-  const password = passwordInput ? passwordInput.value.trim() : '';
+  const password = passwordInput ? passwordInput.value : '';
 
   if (!password) {
     if (errorMsg) {
@@ -9110,12 +9298,23 @@ async function submitBotLogin() {
     });
     const data = await res.json();
     if (data && data.ok) {
+      isPollingActive = true;
       if (data.token) {
         localStorage.setItem('bot_token', data.token);
-        document.cookie = 'bot_token=' + data.token + '; path=/; max-age=2592000';
+        document.cookie = 'bot_token=' + data.token + '; path=/; max-age=86400';
       }
       if (overlay) overlay.style.display = 'none';
+      if (mainApp) mainApp.classList.remove('hidden');
+      if (logoutBtn) logoutBtn.classList.remove('hidden');
+      if (accountPanel) {
+        if (data.role !== 'admin' && data.allowAccountChange === false) {
+          accountPanel.style.display = 'none';
+        } else {
+          accountPanel.style.display = '';
+        }
+      }
       await refresh(true);
+      scheduleNextRefresh();
     } else {
       if (errorMsg) {
         errorMsg.textContent = data.error || 'Đăng nhập không thành công.';
@@ -9130,6 +9329,52 @@ async function submitBotLogin() {
   }
 }
 
+async function botLogout() {
+  isPollingActive = false;
+  refreshQueued = false;
+  lastSnapshotRev = '';
+  if (refreshTimerId) {
+    clearTimeout(refreshTimerId);
+    refreshTimerId = null;
+  }
+  try {
+    const token = localStorage.getItem('bot_token') || '';
+    await fetch('/api/auth/logout' + (token ? '?token=' + encodeURIComponent(token) : ''), { method: 'POST' });
+  } catch (_) {}
+  localStorage.removeItem('bot_token');
+  document.cookie = 'bot_token=; path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; max-age=0';
+  byId('mainApp')?.classList.add('hidden');
+  byId('botLogoutBtn')?.classList.add('hidden');
+  const overlay = byId('loginGateOverlay');
+  if (overlay) overlay.style.display = 'flex';
+  showToast('Đã đăng xuất.');
+}
+window.botLogout = botLogout;
+
+function toggleBotPasswordVisibility(inputId, btn) {
+  const el = byId(inputId);
+  if (!el) return;
+  if (el.type === 'password') {
+    el.type = 'text';
+    if (btn) btn.textContent = '🙈';
+  } else {
+    el.type = 'password';
+    if (btn) btn.textContent = '👁';
+  }
+}
+window.toggleBotPasswordVisibility = toggleBotPasswordVisibility;
+
+function openBotUpdateModal() {
+  byId('botUpdateModal')?.classList.remove('hidden');
+}
+function closeBotUpdateModal() {
+  byId('botUpdateModal')?.classList.add('hidden');
+}
+window.openBotUpdateModal = openBotUpdateModal;
+window.closeBotUpdateModal = closeBotUpdateModal;
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeBotUpdateModal();
+});
 window.renderRemoteGui = renderRemoteGui;
 window.clickGuiSlot = clickGuiSlot;
 window.closeGuiWindow = closeGuiWindow;
@@ -9137,7 +9382,7 @@ window.submitBotLogin = submitBotLogin;
 
 (async function init() {
   updateSoundAlertButton();
-  await checkBotAuth();
+  const isAuthed = await checkBotAuth();
 
   const msgInput = byId('messageInput');
   if (msgInput) {
@@ -9163,33 +9408,45 @@ window.submitBotLogin = submitBotLogin;
     });
   }
 
-  await refresh(true);
+  if (isAuthed === true) {
+    await refresh(true);
+    scheduleNextRefresh();
+  }
 })();
 
 let refreshTimerId = null;
 function scheduleNextRefresh() {
-  if (refreshTimerId) clearTimeout(refreshTimerId);
-  const delay = document.hidden ? 5000 : 1000;
-  refreshTimerId = setTimeout(() => {
-    if (
-      !settingsSaveInFlight &&
-      !autoChatSaveInFlight &&
-      !botScheduleSaveInFlight
-    ) {
-      void refresh(false);
+  if (refreshTimerId) {
+    clearTimeout(refreshTimerId);
+    refreshTimerId = null;
+  }
+  if (!isPollingActive || byId('mainApp')?.classList.contains('hidden')) return;
+  const delay = document.hidden ? 5000 : 500;
+  refreshTimerId = setTimeout(async () => {
+    try {
+      if (!isPollingActive || byId('mainApp')?.classList.contains('hidden')) return;
+      if (
+        !settingsSaveInFlight &&
+        !autoChatSaveInFlight &&
+        !botScheduleSaveInFlight
+      ) {
+        await refresh(false);
+      }
+    } finally {
+      if (isPollingActive && !byId('mainApp')?.classList.contains('hidden')) {
+        scheduleNextRefresh();
+      }
     }
-    scheduleNextRefresh();
   }, delay);
 }
 
 document.addEventListener('visibilitychange', () => {
+  if (!isPollingActive || byId('mainApp')?.classList.contains('hidden')) return;
   if (!document.hidden) {
     void refresh(true);
   }
   scheduleNextRefresh();
 });
-
-scheduleNextRefresh();
 
 setInterval(updateUptimeDisplay, 250);
 </script>
@@ -9205,13 +9462,28 @@ setInterval(updateUptimeDisplay, 250);
 app.get(
     '/api/snapshot',
     (req, res) => {
+        const bot = publicBotState(botState);
+        const inventory = publicInventoryState(botState);
+        const settings = publicSettingsState(botState);
+        const autoChatSchedules = publicAutoChatState(botState);
+        const botSchedules = publicBotSchedulesState(botState);
+
+        const currentRev = `${bot.status}:${bot.stateRevision}:${bot.health}:${bot.food}:${bot.totemCount}:${bot.ping}:${bot.reconnectCount}:${inventory.usedSlots}:${bot.manuallyStopped ? 1 : 0}:${bot.position ? bot.position.x + ',' + bot.position.y + ',' + bot.position.z : ''}`;
+        const clientRev = String(req.query?.rev || req.headers['if-none-match'] || '').replace(/"/g, '');
+
+        if (clientRev && clientRev === currentRev) {
+            return res.json({ ok: true, unchanged: true, rev: currentRev });
+        }
+
+        res.setHeader('ETag', `"${currentRev}"`);
         res.json({
             ok: true,
-            bot: publicBotState(botState),
-            inventory: publicInventoryState(botState),
-            settings: publicSettingsState(botState),
-            autoChatSchedules: publicAutoChatState(botState),
-            botSchedules: publicBotSchedulesState(botState)
+            rev: currentRev,
+            bot,
+            inventory,
+            settings,
+            autoChatSchedules,
+            botSchedules
         });
     }
 );
@@ -9291,6 +9563,27 @@ function publicBotSchedulesState(state) {
             : []
     }));
 }
+
+// -----------------------------------------------------------------------------
+// ENTERPRISE API ACCESS CONTROL MIDDLEWARE
+// -----------------------------------------------------------------------------
+app.use((req, res, next) => {
+    if (req.path === '/health' || req.path.startsWith('/api/auth/')) {
+        return next();
+    }
+    if (!req.path.startsWith('/api/')) {
+        return next();
+    }
+    const session = getBotSessionFromRequest(req);
+    if (session) {
+        req.botSession = session;
+        return next();
+    }
+    if (isTrustedManagerRequest(req)) {
+        return next();
+    }
+    return res.status(401).json({ ok: false, error: 'Yêu cầu xác thực (Chưa đăng nhập hoặc khóa bảo mật không hợp lệ).' });
+});
 
 app.get('/api/settings', (req, res) => {
     res.json({
@@ -9420,14 +9713,21 @@ app.get('/api/bot-schedules', (req, res) => {
 app.post('/api/bot-schedules', (req, res) => {
     const body = req.body && typeof req.body === 'object' ? req.body : {};
     if (body.enabled === false) {
+        const prevSchedules = Array.isArray(botState.botSchedules) ? JSON.parse(JSON.stringify(botState.botSchedules)) : [];
         if (Array.isArray(botState.botSchedules)) {
             botState.botSchedules = botState.botSchedules.map(s => ({ ...s, enabled: false }));
         }
-        saveBotSettingsFile(
+        const persisted = saveBotSettingsFile(
             botState.settings,
             botState.autoChatSchedules,
             botState.botSchedules
         );
+        if (!persisted) {
+            botState.botSchedules = prevSchedules;
+            return res.status(500).json({
+                error: 'Không thể ghi bot_settings.json; trạng thái hẹn giờ chưa được thay đổi.'
+            });
+        }
         addLog(botState, '[SCHEDULER] Đã khóa hẹn giờ Bot do hết hạn gói thuê.');
         return res.json({
             ok: true,
@@ -9637,7 +9937,7 @@ app.get(
 app.get(
     '/api/bot/credentials',
     (req, res) => {
-        if (BOT_SECRET_KEY && !isManagerSecretRequest(req) && req.botSession?.role !== 'admin') {
+        if (!isTrustedManagerRequest(req) && req.botSession?.role !== 'admin') {
             return res.status(403).json({ ok: false, error: 'Chỉ Manager hoặc phiên Admin mới có quyền đọc thông tin tài khoản bot.' });
         }
         res.json(
@@ -10065,44 +10365,126 @@ app.post(
 // Reset Customer Bot (Bàn giao lại cho khách mới)
 // -----------------------------------------------------------------------------
 
-app.post(
-    '/api/bot/reset-customer',
-    (req, res) => {
-        if (BOT_SECRET_KEY && !isManagerSecretRequest(req) && req.botSession?.role !== 'admin') {
-            return res.status(403).json({
-                ok: false,
-                error: 'Chỉ Manager hoặc phiên Admin mới có quyền reset bàn giao bot.'
-            });
-        }
-        stopBot(botState, 'manual');
-        botState.username = '';
-        botState.password = '';
-        botState.logs = [];
-        botState.chatLogs = [];
-        botState.autoChatSchedules = [];
-        botState.botSchedules = [];
-        botState.manuallyStopped = true;
-        botState.stateRevision++;
-        botState.logRevision++;
-        botState.chatLogRevision++;
-
-        const persisted = saveBotSettingsFile(
-            botState.settings,
-            [],
-            [],
-            { username: '', password: '', manuallyStopped: true }
-        );
-
-        if (!persisted) {
-            return res.status(500).json({
-                ok: false,
-                error: 'Không thể lưu bot_settings.json sau khi reset bot.'
-            });
-        }
-
-        res.json({ ok: true, message: 'Đã làm sạch bot thành công.' });
+// -----------------------------------------------------------------------------
+// AUTH SYNC ENDPOINT (MANAGER -> BOT CON)
+// -----------------------------------------------------------------------------
+app.post('/api/bot/auth-sync', (req, res) => {
+    if (!isTrustedManagerRequest(req) && req.botSession?.role !== 'admin') {
+        return res.status(403).json({ ok: false, error: 'Chỉ Manager có khóa bảo mật hoặc phiên Admin mới được phép đồng bộ auth.' });
     }
-);
+    const body = req.body || {};
+    const cacheData = {
+        managerBotId: Number(body.managerBotId || BOT_ID_NUMBER),
+        authRevision: Number(body.authRevision || Date.now()),
+        adminPasswordHash: String(body.adminPasswordHash || ''),
+        users: Array.isArray(body.users) ? body.users : [],
+        updatedAt: body.updatedAt || new Date().toISOString()
+    };
+
+    const saved = saveBotAuthCache(cacheData);
+    if (!saved) {
+        return res.status(500).json({ ok: false, error: 'Không thể ghi file bot_auth_cache.json.' });
+    }
+    botState.syncedAuth = cacheData;
+
+    // Thu hồi các session không còn hợp lệ
+    const now = Date.now();
+    for (const [token, sess] of botSessions.entries()) {
+        if (sess.role === 'admin') {
+            if (cacheData.adminPasswordHash) {
+                if (sess.passwordHash) {
+                    if (sess.passwordHash !== cacheData.adminPasswordHash) {
+                        botSessions.delete(token);
+                    }
+                } else {
+                    if (verifyScryptPassword(BOT_ADMIN_PASSWORD, cacheData.adminPasswordHash)) {
+                        sess.passwordHash = cacheData.adminPasswordHash;
+                    } else {
+                        botSessions.delete(token);
+                    }
+                }
+            }
+            continue;
+        }
+        const matchedUser = cacheData.users.find(u => u.username.toLowerCase() === (sess.username || '').toLowerCase());
+        if (!matchedUser || matchedUser.status !== 'active' || (matchedUser.expiresAt && now > Date.parse(matchedUser.expiresAt))) {
+            botSessions.delete(token);
+            continue;
+        }
+        if (matchedUser.passwordHash) {
+            if (!sess.passwordHash || sess.passwordHash !== matchedUser.passwordHash) {
+                botSessions.delete(token);
+                continue;
+            }
+        }
+        sess.allowAccountChange = matchedUser.allowAccountChange !== false;
+    }
+
+    res.json({
+        ok: true,
+        message: 'Đã đồng bộ auth thành công.',
+        syncedUsersCount: cacheData.users.length
+    });
+});
+
+app.post('/api/bot/reset-customer', (req, res) => {
+    if (!isTrustedManagerRequest(req) && req.botSession?.role !== 'admin') {
+        return res.status(403).json({
+            ok: false,
+            error: 'Chỉ Manager hoặc phiên Admin mới có quyền reset bàn giao bot.'
+        });
+    }
+
+    // Lưu file cấu hình rỗng TRƯỚC KHI dừng bot thực tế để đảm bảo tính nguyên tử
+    const persisted = saveBotSettingsFile(
+        DEFAULT_SETTINGS,
+        [],
+        [],
+        { username: '', password: '', manuallyStopped: true }
+    );
+
+    if (!persisted) {
+        return res.status(500).json({
+            ok: false,
+            error: 'Không thể lưu bot_settings.json sau khi reset bot.'
+        });
+    }
+
+    // Lưu file thành công -> giờ mới stopBot an toàn
+    stopBot(botState, 'manual');
+
+    // Xóa sạch toàn bộ biến trạng thái trong RAM
+    botState.username = '';
+    botState.password = '';
+    botState.logs = [];
+    botState.chatLogs = [];
+    botState.recentChatMessages = [];
+    botState.lastWebChatText = '';
+    botState.lastWebChatAt = 0;
+    botState.autoChatSchedules = [];
+    botState.botSchedules = [];
+    botState.settings = { ...DEFAULT_SETTINGS };
+    botState.manuallyStopped = true;
+    botState.afkElapsedSeconds = 0;
+    botState.afkStartedAt = null;
+    botState.reconnectCount = 0;
+    botState.reconnectAttempts = 0;
+    botState.deathCount = 0;
+    botState.lastDeathAt = 0;
+    botState.lastDeathCoords = '';
+    botState.lastKickReason = '';
+    botState.lastKickAt = null;
+    resetInventoryState(botState);
+    botState.stateRevision++;
+    botState.logRevision++;
+    botState.chatLogRevision++;
+
+    res.json({
+        ok: true,
+        message: 'Đã reset bàn giao bot về trạng thái rỗng thành công!',
+        bot: publicBotState(botState)
+    });
+});
 
 // -----------------------------------------------------------------------------
 // Inventory API
@@ -11031,48 +11413,95 @@ app.post('/api/bot/window/close', (req, res) => {
 // -----------------------------------------------------------------------------
 
 app.post('/api/auth/login', async (req, res) => {
-    const username = (req.body?.username || '').trim();
-    const password = (req.body?.password || '').trim();
+    const username = String(req.body?.username || '').trim();
+    const password = String(req.body?.password ?? '');
     if (!password) {
         return res.status(400).json({ ok: false, error: 'Vui lòng nhập mật khẩu.' });
     }
 
-    // 1. Kiểm tra Admin Password
-    if (timingSafeStringEquals(password, BOT_ADMIN_PASSWORD)) {
-        const token = createBotSession('admin', username || 'admin');
-        return res.json({ ok: true, token, role: 'admin', username: username || 'admin' });
+    // 1. Quản trị viên Admin
+    if (!username || username.toLowerCase() === 'admin') {
+        const adminHash = botState.syncedAuth?.adminPasswordHash;
+        const isAdminCorrect = (adminHash && verifyScryptPassword(password, adminHash))
+            || timingSafeStringEquals(password, BOT_ADMIN_PASSWORD);
+        if (isAdminCorrect) {
+            const token = createBotSession('admin', 'admin', { allowAccountChange: true, passwordHash: adminHash || '' });
+            res.setHeader('Set-Cookie', 'bot_token=' + token + '; path=/; HttpOnly; SameSite=Lax; Max-Age=86400');
+            return res.json({ ok: true, token, role: 'admin', username: 'admin', allowAccountChange: true });
+        }
+        return res.status(401).json({ ok: false, error: 'Mật khẩu Quản trị viên (Admin) không chính xác.' });
     }
 
-    // 2. Nếu có username + password, gọi sang Manager để verify quyền sở hữu bot con
-    if (username && password) {
+    // 2. Khách thuê User: ưu tiên xác thực từ syncedAuth (bot_auth_cache.json)
+    if (botState.syncedAuth) {
+        const syncedUsers = Array.isArray(botState.syncedAuth.users) ? botState.syncedAuth.users : [];
+        const u = syncedUsers.find(x => x.username.toLowerCase() === username.toLowerCase());
+        if (!u) {
+            return res.status(401).json({ ok: false, error: 'Tài khoản không tồn tại hoặc chưa được phân quyền cho bot này.' });
+        }
+        if (!verifyScryptPassword(password, u.passwordHash)) {
+            return res.status(401).json({ ok: false, error: 'Tên đăng nhập hoặc mật khẩu không chính xác.' });
+        }
+        if (u.status !== 'active') {
+            return res.status(403).json({ ok: false, error: 'Tài khoản của bạn đã bị vô hiệu hóa hoặc chưa kích hoạt.' });
+        }
+        if (u.expiresAt && Date.now() > Date.parse(u.expiresAt)) {
+            return res.status(403).json({ ok: false, error: 'Tài khoản của bạn đã hết hạn thuê. Vui lòng gia hạn trên Manager.' });
+        }
+        const token = createBotSession('user', u.username, { allowAccountChange: u.allowAccountChange !== false, passwordHash: u.passwordHash });
+        res.setHeader('Set-Cookie', 'bot_token=' + token + '; path=/; HttpOnly; SameSite=Lax; Max-Age=86400');
+        return res.json({
+            ok: true,
+            token,
+            role: 'user',
+            username: u.username,
+            allowAccountChange: u.allowAccountChange !== false
+        });
+    }
+
+    // 3. Fallback sang Manager nếu bot con chưa nhận được syncAuth lần nào
+    if (MANAGER_API_URL) {
         try {
             const targetManager = MANAGER_API_URL.replace(/\/+$/, '');
-            const fetchRes = await fetch(`${targetManager}/api/auth/verify-bot-access`, {
+            const fetchRes = await fetch(targetManager + '/api/auth/verify-bot-access', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     username,
                     password,
-                    botId: BOT_ID,
-                    botUrl: req.headers.host || ''
+                    botId: BOT_ID_NUMBER
                 })
             });
             const data = await fetchRes.json();
             if (data && data.ok) {
                 const role = data.role === 'admin' ? 'admin' : 'user';
                 const token = createBotSession(role, data.username || username, {
+                    allowAccountChange: data.allowAccountChange !== false,
+                    passwordHash: data.passwordHash || ''
+                });
+                res.setHeader('Set-Cookie', 'bot_token=' + token + '; path=/; HttpOnly; SameSite=Lax; Max-Age=86400');
+                return res.json({
+                    ok: true,
+                    token,
+                    role,
+                    username: data.username || username,
                     allowAccountChange: data.allowAccountChange !== false
                 });
-                return res.json({ ok: true, token, role, username: data.username || username });
             } else {
-                return res.status(403).json({ ok: false, error: data?.error || 'Tài khoản không có quyền truy cập bot này.' });
+                return res.status(fetchRes.status || 401).json({
+                    ok: false,
+                    error: data?.error || 'Tài khoản không có quyền truy cập bot này.'
+                });
             }
         } catch (err) {
-            return res.status(401).json({ ok: false, error: 'Sai mật khẩu Admin hoặc không thể kết nối tới Manager để xác thực khách thuê.' });
+            return res.status(502).json({
+                ok: false,
+                error: 'Không thể kết nối tới Manager để xác thực khách thuê (' + err.message + ').'
+            });
         }
     }
 
-    return res.status(401).json({ ok: false, error: 'Mật khẩu Admin không chính xác.' });
+    return res.status(401).json({ ok: false, error: 'Chưa có dữ liệu đồng bộ auth từ Manager.' });
 });
 
 app.get('/api/auth/me', (req, res) => {
@@ -11090,22 +11519,25 @@ app.get('/api/auth/me', (req, res) => {
     if (!session) {
         return res.json({ ok: false, loggedIn: false });
     }
-    return res.json({ ok: true, loggedIn: true, user: { role: session.role, username: session.username } });
+    return res.json({ ok: true, loggedIn: true, user: { role: session.role, username: session.username, allowAccountChange: session.allowAccountChange !== false } });
 });
 
 app.post('/api/auth/logout', (req, res) => {
     const authHeader = req.headers['authorization'] || req.headers['x-bot-token'];
-    let token = req.query.token;
+    let token = req.query?.token;
     if (authHeader) {
         if (authHeader.startsWith('Bearer ')) token = authHeader.substring(7);
         else token = authHeader;
     }
     if (!token && req.headers.cookie) {
-        const match = req.headers.cookie.match(/bot_token=([^;]+)/);
-        if (match) token = match[1];
+        const match = String(req.headers.cookie).match(/bot_token=([^;]+)/);
+        if (match) token = decodeURIComponent(match[1]);
     }
-    if (token) botSessions.delete(token);
-    res.json({ ok: true });
+    if (token && botSessions.has(token)) {
+        botSessions.delete(token);
+    }
+    res.setHeader('Set-Cookie', 'bot_token=; Path=/; HttpOnly; SameSite=Lax; Expires=Thu, 01 Jan 1970 00:00:01 GMT; Max-Age=0');
+    res.json({ ok: true, message: 'Đã đăng xuất.' });
 });
 
 app.get(
@@ -11347,7 +11779,7 @@ process.on('unhandledRejection', (reason) => {
 // - AUTO_START=false => tắt auto-start nhưng vẫn giữ nút Chạy thủ công.
 // -----------------------------------------------------------------------------
 
-botState.manuallyStopped = true;
+botState.manuallyStopped = (typeof botState.manuallyStopped === 'boolean') ? botState.manuallyStopped : true;
 botState.ready = false;
 setBotStatus(botState, 'offline');
 botState.connectedAt = null;
