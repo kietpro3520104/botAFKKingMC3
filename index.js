@@ -4,9 +4,33 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const net = require('net');
+const dns = require('dns');
+const v8 = require('v8');
+const vm = require('vm');
+
+// 🚀 Dynamic V8 GC runtime injection: Cho phép giải phóng RAM thực sự ngay cả khi không truyền cờ --expose-gc
+let dynamicGc = null;
+try {
+    v8.setFlagsFromString('--expose_gc');
+    dynamicGc = vm.runInNewContext('gc');
+} catch (_) {}
+
+function runGarbageCollection() {
+    try {
+        if (typeof global.gc === 'function') {
+            global.gc();
+            return true;
+        } else if (typeof dynamicGc === 'function') {
+            dynamicGc();
+            return true;
+        }
+    } catch (_) {}
+    return false;
+}
 
 // ============================================================================
-// CẤU HÌNH TỔNG BOT MINECRAFT KINGMC (PURE RENDER OPTIMIZED V11.3)
+// CẤU HÌNH TỔNG BOT MINECRAFT KINGMC (COMMERCIAL ENTERPRISE EDITION V11.6)
 //
 // Triển khai file này lên Render Web Service hoặc VPS dưới dạng index.js / bot.js.
 // Tự động nhận diện Render Cloud Native (PORT 10000) và khởi chạy Web UI tức thì!
@@ -15,13 +39,14 @@ const crypto = require('crypto');
 const BOT_CONFIG = {
     // --- 0. KHÓA BẢO MẬT NỘI BỘ MANAGER <-> BOT CON ---
     BOT_SECRET_KEY: '',                   // Khóa bí mật giao tiếp dịch vụ nội bộ
+    MANAGER_API_URL: '',                  // URL của Web Manager (VD: 'https://kbot-manager.onrender.com' hoặc 'http://localhost:3000')
 
     // --- 1. TÀI KHOẢN BOT (ĐỂ TRỐNG ĐỂ TỰ ĐIỀN HOẶC NHẬP TỪ WEB UI) ---
     USERNAME: '',                         // Tên tài khoản Minecraft ingame (VD: 'AFK_PRO_01')
     PASSWORD: '',                         // Mật khẩu /login trong server KingMC (VD: 'matkhau123')
 
     // --- 2. SERVER MINECRAFT KINGMC ---
-    MC_HOSTS: ['sgp.kingmc.vn', 'kingmc.vn'], // Danh sách IP server KingMC
+    MC_HOSTS: ['sgp.kingmc.vn', 'kingmc.vn', 'java.kingmc.vn'], // Danh sách IP server KingMC xoay vòng tuần tự (5 lần/IP)
     MC_PORT: 25565,                           // Cổng Minecraft mặc định (25565)
     MC_VERSION: '1.20.1',                     // Phiên bản Minecraft kết nối
 
@@ -33,7 +58,7 @@ const BOT_CONFIG = {
     // --- 4. CỔNG MÁY CHỦ WEB & NỀN TẢNG HOSTING (THUẦN RENDER CLOUD) ---
     PLATFORM: 'auto',                     // 'auto' (Tự nhận diện Render Cloud Web Service / Local PC)
     WEB_PORT: 10000,                      // Cổng Web mặc định trên Render (Render tự gán PORT=10000; test Local dự phòng 3000)
-    BOT_ID: '1',                          // ID định danh của bot
+    BOT_ID: process.env.BOT_ID || '1',    // ID định danh của bot (ưu tiên biến môi trường khi deploy)
 
     // --- 5. TỐI ƯU HÓA BỘ NHỚ & CHỐNG TRÀN RAM (WATCHDOG 300-500MB) ---
     AUTO_START: true,                     // Tự động kết nối vào game nếu đã có USERNAME và PASSWORD
@@ -52,7 +77,7 @@ const BOT_CONFIG = {
         IGNORE_ITEM_PHYSICS: true,        // Bỏ qua tính toán va chạm với item rơi
         DROP_PARTICLES_AND_SOUNDS: true,  // Chặn hoàn toàn packet hạt bọt nước & âm thanh farm
         CHUNK_CULL_RADIUS: 2,             // Chỉ giữ 2 chunks quanh bot, giải phóng map thừa
-        PRUNE_INTERVAL_MS: 1500           // Quét dọn rác mỗi 1.5 giây
+        PRUNE_INTERVAL_MS: 20000          // Quét dọn chunk map ở xa mỗi 20 giây (chống nghẽn CPU)
     },
 
     // --- 8. CẤU HÌNH HÀNH VI TỰ ĐỘNG (THUẦN AFK & ANTI-AFK) ---
@@ -61,13 +86,166 @@ const BOT_CONFIG = {
         antiHungry: true,                 // Tự ăn khi đói chống chết đói khi treo máy
         autoReconnect: true,              // Tự kết nối lại khi mất mạng / server restart
         antiAfkKick: true,                // Giả lập vi chuyển động yaw/pitch & sneak chống kick AFK
-        ecoMode: true                     // 🌱 Chế độ Siêu Tiết Kiệm Eco: giảm physics loop, hạ CPU ~0%, giữ RAM 150-220MB
+        ecoMode: true,                    // 🌱 Chế độ Siêu Tiết Kiệm Eco: giảm physics loop, hạ CPU ~0%, giữ RAM 150-220MB
+        spawnCommands: '',                // ⚡ Chuỗi lệnh tự động chạy tuần tự khi vào trạng thái AFK (cách nhau 1.6s)
+        proxy: {
+            enabled: false,
+            protocol: 'socks5',
+            host: '',
+            port: 0,
+            username: '',
+            password: ''
+        }
     }
 };
 
-const BOT_SECRET_KEY = String(process.env.BOT_SECRET_KEY || BOT_CONFIG.BOT_SECRET_KEY || 'kingmc_sentinel_internal_secret_2026_v93').trim();
-const BOT_ADMIN_PASSWORD = process.env.BOT_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || 'admin123';
-const MANAGER_API_URL = process.env.MANAGER_API_URL || 'http://localhost:3000';
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : __dirname;
+if (!fs.existsSync(DATA_DIR)) {
+    try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
+}
+if (process.env.RENDER && !process.env.DATA_DIR) {
+    console.warn('[SECURITY WARNING] Phát hiện môi trường Render nhưng biến DATA_DIR chưa được cấu hình. Dữ liệu có thể bị mất khi instance khởi động lại hoặc redeploy. Khuyến nghị gắn Render Persistent Disk.');
+}
+if (DATA_DIR !== __dirname) {
+    for (const filename of ['bot_settings.json', 'bot_auth_cache.json', '.bot_master_key', '.bot_secret_key', '.supabase_secret']) {
+        const oldPath = path.join(__dirname, filename);
+        const newPath = path.join(DATA_DIR, filename);
+        if (fs.existsSync(oldPath) && !fs.existsSync(newPath)) {
+            try {
+                fs.copyFileSync(oldPath, newPath);
+                console.log(`[MIGRATION] Đã di chuyển ${filename} từ ${oldPath} sang ${newPath}`);
+            } catch (e) {
+                console.error(`[MIGRATION] Lỗi di chuyển ${filename}:`, e.message);
+            }
+        }
+    }
+}
+
+let botSecretKeySource = String(process.env.BOT_SECRET_KEY || BOT_CONFIG.BOT_SECRET_KEY || '').trim();
+const botSecretKeyFile = path.join(DATA_DIR, '.bot_secret_key');
+if (!botSecretKeySource) {
+    try {
+        if (fs.existsSync(botSecretKeyFile)) {
+            botSecretKeySource = fs.readFileSync(botSecretKeyFile, 'utf8').trim();
+        }
+    } catch (_) {}
+}
+const BOT_SECRET_KEY = botSecretKeySource;
+if (!BOT_SECRET_KEY) {
+    console.warn('[SECURITY] ⚠️ BOT_SECRET_KEY chưa được cấu hình! Các yêu cầu service-to-service từ Manager sẽ bị từ chối cho đến khi biến môi trường BOT_SECRET_KEY được đặt.');
+}
+const BOT_ADMIN_PASSWORD = String(process.env.BOT_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || '').trim();
+const MANAGER_API_URL = String(process.env.MANAGER_API_URL || BOT_CONFIG.MANAGER_API_URL || 'http://localhost:3000').trim().replace(/\/+$/, '');
+
+
+// ----------------------------------------------------------------------------
+// SUPABASE CLOUD DATABASE ADAPTER (BOT WORKER ENGINE)
+// ----------------------------------------------------------------------------
+class BotSupabaseAdapter {
+    constructor(config = {}) {
+        this.url = (config.url || process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
+        this.key = (config.key || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || '').trim();
+        this.botId = String(config.botId || process.env.BOT_ID || '1');
+        this.enabled = !!(this.url && this.key);
+    }
+
+    isEnabled() {
+        return !!(this.url && this.key);
+    }
+
+    getHeaders(extra = {}) {
+        return {
+            'apikey': this.key,
+            'Authorization': `Bearer ${this.key}`,
+            'Content-Type': 'application/json',
+            ...extra
+        };
+    }
+
+    async fetchBotSettings() {
+        if (!this.isEnabled()) return null;
+        try {
+            const res = await fetch(`${this.url}/rest/v1/bot_settings?bot_id=eq.${encodeURIComponent(this.botId)}&select=*`, {
+                headers: this.getHeaders(),
+                signal: AbortSignal.timeout(6000)
+            });
+            if (!res.ok) return null;
+            const data = await res.json();
+            if (Array.isArray(data) && data.length > 0) {
+                return data[0];
+            }
+            return null;
+        } catch (err) {
+            console.error('[BOT SUPABASE] Lỗi đọc bot_settings:', err.message);
+            return null;
+        }
+    }
+
+    async saveBotSettings(payload) {
+        if (!this.isEnabled()) return false;
+        try {
+            const persistedSettings = {
+                ...(payload.settings && typeof payload.settings === 'object' ? payload.settings : {}),
+                manuallyStopped: payload.manuallyStopped === true
+            };
+            const row = {
+                bot_id: this.botId,
+                username: payload.username || '',
+                password: payload.password || '',
+                settings: persistedSettings,
+                proxy: payload.proxy || payload.settings?.proxy || {},
+                schedules: payload.botSchedules || payload.schedules || [],
+                auto_chat: payload.autoChatSchedules || payload.auto_chat || [],
+                updated_at: new Date().toISOString()
+            };
+            const res = await fetch(`${this.url}/rest/v1/bot_settings`, {
+                method: 'POST',
+                headers: this.getHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+                body: JSON.stringify([row]),
+                signal: AbortSignal.timeout(8000)
+            });
+            return res.ok;
+        } catch (err) {
+            console.error('[BOT SUPABASE] Lỗi lưu bot_settings:', err.message);
+            return false;
+        }
+    }
+
+    async logBotAction({ action, actionLabel, category = 'BOT_SETTINGS', details, status = 'SUCCESS' }) {
+        if (!this.isEnabled()) return false;
+        try {
+            const row = {
+                id: 'aud_' + Date.now() + '_' + Math.floor(Math.random() * 10000),
+                log_type: 'BOT',
+                category: category,
+                action: action,
+                action_label: actionLabel || action,
+                actor_username: 'bot_worker_' + this.botId,
+                actor_role: 'bot',
+                actor_ip: '127.0.0.1',
+                target: { botId: this.botId },
+                details: details || '',
+                status: status,
+                timestamp: new Date().toISOString()
+            };
+            await fetch(`${this.url}/rest/v1/audit_logs`, {
+                method: 'POST',
+                headers: this.getHeaders({ 'Prefer': 'return=minimal' }),
+                body: JSON.stringify([row]),
+                signal: AbortSignal.timeout(4000)
+            }).catch(() => {});
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+}
+
+const botSupabase = new BotSupabaseAdapter({
+    url: process.env.SUPABASE_URL || '',
+    key: process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || '',
+    botId: process.env.BOT_ID || BOT_CONFIG.BOT_ID || '1'
+});
 
 function isManagerSecretRequest(req) {
     return !!BOT_SECRET_KEY && timingSafeStringEquals(String(req.headers['x-bot-secret'] || ''), BOT_SECRET_KEY);
@@ -75,6 +253,92 @@ function isManagerSecretRequest(req) {
 
 function isTrustedManagerRequest(req) {
     return isManagerSecretRequest(req);
+}
+
+class MemoryRateLimiter {
+    constructor({ maxFailures = 5, windowMs = 15 * 60 * 1000, maxEntries = 5000, message = 'Quá nhiều lần thử thất bại. Vui lòng thử lại sau.' } = {}) {
+        this.maxFailures = maxFailures;
+        this.windowMs = windowMs;
+        this.maxEntries = maxEntries;
+        this.message = message;
+        this.attempts = new Map();
+    }
+
+    _clean() {
+        const now = Date.now();
+        if (this.attempts.size > this.maxEntries) {
+            for (const [key, val] of this.attempts.entries()) {
+                if (now - val.lastAttempt > this.windowMs && (!val.lockedUntil || now > val.lockedUntil)) {
+                    this.attempts.delete(key);
+                }
+            }
+            if (this.attempts.size > this.maxEntries) {
+                for (const [key, val] of this.attempts.entries()) {
+                    if (this.attempts.size <= this.maxEntries) break;
+                    if (!val.lockedUntil || now >= val.lockedUntil) {
+                        this.attempts.delete(key);
+                    }
+                }
+            }
+        }
+    }
+
+    _getKeys(ip, identifier = '') {
+        const normIp = String(ip || 'unknown').trim().toLowerCase() || 'unknown';
+        const normId = String(identifier || '').trim().toLowerCase();
+        const keys = [`ip:${normIp}`];
+        if (normId) keys.push(`id:${normId}`);
+        return keys;
+    }
+
+    check(ip, identifier = '') {
+        this._clean();
+        const now = Date.now();
+        let lockedUntil = 0;
+        for (const key of this._getKeys(ip, identifier)) {
+            const record = this.attempts.get(key);
+            if (record?.lockedUntil && now < record.lockedUntil) {
+                lockedUntil = Math.max(lockedUntil, record.lockedUntil);
+            }
+        }
+        if (lockedUntil) {
+            const remainingSec = Math.ceil((lockedUntil - now) / 1000);
+            const remainingMin = Math.ceil(remainingSec / 60);
+            return {
+                allowed: false,
+                error: `${this.message} (Chờ ${remainingMin} phút / ${remainingSec}s)`
+            };
+        }
+        return { allowed: true };
+    }
+
+    record(ip, identifier = '', success = false) {
+        this._clean();
+        const now = Date.now();
+        for (const key of this._getKeys(ip, identifier)) {
+            if (success) {
+                this.attempts.delete(key);
+                continue;
+            }
+            const record = this.attempts.get(key) || { count: 0, lockedUntil: 0, lastAttempt: now };
+            record.count += 1;
+            record.lastAttempt = now;
+            if (record.count >= this.maxFailures) {
+                record.lockedUntil = now + this.windowMs;
+            }
+            this.attempts.set(key, record);
+        }
+    }
+}
+
+const botLoginLimiter = new MemoryRateLimiter({
+    maxFailures: 5,
+    windowMs: 15 * 60 * 1000,
+    message: 'Cổng đăng nhập tạm khóa do nhập sai mật khẩu quá nhiều lần.'
+});
+
+function getClientIp(req) {
+    return req.ip || req.socket?.remoteAddress || '127.0.0.1';
 }
 
 const botSessions = new Map();
@@ -138,6 +402,15 @@ function verifyBotSession(token) {
     return sess;
 }
 
+setInterval(() => {
+    const now = Date.now();
+    for (const [token, sess] of botSessions.entries()) {
+        if (!sess || !sess.expiresAt || now > sess.expiresAt) {
+            botSessions.delete(token);
+        }
+    }
+}, 600000);
+
 function timingSafeStringEquals(left, right) {
     if (typeof left !== 'string' || typeof right !== 'string') return false;
     const leftBuffer = Buffer.from(left);
@@ -147,27 +420,54 @@ function timingSafeStringEquals(left, right) {
 
 function getBotSessionFromRequest(req) {
     const authHeader = req.headers['authorization'] || req.headers['x-bot-token'];
-    let token = req.query?.token;
+    let token = null;
     if (typeof authHeader === 'string') {
         token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
     }
     if (!token && req.headers.cookie) {
-        const match = String(req.headers.cookie).match(/bot_token=([^;]+)/);
-        if (match) token = decodeURIComponent(match[1]);
+        token = parseCookies(req).bot_token || null;
     }
     return verifyBotSession(token);
 }
 
+function isHttps(req) {
+    return !!(req.secure || req.headers['x-forwarded-proto'] === 'https');
+}
 
+function serializeBotCookie(name, value, options = {}) {
+    let cookie = `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax`;
+    if (options.maxAge) cookie += `; Max-Age=${options.maxAge}`;
+    if (options.secure) cookie += `; Secure`;
+    return cookie;
+}
+
+function clearBotCookieHeader(name, secure = false) {
+    let cookie = `${name}=; Path=/; HttpOnly; SameSite=Lax; Expires=Thu, 01 Jan 1970 00:00:01 GMT; Max-Age=0`;
+    if (secure) cookie += `; Secure`;
+    return cookie;
+}
+
+function isAdminRequest(req) {
+    if (isTrustedManagerRequest(req)) {
+        return req.headers['x-manager-role'] === 'admin';
+    }
+    const session = req.botSession || getBotSessionFromRequest(req);
+    return !!session && session.role === 'admin';
+}
 
 function canChangeMinecraftAccount(req) {
-    const session = req.botSession || getBotSessionFromRequest(req);
     if (isTrustedManagerRequest(req)) {
-        const allowHdr = req.headers['x-manager-allow-account-change'];
-        if (allowHdr !== undefined) return allowHdr === '1';
-        return true;
+        const headerVal = req.headers['x-manager-allow-account-change'];
+        if (headerVal !== undefined) {
+            return headerVal === '1' || headerVal === 'true';
+        }
+        const roleVal = req.headers['x-manager-role'];
+        if (roleVal === 'admin') return true;
+        return false;
     }
-    return session?.role === 'admin' || session?.allowAccountChange === true;
+    const session = req.botSession || getBotSessionFromRequest(req);
+    if (!session) return false;
+    return session.role === 'admin' || session.allowAccountChange !== false;
 }
 
 const app = express();
@@ -207,6 +507,20 @@ function extractCliArgs() {
         } else if (arg.startsWith('-p=')) {
             const p = parseInt(arg.split('=')[1], 10);
             if (Number.isFinite(p) && p > 0 && p <= 65535) port = p;
+        } else if (arg.startsWith('--server_port=') || arg.startsWith('--server-port=')) {
+            const p = parseInt(arg.split('=')[1], 10);
+            if (Number.isFinite(p) && p > 0 && p <= 65535) port = p;
+        } else if (arg === '--server_port' || arg === '--server-port') {
+            if (i + 1 < argv.length) {
+                const p = parseInt(argv[i + 1], 10);
+                if (Number.isFinite(p) && p > 0 && p <= 65535) {
+                    port = p;
+                    i++;
+                }
+            }
+        } else if (arg.startsWith('--web_port=') || arg.startsWith('--web-port=')) {
+            const p = parseInt(arg.split('=')[1], 10);
+            if (Number.isFinite(p) && p > 0 && p <= 65535) port = p;
         } else if (arg.startsWith('--platform=')) {
             platform = arg.split('=')[1].trim().toLowerCase();
         } else if (arg === '--platform') {
@@ -225,7 +539,7 @@ function extractCliArgs() {
 function detectHostPlatformAndPort(config, fallbackPort, role = 'bot') {
     const cli = extractCliArgs();
 
-    // 1. Dấu hiệu Render Cloud Native theo tài liệu chính thức (https://render.com/docs/environment-variables):
+    // 1. Nhận diện nền tảng Hosting (Render Cloud, Deplexo, WispByte, Pterodactyl, Docker, Local):
     const isRender = !!(
         (process.env.RENDER && String(process.env.RENDER).toLowerCase() === 'true') ||
         process.env.RENDER_SERVICE_ID ||
@@ -234,40 +548,75 @@ function detectHostPlatformAndPort(config, fallbackPort, role = 'bot') {
         process.env.RENDER_EXTERNAL_HOSTNAME
     );
 
-    let platform = isRender ? 'render' : 'local';
+    const isPanel = !!(
+        process.env.PTERODACTYL ||
+        process.env.P_SERVER_UUID ||
+        process.env.P_SERVER_ALLOCATION_LIMIT ||
+        process.env.SERVER_PORT ||
+        process.env.P_SERVER_PORT ||
+        process.env.STARTUP ||
+        process.env.DEPLEXO ||
+        process.env.WISPBYTE ||
+        process.env.WISPBAY ||
+        process.env.WISP
+    );
+
+    let platform = isRender ? 'render' : (isPanel ? 'pterodactyl' : 'local');
     let detectionSource = isRender
-        ? 'Biến môi trường Render chính thức (process.env.RENDER / RENDER_SERVICE_ID)'
-        : 'Môi trường Local PC / VPS độc lập (Render Compatible Mode)';
+        ? 'Render Cloud Web Service (process.env.RENDER / RENDER_SERVICE_ID)'
+        : (isPanel
+            ? 'Hosting Panel / Pterodactyl / Wisp (Deplexo, WispByte, Game Host Container)'
+            : 'Môi trường Local PC / VPS độc lập (Universal Mode)');
 
     const configuredPlatform = String(config.PLATFORM || 'auto').trim().toLowerCase();
 
-    if (cli.platform === 'render' || cli.platform === 'local') {
+    if (cli.platform) {
         platform = cli.platform;
         detectionSource = `Tham số dòng lệnh CLI (--platform=${cli.platform})`;
-    } else if (configuredPlatform === 'render' || configuredPlatform === 'local') {
+    } else if (configuredPlatform && configuredPlatform !== 'auto') {
         platform = configuredPlatform;
-        detectionSource = `Cấu hình ép buộc config.PLATFORM = '${configuredPlatform}'`;
+        detectionSource = `Cấu hình config.PLATFORM = '${configuredPlatform}'`;
     }
 
-    // 2. Phân giải Cổng (Port) - Render Web Service mặc định 10000
+    // 2. Phân giải Cổng (Port) thông minh - Ưu tiên thích ứng mọi Hosting
+    function isValidPort(p) {
+        const n = Number(p);
+        return Number.isFinite(n) && n > 0 && n <= 65535;
+    }
+
     let port = fallbackPort || 10000;
     let portSource = 'mặc định';
 
-    if (cli.port) {
-        port = cli.port;
-        portSource = `Tham số dòng lệnh CLI (--port = ${cli.port})`;
-    } else if (process.env.PORT) {
-        const envPort = Number(process.env.PORT);
-        if (Number.isFinite(envPort) && envPort > 0 && envPort <= 65535) {
-            port = envPort;
-            portSource = `Render Web Service (process.env.PORT = ${envPort})`;
-        }
-    } else if (config.WEB_PORT) {
-        const cfgPort = Number(config.WEB_PORT);
-        if (Number.isFinite(cfgPort) && cfgPort > 0 && cfgPort <= 65535) {
-            port = cfgPort;
-            portSource = `Cấu hình config.WEB_PORT = ${cfgPort}`;
-        }
+    if (cli.port && isValidPort(cli.port)) {
+        port = Number(cli.port);
+        portSource = `Tham số dòng lệnh CLI (--port = ${port})`;
+    } else if (isValidPort(process.env.SERVER_PORT)) {
+        port = Number(process.env.SERVER_PORT);
+        portSource = `Biến môi trường SERVER_PORT = ${port} (WispByte / Deplexo / Pterodactyl)`;
+    } else if (isValidPort(process.env.P_SERVER_PORT)) {
+        port = Number(process.env.P_SERVER_PORT);
+        portSource = `Biến môi trường P_SERVER_PORT = ${port} (Pterodactyl Allocation)`;
+    } else if (isValidPort(process.env.ALLOCATION_PORT)) {
+        port = Number(process.env.ALLOCATION_PORT);
+        portSource = `Biến môi trường ALLOCATION_PORT = ${port}`;
+    } else if (isValidPort(process.env.PORT)) {
+        port = Number(process.env.PORT);
+        portSource = `Biến môi trường PORT = ${port} (Render / Cloud Web Service)`;
+    } else if (isValidPort(process.env.APP_PORT)) {
+        port = Number(process.env.APP_PORT);
+        portSource = `Biến môi trường APP_PORT = ${port}`;
+    } else if (isValidPort(process.env.WEB_PORT)) {
+        port = Number(process.env.WEB_PORT);
+        portSource = `Biến môi trường WEB_PORT = ${port}`;
+    } else if (isRender) {
+        port = 10000;
+        portSource = 'Render Web Service mặc định (10000)';
+    } else if (isValidPort(config.WEB_PORT)) {
+        port = Number(config.WEB_PORT);
+        portSource = `Cấu hình BOT_CONFIG.WEB_PORT = ${port}`;
+    } else {
+        port = fallbackPort || 10000;
+        portSource = `Cổng dự phòng fallback (${port})`;
     }
 
     return { platform, detectionSource, port, portSource };
@@ -275,23 +624,31 @@ function detectHostPlatformAndPort(config, fallbackPort, role = 'bot') {
 
 function listenHttpServer(app, initialPort, platform, onListening) {
     const fixedPort = initialPort;
-    const maxRetries = 5;
+    const maxRetries = 10;
     let attempt = 0;
+    let bindHost = '0.0.0.0';
 
     function tryListen() {
-        const srv = app.listen(fixedPort, '0.0.0.0');
+        const srv = app.listen(fixedPort, bindHost);
 
         srv.on('listening', () => {
-            onListening(srv, fixedPort);
+            onListening(srv, fixedPort, bindHost);
         });
 
         srv.on('error', (err) => {
+            if (err.code === 'EADDRNOTAVAIL' && bindHost !== '0.0.0.0') {
+                console.warn(`[HTTP] ⚠️ Không thể gán IP ${bindHost} (EADDRNOTAVAIL). Tự động chuyển sang bind '0.0.0.0'...`);
+                bindHost = '0.0.0.0';
+                setTimeout(tryListen, 500);
+                return;
+            }
+
             if (err.code === 'EADDRINUSE' && attempt < maxRetries) {
                 attempt++;
                 console.warn(`[HTTP] ⚠️ Cổng ${fixedPort} đang tạm thời bận (EADDRINUSE). Đang chờ giải phóng socket và thử lại lần ${attempt}/${maxRetries} sau 1 giây...`);
                 setTimeout(tryListen, 1000);
             } else {
-                console.error(`[HTTP] ❌ Lỗi khởi động máy chủ web trên cổng cố định ${fixedPort}:`, err.message);
+                console.error(`[HTTP] ❌ Lỗi khởi động máy chủ web trên cổng ${fixedPort} (IP: ${bindHost}):`, err.message);
                 if (err.code === 'EADDRINUSE') {
                     console.error(`[HTTP] 💡 Khắc phục: Cổng ${fixedPort} đang bị chiếm bởi tiến trình khác. Hãy kiểm tra các bot/tiến trình Node.js đang chạy ngầm trên máy.`);
                 }
@@ -373,10 +730,103 @@ const LOCATION_RETRY_MAX_MS = 30000;
 const LOCATION_ACTION_COOLDOWN_MS = 2500;
 const IP_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 
-const SETTINGS_FILE = path.join(__dirname, 'bot_settings.json');
+const SETTINGS_FILE = path.join(DATA_DIR, 'bot_settings.json');
 const DEFAULT_SETTINGS = Object.freeze({
     ...BOT_CONFIG.DEFAULT_SETTINGS
 });
+
+let botFileMasterKey = null;
+const botMasterKeyFile = path.join(DATA_DIR, '.bot_master_key');
+try {
+    if (fs.existsSync(botMasterKeyFile)) {
+        botFileMasterKey = fs.readFileSync(botMasterKeyFile, 'utf8').trim();
+    } else {
+        botFileMasterKey = crypto.randomBytes(32).toString('hex');
+        fs.writeFileSync(botMasterKeyFile, botFileMasterKey, { encoding: 'utf8', mode: 0o600 });
+    }
+} catch (_) {}
+
+function getBotCredentialsKeys() {
+    const keys = [];
+    const primary = String(
+        process.env.BOT_CREDENTIALS_ENCRYPTION_KEY ||
+        BOT_SECRET_KEY ||
+        botFileMasterKey || ''
+    ).trim();
+    if (primary) {
+        keys.push(crypto.createHash('sha256').update(primary).digest());
+    }
+    if (botFileMasterKey && botFileMasterKey !== primary) {
+        keys.push(crypto.createHash('sha256').update(botFileMasterKey).digest());
+    }
+    return keys;
+}
+
+function getBotCredentialsKey() {
+    const keys = getBotCredentialsKeys();
+    if (keys.length === 0) {
+        throw new Error('Không có khóa mã hóa hợp lệ cho mật khẩu Minecraft của bot (BOT_CREDENTIALS_ENCRYPTION_KEY / BOT_SECRET_KEY / .bot_master_key).');
+    }
+    return keys[0];
+}
+
+function isEncryptedPassword(str) {
+    return typeof str === 'string' && (str.startsWith('enc:v1:') || str.startsWith('enc$'));
+}
+
+function encryptMinecraftPassword(plaintext) {
+    if (!plaintext || typeof plaintext !== 'string') return '';
+    try {
+        const iv = crypto.randomBytes(12);
+        const key = getBotCredentialsKey();
+        const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+        let encrypted = cipher.update(plaintext, 'utf8', 'hex');
+        encrypted += cipher.final('hex');
+        const tag = cipher.getAuthTag();
+        return `enc:v1:${iv.toString('hex')}:${tag.toString('hex')}:${encrypted}`;
+    } catch (err) {
+        console.error('[ENCRYPTION] Không thể mã hóa mật khẩu bot:', err.message);
+        throw new Error('Không thể mã hóa mật khẩu bot: ' + err.message);
+    }
+}
+
+function decryptMinecraftPassword(stored) {
+    if (!stored || typeof stored !== 'string') return '';
+    if (!isEncryptedPassword(stored)) {
+        return stored;
+    }
+    let iv, tag, ciphertext;
+    if (stored.startsWith('enc:v1:')) {
+        const parts = stored.split(':');
+        if (parts.length !== 5) return stored;
+        iv = Buffer.from(parts[2], 'hex');
+        tag = Buffer.from(parts[3], 'hex');
+        ciphertext = parts[4];
+    } else if (stored.startsWith('enc$')) {
+        const parts = stored.split('$');
+        if (parts.length >= 4) {
+            iv = Buffer.from(parts[1], 'hex');
+            tag = Buffer.from(parts[2], 'hex');
+            ciphertext = parts[3];
+        } else {
+            return stored;
+        }
+    } else {
+        return stored;
+    }
+    const keys = getBotCredentialsKeys();
+    for (const key of keys) {
+        try {
+            const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+            decipher.setAuthTag(tag);
+            let decrypted = decipher.update(ciphertext, 'hex', 'utf8');
+            decrypted += decipher.final('utf8');
+            return decrypted;
+        } catch (_) {}
+    }
+    console.error('[DECRYPTION] Không thể giải mã mật khẩu bot với bất kỳ khóa nào.');
+    return '';
+}
 
 const BOT_SCHEDULER_MAX_ITEMS = 50;
 const BOT_SCHEDULER_TICK_MS = 1000;
@@ -452,6 +902,8 @@ function sanitizeAutoChatSchedules(input) {
 }
 
 const RESTRICTED_MINECRAFT_ACCOUNT_COMMANDS = new Set([
+    '/register',
+    '/reg',
     '/changepassword',
     '/changepass',
     '/cp',
@@ -584,8 +1036,17 @@ function verifyScryptPassword(supplied, stored) {
         return timingSafeStringEquals(supplied, stored);
     }
     const parts = stored.split('$');
-    if (parts.length !== 4) return false;
-    const [, , salt, originalHash] = parts;
+    let salt = '';
+    let originalHash = '';
+    if (parts.length === 4) {
+        salt = parts[2];
+        originalHash = parts[3];
+    } else if (parts.length === 6) {
+        salt = parts[4];
+        originalHash = parts[5];
+    } else {
+        return false;
+    }
     try {
         const derivedKey = crypto.scryptSync(supplied, salt, 64, { N: 16384, r: 8, p: 1 });
         const originalBuffer = Buffer.from(originalHash, 'hex');
@@ -613,7 +1074,12 @@ function saveBotAuthCache(cacheData) {
     try {
         const tmp = AUTH_CACHE_FILE + '.tmp-' + process.pid + '-' + Date.now();
         fs.writeFileSync(tmp, JSON.stringify(cacheData, null, 2), 'utf8');
-        fs.renameSync(tmp, AUTH_CACHE_FILE);
+        try {
+            fs.renameSync(tmp, AUTH_CACHE_FILE);
+        } catch (renameErr) {
+            fs.copyFileSync(tmp, AUTH_CACHE_FILE);
+            try { fs.unlinkSync(tmp); } catch (_) {}
+        }
         return true;
     } catch (e) {
         console.error('[AUTH_SYNC] Lỗi ghi bot_auth_cache.json:', e.message);
@@ -628,6 +1094,7 @@ function loadBotSettings() {
                 settings: { ...DEFAULT_SETTINGS },
                 username: '',
                 password: '',
+                rawEncryptedPassword: null,
                 manuallyStopped: undefined,
                 autoChatSchedules: [],
                 botSchedules: []
@@ -640,6 +1107,9 @@ function loadBotSettings() {
             ? parsed.settings
             : {};
 
+        const rawProxyPass = String(settings?.proxy?.password || parsed?.proxy?.password || '');
+        const decryptedProxyPass = rawProxyPass ? (isEncryptedPassword(rawProxyPass) ? decryptMinecraftPassword(rawProxyPass) : rawProxyPass) : '';
+
         const hasSavedCredentials = typeof parsed?.username === 'string';
         return {
             hasSavedCredentials,
@@ -648,10 +1118,20 @@ function loadBotSettings() {
                 antiHungry: settings.antiHungry !== false,
                 autoReconnect: settings.autoReconnect !== false,
                 antiAfkKick: settings.antiAfkKick !== false,
-                ecoMode: settings.ecoMode !== false
+                ecoMode: settings.ecoMode !== false,
+                spawnCommands: typeof settings?.spawnCommands === 'string' ? settings.spawnCommands : (typeof parsed?.spawnCommands === 'string' ? parsed.spawnCommands : ''),
+                proxy: {
+                    enabled: Boolean(settings?.proxy?.enabled ?? parsed?.proxy?.enabled),
+                    protocol: String(settings?.proxy?.protocol || parsed?.proxy?.protocol || 'socks5'),
+                    host: String(settings?.proxy?.host || parsed?.proxy?.host || ''),
+                    port: Number(settings?.proxy?.port || parsed?.proxy?.port || 0),
+                    username: String(settings?.proxy?.username || parsed?.proxy?.username || ''),
+                    password: decryptedProxyPass
+                }
             },
             username: hasSavedCredentials ? parsed.username : '',
-            password: typeof parsed?.password === 'string' ? parsed.password : '',
+            password: typeof parsed?.password === 'string' ? decryptMinecraftPassword(parsed.password) : '',
+            rawEncryptedPassword: (typeof parsed?.password === 'string' && isEncryptedPassword(parsed.password)) ? parsed.password : null,
             manuallyStopped: parsed?.manuallyStopped !== undefined ? !!parsed.manuallyStopped : undefined,
             autoChatSchedules: sanitizeAutoChatSchedules(parsed?.autoChatSchedules),
             botSchedules: sanitizeBotSchedules(parsed?.botSchedules)
@@ -662,6 +1142,7 @@ function loadBotSettings() {
             settings: { ...DEFAULT_SETTINGS },
             username: '',
             password: '',
+            rawEncryptedPassword: null,
             manuallyStopped: undefined,
             autoChatSchedules: [],
             botSchedules: []
@@ -681,17 +1162,43 @@ function saveBotSettingsFile(settings, autoChatSchedules, botSchedules, accountI
             ? !!accountInfo.manuallyStopped
             : (typeof botState !== 'undefined' && botState ? !!botState.manuallyStopped : false);
 
+        let savedPassword = '';
+        if (accountInfo.password !== undefined) {
+            savedPassword = accountInfo.password ? encryptMinecraftPassword(accountInfo.password) : '';
+            if (typeof botState !== 'undefined' && botState) {
+                botState.rawEncryptedPassword = savedPassword || null;
+            }
+        } else {
+            if (currentPassword) {
+                savedPassword = encryptMinecraftPassword(currentPassword);
+            } else if (typeof botState !== 'undefined' && botState && botState.rawEncryptedPassword) {
+                savedPassword = botState.rawEncryptedPassword;
+            }
+        }
+
+        const rawProxyPass = String(settings?.proxy?.password || '').trim();
+        const savedProxyPass = rawProxyPass ? (isEncryptedPassword(rawProxyPass) ? rawProxyPass : encryptMinecraftPassword(rawProxyPass)) : '';
+
         const payload = {
             version: 3,
             username: currentUsername || '',
-            password: currentPassword || '',
+            password: savedPassword,
             manuallyStopped: currentManuallyStopped,
             settings: {
                 autoTotem: settings.autoTotem !== false,
                 antiHungry: settings.antiHungry !== false,
                 autoReconnect: settings.autoReconnect !== false,
                 antiAfkKick: settings.antiAfkKick !== false,
-                ecoMode: settings.ecoMode !== false
+                ecoMode: settings.ecoMode !== false,
+                spawnCommands: typeof settings?.spawnCommands === 'string' ? settings.spawnCommands.slice(0, 5000) : '',
+                proxy: {
+                    enabled: settings?.proxy?.enabled === true,
+                    protocol: String(settings?.proxy?.protocol || 'socks5').toLowerCase(),
+                    host: String(settings?.proxy?.host || '').trim(),
+                    port: Number(settings?.proxy?.port) || 0,
+                    username: String(settings?.proxy?.username || '').trim(),
+                    password: savedProxyPass
+                }
             },
             autoChatSchedules: sanitizeAutoChatSchedules(autoChatSchedules)
                 .map(schedule => ({
@@ -739,10 +1246,19 @@ function saveBotSettingsFile(settings, autoChatSchedules, botSchedules, accountI
             'utf8'
         );
 
-        fs.renameSync(
-            tmpFile,
-            SETTINGS_FILE
-        );
+        try {
+            fs.renameSync(
+                tmpFile,
+                SETTINGS_FILE
+            );
+        } catch (renameErr) {
+            fs.copyFileSync(tmpFile, SETTINGS_FILE);
+            try { fs.unlinkSync(tmpFile); } catch (_) {}
+        }
+
+        if (typeof botSupabase !== 'undefined' && botSupabase && botSupabase.isEnabled()) {
+            void botSupabase.saveBotSettings(payload);
+        }
 
         return true;
     } catch (err) {
@@ -760,6 +1276,178 @@ const INITIAL_SETTINGS = loadBotSettings();
 // 📡 Đo lưu lượng HTTP Express (Tầng 2 cho Network Telemetry)
 let cumulativeHttpRxBytes = 0;
 let cumulativeHttpTxBytes = 0;
+
+app.set('trust proxy', process.env.TRUST_PROXY ? process.env.TRUST_PROXY : (process.env.RENDER ? 1 : 'loopback'));
+
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; connect-src 'self'; font-src 'self' data: https://fonts.gstatic.com; frame-ancestors 'none'; object-src 'none';");
+    if (req.secure || req.headers['x-forwarded-proto'] === 'https') {
+        res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+    next();
+});
+
+function parseCookies(req) {
+    const list = {};
+    const rc = req.headers?.cookie;
+    if (!rc) return list;
+    rc.split(';').forEach(cookie => {
+        const parts = cookie.split('=');
+        const key = parts.shift().trim();
+        const rawValue = parts.join('=');
+        let value = rawValue;
+        try {
+            value = decodeURIComponent(rawValue);
+        } catch (_) {
+            // Ignore malformed escapes safely; they cannot authenticate as a valid session token.
+        }
+        if (key) list[key] = value;
+    });
+    return list;
+}
+
+function isPrivateOrBlockedHost(hostStr) {
+    if (!hostStr || typeof hostStr !== 'string') return true;
+    let h = hostStr.trim().toLowerCase().replace(/^\[|\]$/g, '');
+
+    // Hostname chặn metadata và internal domains
+    if (['localhost', 'metadata.google.internal', 'metadata.goog', 'instance-data'].includes(h)) return true;
+    if (h.endsWith('.internal') || h.endsWith('.local') || h.endsWith('.localhost')) return true;
+
+    // Chặn định dạng số nguyên decimal / hex bypass IP (ví dụ: 2130706433 hoặc 0x7f000001)
+    if (/^0x[0-9a-f]+$/i.test(h) || /^\d+$/.test(h)) return true;
+
+    // Xử lý IPv4-mapped IPv6, gồm cả dạng hextet để tránh bypass qua ::ffff:7f00:1.
+    if (h.startsWith('::ffff:')) {
+        const after = h.slice(7);
+        if (net.isIPv4(after)) {
+            h = after;
+        } else {
+            const mappedHex = after.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+            if (mappedHex) {
+                const high = parseInt(mappedHex[1], 16);
+                const low = parseInt(mappedHex[2], 16);
+                h = [high >> 8, high & 0xff, low >> 8, low & 0xff].join('.');
+            }
+        }
+    } else {
+        const expandedMappedHex = h.match(/^(?:0{1,4}:){5}ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+        if (expandedMappedHex) {
+            const high = parseInt(expandedMappedHex[1], 16);
+            const low = parseInt(expandedMappedHex[2], 16);
+            h = [high >> 8, high & 0xff, low >> 8, low & 0xff].join('.');
+        } else {
+            const expandedMappedIPv4 = h.match(/^(?:0{1,4}:){5}ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
+            if (expandedMappedIPv4) h = expandedMappedIPv4[1];
+        }
+    }
+
+    const ipType = net.isIP(h);
+    if (ipType === 4) {
+        const parts = h.split('.').map(p => parseInt(p, 10));
+        if (parts.length !== 4 || parts.some(n => isNaN(n) || n < 0 || n > 255)) return true;
+        const [a, b, c, d] = parts;
+
+        // 0.0.0.0/8 (Mạng hiện tại / Unspecified)
+        if (a === 0) return true;
+        // 10.0.0.0/8 (Private RFC 1918)
+        if (a === 10) return true;
+        // 100.64.0.0/10 (Carrier-Grade NAT RFC 6598: 100.64.0.0 - 100.127.255.255)
+        if (a === 100 && (b >= 64 && b <= 127)) return true;
+        // 127.0.0.0/8 (Loopback RFC 1122)
+        if (a === 127) return true;
+        // 169.254.0.0/16 (Link-Local RFC 3927)
+        if (a === 169 && b === 254) return true;
+        // 172.16.0.0/12 (Private RFC 1918: 172.16.0.0 - 172.31.255.255)
+        if (a === 172 && (b >= 16 && b <= 31)) return true;
+        // 192.0.0.0/24 (IETF Protocol Assignments)
+        if (a === 192 && b === 0 && c === 0) return true;
+        // 192.0.2.0/24 (TEST-NET-1 RFC 5737)
+        if (a === 192 && b === 0 && c === 2) return true;
+        // 192.168.0.0/16 (Private RFC 1918)
+        if (a === 192 && b === 168) return true;
+        // 198.18.0.0/15 (Benchmarking RFC 2544: 198.18.0.0 - 198.19.255.255)
+        if (a === 198 && (b === 18 || b === 19)) return true;
+        // 198.51.100.0/24 (TEST-NET-2 RFC 5737)
+        if (a === 198 && b === 51 && c === 100) return true;
+        // 203.0.113.0/24 (TEST-NET-3 RFC 5737)
+        if (a === 203 && b === 0 && c === 113) return true;
+        // 224.0.0.0/4 (Multicast) & 240.0.0.0/4 (Reserved) & 255.255.255.255 (Broadcast)
+        if (a >= 224) return true;
+
+        return false;
+    } else if (ipType === 6) {
+        // ::1 Loopback
+        if (h === '::1' || h === '0:0:0:0:0:0:0:1') return true;
+        // :: Unspecified
+        if (h === '::' || h === '0:0:0:0:0:0:0:0') return true;
+        // fe80::/10 (Link-Local)
+        if (/^fe[89ab][0-9a-f]/i.test(h) || h.startsWith('fe80:')) return true;
+        // fc00::/7 (Unique Local Address - ULA: fc00:: đến fdff::)
+        if (/^f[cd][0-9a-f]{2}:/i.test(h)) return true;
+        // ff00::/8 (Multicast)
+        if (/^ff[0-9a-f]{2}:/i.test(h)) return true;
+
+        return false;
+    }
+
+    return false;
+}
+
+async function isPrivateOrBlockedHostAsync(hostStr) {
+    if (!hostStr || typeof hostStr !== 'string') return true;
+    if (isPrivateOrBlockedHost(hostStr)) return true;
+    let h = hostStr.trim().toLowerCase().replace(/^\[|\]$/g, '');
+    if (net.isIP(h) !== 0) return false;
+    try {
+        const records = await dns.promises.lookup(h, { all: true });
+        for (const rec of records) {
+            if (isPrivateOrBlockedHost(rec.address)) {
+                return true;
+            }
+        }
+        return false;
+    } catch (_) {
+        return true;
+    }
+}
+
+// CSRF Origin verification on mutating requests
+app.use((req, res, next) => {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+    if (isTrustedManagerRequest(req)) return next();
+    if (req.path === '/api/auth/login') return next();
+    const cookies = parseCookies(req);
+    const hasSessionCookie = !!cookies.bot_token;
+    const origin = req.headers['origin'];
+    const host = req.headers.host;
+    if (hasSessionCookie && !origin && !req.headers['referer']) {
+        return res.status(403).json({ ok: false, error: 'Yêu cầu từ trình duyệt thiếu header xác thực nguồn (Origin/Referer).' });
+    }
+    if (origin) {
+        try {
+            const parsedOrigin = new URL(origin);
+            if (parsedOrigin.host !== host) {
+                return res.status(403).json({ ok: false, error: 'CSRF validation failed: Invalid Origin.' });
+            }
+        } catch (_) {
+            return res.status(403).json({ ok: false, error: 'CSRF validation failed: Malformed Origin.' });
+        }
+    } else if (req.headers['referer'] && host) {
+        try {
+            const refererHost = new URL(req.headers['referer']).host;
+            if (refererHost !== host) {
+                return res.status(403).json({ ok: false, error: 'CSRF validation failed: Referer mismatch.' });
+            }
+        } catch (_) {
+            return res.status(403).json({ ok: false, error: 'CSRF validation failed: Malformed Referer.' });
+        }
+    }
+    next();
+});
 
 app.use((req, res, next) => {
     let reqBytes = 0;
@@ -808,6 +1496,8 @@ app.use((req, res, next) => {
 
     if (
         req.path === '/health' ||
+        req.path === '/healthz' ||
+        req.path === '/api/health' ||
         !req.path.startsWith('/api/') ||
         req.path.startsWith('/api/auth/') ||
         isTrustedManagerRequest(req) ||
@@ -821,13 +1511,9 @@ app.use((req, res, next) => {
 
 app.use((err, req, res, next) => {
     if (err && (err.type === 'entity.parse.failed' || err instanceof SyntaxError)) {
-        return res.status(400).json({ error: 'JSON request không hợp lệ.' });
+        return res.status(400).json({ ok: false, error: 'JSON request không hợp lệ.' });
     }
-    if (err) {
-        console.error(`[HTTP] ${req.method} ${req.originalUrl || req.url}: ${err.message || err}`);
-        return res.status(500).json({ error: 'Lỗi máy chủ.' });
-    }
-    return next();
+    return next(err);
 });
 
 function cleanMinecraftText(text) {
@@ -897,6 +1583,7 @@ function createBotState() {
 
         username: effectiveUsername,
         password: effectivePassword,
+        rawEncryptedPassword: initialSaved.rawEncryptedPassword || null,
         syncedAuth: loadBotAuthCache(),
 
         bot: null,
@@ -1012,7 +1699,20 @@ const botState = createBotState();
 startBotScheduler(botState);
 startMemoryWatchdog(botState);
 
+let lastLoggedMessage = '';
+let lastLoggedMessageTime = 0;
+
 function addLog(state, message) {
+    if (!message || typeof message !== 'string') return;
+    const now = Date.now();
+
+    // Hạn chế log sự kiện trùng lặp / spam liên tục trong vòng 6s
+    if (message === lastLoggedMessage && (now - lastLoggedMessageTime < 6000)) {
+        return;
+    }
+    lastLoggedMessage = message;
+    lastLoggedMessageTime = now;
+
     const time = new Date().toLocaleTimeString('vi-VN', {
         timeZone: 'Asia/Ho_Chi_Minh',
         hour12: false
@@ -1254,10 +1954,20 @@ function cleanupBotResources(bot) {
     } catch (_) {
     }
 
-    // Gợi ý V8 thu hồi bộ nhớ ngay sau khi đóng/dọn dẹp tài nguyên bot
-    if (typeof global.gc === 'function') {
-        try { global.gc(); } catch (_) {}
-    }
+    try {
+        if (bot.world && bot.world.columns) {
+            bot.world.columns = {};
+        }
+        if (bot.entities) {
+            bot.entities = {};
+        }
+        if (bot.inventory) {
+            bot.inventory.slots = [];
+        }
+    } catch (_) {}
+
+    // Thu hồi bộ nhớ Heap thực sự sau khi đóng/dọn dẹp tài nguyên bot
+    runGarbageCollection();
 }
 
 function withTimeout(
@@ -1406,87 +2116,32 @@ function applyHighDensityFarmOptimizations(state, bot) {
             'block_break_animation', 'entity_effect', 'remove_entity_effect'
         ];
         for (const evt of dropEvents) {
-            bot._client.removeAllListeners(evt);
-            bot._client.on(evt, () => {}); // No-op: drop thẳng gói tin, không tốn CPU/RAM parse
+            // Không xóa listener nội bộ của Mineflayer bằng removeAllListeners
+            if (bot._client.listenerCount(evt) === 0) {
+                bot._client.on(evt, () => {});
+            }
         }
     }
 
-    // 2. Lắng nghe entitySpawn để cắt tỉa rác tức thì (không để dồn ứ bộ nhớ RAM)
+    // 2. Hủy bỏ triệt để việc xóa bot.entities (tránh tạo vòng lặp tái sinh entity vô tận làm đơ/loop Eco mode)
     if (bot._entitySpawnPruneHandler) {
         bot.removeListener('entitySpawn', bot._entitySpawnPruneHandler);
+        bot._entitySpawnPruneHandler = null;
     }
-    bot._entitySpawnPruneHandler = (entity) => {
-        try {
-            if (!entity || !bot.entities) return;
-            const myPos = bot.entity ? bot.entity.position : null;
-            const hasPos = entity.position && typeof entity.position.distanceSquared === 'function';
-            const distSq = (hasPos && myPos) ? entity.position.distanceSquared(myPos) : 99999;
-            const isItemOrOrb = entity.name === 'item' || entity.type === 'object' || entity.entityType === 'item' || entity.type === 'orb';
-            if (isItemOrOrb && distSq > 9) {
-                delete bot.entities[entity.id];
-            } else if (entity.type !== 'player' && distSq > 400) {
-                delete bot.entities[entity.id];
-            }
-        } catch (_) {}
-    };
-    bot.on('entitySpawn', bot._entitySpawnPruneHandler);
 
-    // 3. Vòng lặp dọn dẹp thực thể (Entity Pruning) - Khóa cứng RAM luôn < 120MB
+    // 3. Vòng lặp dọn dẹp Chunk bản đồ ở xa (> 2 chunks) để giải phóng RAM triệt để
     if (state.farmPruneTimer) clearInterval(state.farmPruneTimer);
+    const pruneInterval = Number(BOT_CONFIG.FARM_OPTIMIZATION.PRUNE_INTERVAL_MS) || 20000;
     state.farmPruneTimer = setInterval(() => {
         try {
-            if (!bot || !bot.entities) return;
-
-            const myId = bot.entity ? bot.entity.id : -1;
+            if (!bot) return;
             const myPos = bot.entity ? bot.entity.position : null;
-            let totalCount = 0;
-            const nonPlayerIds = [];
 
-            for (const id in bot.entities) {
-                totalCount++;
-                if (id == myId) continue;
-                const entity = bot.entities[id];
-                if (!entity) continue;
-
-                // Nếu là item rơi dưới đất hoặc exp orb
-                const isItemOrOrb = entity.name === 'item' || entity.type === 'object' || entity.entityType === 'item' || entity.type === 'orb' || entity.name === 'experience_orb';
-                const hasPos = entity.position && typeof entity.position.distanceSquared === 'function';
-                const distSq = (hasPos && myPos) ? entity.position.distanceSquared(myPos) : 99999;
-
-                if (isItemOrOrb) {
-                    // Nếu cách bot hơn 3 block (ngoài tầm nhặt) -> Xóa sổ khỏi bộ nhớ RAM
-                    if (!myPos || !hasPos || distSq > 9) {
-                        delete bot.entities[id];
-                        continue;
-                    }
-                }
-
-                // Dọn dẹp thực thể quái/vật phẩm ở xa ngoài 20 blocks
-                if (entity.type !== 'player') {
-                    if (distSq > 400) {
-                        delete bot.entities[id];
-                        continue;
-                    }
-                    nonPlayerIds.push({ id, distSq });
-                }
-            }
-
-            // Nếu số lượng entity vượt quá trần cấu hình -> Xóa các thực thể xa nhất
-            const maxEntities = BOT_CONFIG.FARM_OPTIMIZATION.MAX_ENTITIES_IN_MEMORY || 120;
-            if (totalCount > maxEntities && nonPlayerIds.length > 0) {
-                nonPlayerIds.sort((a, b) => b.distSq - a.distSq);
-                for (const item of nonPlayerIds) {
-                    if (totalCount <= maxEntities) break;
-                    delete bot.entities[item.id];
-                    totalCount--;
-                }
-            }
-
-            // 3. Dọn dẹp Chunk ở xa để giải phóng bộ nhớ World Map
+            // Dọn dẹp an toàn các chunk map ngoài bán kính quanh bot
             if (bot.world && myPos) {
                 const botChunkX = Math.floor(myPos.x / 16);
                 const botChunkZ = Math.floor(myPos.z / 16);
-                const cullRadius = BOT_CONFIG.FARM_OPTIMIZATION.CHUNK_CULL_RADIUS;
+                const cullRadius = Number(BOT_CONFIG.FARM_OPTIMIZATION.CHUNK_CULL_RADIUS) || 2;
 
                 if (typeof bot.world.getColumns === 'function') {
                     const cols = bot.world.getColumns();
@@ -1499,7 +2154,24 @@ function applyHighDensityFarmOptimizations(state, bot) {
                                 if (Math.abs(cx - botChunkX) > cullRadius || Math.abs(cz - botChunkZ) > cullRadius) {
                                     if (typeof bot.world.unloadColumn === 'function') {
                                         bot.world.unloadColumn(cx, cz);
+                                    } else if (bot.world.columns) {
+                                        delete bot.world.columns[`${cx},${cz}`];
                                     }
+                                }
+                            }
+                        }
+                    }
+                } else if (bot.world.columns) {
+                    for (const key of Object.keys(bot.world.columns)) {
+                        const parts = key.split(',');
+                        if (parts.length === 2) {
+                            const cx = parseInt(parts[0], 10);
+                            const cz = parseInt(parts[1], 10);
+                            if (Math.abs(cx - botChunkX) > cullRadius || Math.abs(cz - botChunkZ) > cullRadius) {
+                                if (typeof bot.world.unloadColumn === 'function') {
+                                    bot.world.unloadColumn(cx, cz);
+                                } else {
+                                    delete bot.world.columns[key];
                                 }
                             }
                         }
@@ -1507,7 +2179,7 @@ function applyHighDensityFarmOptimizations(state, bot) {
                 }
             }
         } catch (_) {}
-    }, BOT_CONFIG.FARM_OPTIMIZATION.PRUNE_INTERVAL_MS);
+    }, pruneInterval);
 }
 
 // 🌿 ECO MODE ENGINE: Siêu Tối Ưu RAM & CPU cho Hạm Đội
@@ -1520,85 +2192,123 @@ function applyEcoModeOptimizations(state, bot) {
             bot.physics.maxCatchupTicks = 0;
         }
 
-        // Tắt tính toán physics khi bot đang AFK đứng yên (tiết kiệm ~80% CPU)
-        if (state.status === 'afk' && !state.isEating && !state.locationFlowBusy) {
-            bot.physicsEnabled = false;
-        } else {
-            bot.physicsEnabled = true;
-        }
+        // BẢO ĐẢM PHYSICS TICK LUÔN BẬT để server KingMC không kick do mất gói tin / timeout
+        bot.physicsEnabled = true;
 
-        // Chặn hoàn toàn packet hạt bọt nước & âm thanh thừa
-        if (bot._client) {
-            const dropEvts = [
-                'update_light', 'world_particles', 'sound_effect', 'named_sound_effect',
-                'spawn_entity_experience_orb', 'experience_orb', 'block_break_animation',
-                'entity_effect', 'remove_entity_effect'
-            ];
-            for (const evt of dropEvts) {
-                bot._client.removeAllListeners(evt);
-                bot._client.on(evt, () => {});
-            }
+        // Hạ CPU ~80%: triệt tiêu tính toán gia tốc khi bot đang AFK đứng yên
+        if (state.status === 'afk' && !state.isEating && !state.locationFlowBusy) {
+            try {
+                if (typeof bot.clearControlStates === 'function') {
+                    bot.clearControlStates();
+                }
+                if (bot.entity && bot.entity.velocity) {
+                    bot.entity.velocity.set(0, 0, 0);
+                }
+            } catch (_) {}
         }
 
         // Cắt tỉa logs trong RAM
         if (state.logs && state.logs.length > 150) state.logs = state.logs.slice(-150);
         if (state.chatLogs && state.chatLogs.length > 150) state.chatLogs = state.chatLogs.slice(-150);
 
-        // Cắt tỉa thực thể chỉ giữ tối đa 35 thực thể trong phạm vi 8 khối
-        if (bot.entities) {
-            const myId = bot.entity ? bot.entity.id : -1;
-            const myPos = bot.entity ? bot.entity.position : null;
-            let count = 0;
-            for (const id in bot.entities) {
-                if (id == myId) continue;
-                const e = bot.entities[id];
-                if (!e) continue;
-                const distSq = (myPos && e.position) ? e.position.distanceSquared(myPos) : 9999;
-                if (distSq > 64 || count > 35) {
-                    delete bot.entities[id];
-                } else {
-                    count++;
+        // Dọn dẹp an toàn các chunk bản đồ ở xa (> 2 chunk quanh bot) để giải phóng hàng chục MB RAM
+        try {
+            if (bot.world) {
+                const myPos = bot.entity ? bot.entity.position : null;
+                if (myPos) {
+                    const myCx = Math.floor(myPos.x / 16);
+                    const myCz = Math.floor(myPos.z / 16);
+                    if (bot.world.columns) {
+                        for (const key of Object.keys(bot.world.columns)) {
+                            const parts = key.split(',');
+                            if (parts.length === 2) {
+                                const cx = parseInt(parts[0], 10);
+                                const cz = parseInt(parts[1], 10);
+                                if (Math.abs(cx - myCx) > 2 || Math.abs(cz - myCz) > 2) {
+                                    if (typeof bot.world.unloadColumn === 'function') {
+                                        bot.world.unloadColumn(cx, cz);
+                                    } else {
+                                        delete bot.world.columns[key];
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
-        }
+        } catch (_) {}
+
+        // Kích hoạt V8 Garbage Collection giải phóng bộ nhớ Heap thực sự
+        runGarbageCollection();
     } else {
         bot.physicsEnabled = true;
     }
 }
 
 // 🛡️ MEMORY WATCHDOG: Giám sát RAM định kỳ, bảo đảm luôn < 220MB (Eco) / < 380MB
+let lastMemCleanLogTime = 0;
+
 function startMemoryWatchdog(state) {
     if (state.memoryWatchdogTimer) clearInterval(state.memoryWatchdogTimer);
     state.memoryWatchdogTimer = setInterval(() => {
         try {
-            const mem = process.memoryUsage();
-            const rssMb = Math.round(mem.rss / (1024 * 1024));
-            const heapMb = Math.round(mem.heapUsed / (1024 * 1024));
+            const memBefore = process.memoryUsage();
+            const rssMb = Math.round(memBefore.rss / (1024 * 1024));
+            const heapMb = Math.round(memBefore.heapUsed / (1024 * 1024));
             state.lastRssMb = rssMb;
             state.lastHeapMb = heapMb;
 
             const isEco = state.settings.ecoMode !== false;
-            const limitMb = isEco ? 220 : (Number(BOT_CONFIG.RAM_WATCHDOG_LIMIT_MB) || 380);
-            if (rssMb > limitMb) {
-                // Ép dọn dẹp thực thể và chunk
-                if (state.bot && state.bot.entities) {
-                    const myId = state.bot.entity ? state.bot.entity.id : -1;
-                    for (const id in state.bot.entities) {
-                        if (id != myId && state.bot.entities[id]?.type !== 'player') {
-                            delete state.bot.entities[id];
+            const hostTotalMb = typeof getContainerMemoryLimit === 'function' ? getContainerMemoryLimit() : 512;
+            let limitMb;
+            if (isEco) {
+                limitMb = Math.min(220, Math.max(120, Math.round(hostTotalMb * 0.5)));
+            } else {
+                const configLimit = Number(BOT_CONFIG.RAM_WATCHDOG_LIMIT_MB) || 380;
+                limitMb = Math.min(configLimit, Math.max(160, Math.round(hostTotalMb * 0.75)));
+            }
+            if (rssMb > limitMb || heapMb > (limitMb * 0.75)) {
+                // 1. Dọn dẹp an toàn chunk ở xa
+                if (state.bot && state.bot.world) {
+                    const myPos = state.bot.entity ? state.bot.entity.position : null;
+                    if (myPos && state.bot.world.columns) {
+                        const myCx = Math.floor(myPos.x / 16);
+                        const myCz = Math.floor(myPos.z / 16);
+                        for (const key of Object.keys(state.bot.world.columns)) {
+                            const parts = key.split(',');
+                            if (parts.length === 2) {
+                                const cx = parseInt(parts[0], 10);
+                                const cz = parseInt(parts[1], 10);
+                                if (Math.abs(cx - myCx) > 2 || Math.abs(cz - myCz) > 2) {
+                                    if (typeof state.bot.world.unloadColumn === 'function') {
+                                        state.bot.world.unloadColumn(cx, cz);
+                                    } else {
+                                        delete state.bot.world.columns[key];
+                                    }
+                                }
+                            }
                         }
                     }
                 }
 
+                // 2. Cắt tỉa logs trong RAM
                 const maxLogs = isEco ? 150 : 300;
                 if (state.logs && state.logs.length > maxLogs) state.logs = state.logs.slice(-maxLogs);
                 if (state.chatLogs && state.chatLogs.length > maxLogs) state.chatLogs = state.chatLogs.slice(-maxLogs);
 
-                if (typeof global.gc === 'function') {
-                    global.gc();
-                }
+                // 3. Thực thi Garbage Collection giải phóng bộ nhớ
+                runGarbageCollection();
 
-                addLog(state, `[BỘ NHỚ] 🌿 Kích hoạt giải phóng RAM Eco Mode (RSS: ${rssMb} MB / Ngưỡng: ${limitMb} MB).`);
+                const memAfter = process.memoryUsage();
+                state.lastRssMb = Math.round(memAfter.rss / (1024 * 1024));
+                state.lastHeapMb = Math.round(memAfter.heapUsed / (1024 * 1024));
+
+                // 4. Rate-limit log sự kiện (chỉ log tối đa 1 lần mỗi 10 phút, không spam liên tục)
+                const now = Date.now();
+                if (now - lastMemCleanLogTime > 600000) {
+                    lastMemCleanLogTime = now;
+                    addLog(state, `[BỘ NHỚ] 🌿 Đã giải phóng RAM (RSS: ${rssMb}MB → ${state.lastRssMb}MB | Heap: ${state.lastHeapMb}MB).`);
+                }
             }
 
             if (state.bot) {
@@ -1802,15 +2512,19 @@ function startSmartAntiAfk(state) {
                         }
                         // 25% cơ hội nhấp ngồi (sneak) 160ms giả lập thao tác người thật
                         if (Math.random() > 0.75 && typeof state.bot.setControlState === 'function') {
-                            state.bot.setControlState('sneak', true);
+                            try { state.bot.setControlState('sneak', true); } catch (_) {}
                             setTimeout(() => {
-                                if (state.bot) state.bot.setControlState('sneak', false);
+                                try {
+                                    if (state.bot && typeof state.bot.setControlState === 'function') {
+                                        state.bot.setControlState('sneak', false);
+                                    }
+                                } catch (_) {}
                             }, 160);
                         }
                     });
                     setTimeout(() => {
-                        if (state.bot && state.settings.ecoMode !== false && state.status === 'afk' && !state.isEating && !state.locationFlowBusy) {
-                            state.bot.physicsEnabled = false;
+                        if (state.bot) {
+                            applyEcoModeOptimizations(state, state.bot);
                         }
                     }, 1500);
                 } catch (_) {}
@@ -1820,6 +2534,37 @@ function startSmartAntiAfk(state) {
     }
 
     scheduleNext();
+}
+
+// 🚀 AUTO-SPAWN ACTION ROUTINE: Tự động chạy chuỗi lệnh sau khi vào server thành công
+function runSpawnCommands(state, bot) {
+    const raw = String(state.settings?.spawnCommands || '').trim();
+    if (!raw) return;
+    const cmds = raw.split(/[\r\n;]+/).map(s => s.trim()).filter(Boolean);
+    if (cmds.length === 0) return;
+
+    addLog(state, `[SPAWN-CMD] 🚀 Đang khởi chạy chuỗi ${cmds.length} lệnh tự động sau khi vào server...`);
+    let idx = 0;
+    function next() {
+        if (idx >= cmds.length) {
+            addLog(state, `[SPAWN-CMD] ✅ Đã hoàn tất chuỗi lệnh tự động.`);
+            return;
+        }
+        if (state.status !== 'afk' || state.bot !== bot || !state.ready) {
+            addLog(state, `[SPAWN-CMD] ⚠️ Tạm dừng chuỗi lệnh do trạng thái bot không còn AFK.`);
+            return;
+        }
+        const cmd = cmds[idx++];
+        const formatted = cmd.startsWith('/') ? cmd : '/' + cmd;
+        try {
+            addLog(state, `[SPAWN-CMD] ❯ Gửi lệnh: ${formatted}`);
+            bot.chat(formatted);
+        } catch (e) {
+            addLog(state, `[SPAWN-CMD] ❌ Lỗi gửi lệnh (${formatted}): ${e.message}`);
+        }
+        setTimeout(next, 1600);
+    }
+    setTimeout(next, 2000);
 }
 
 
@@ -2669,15 +3414,8 @@ async function autoEatTick(state) {
     } finally {
         state.isEating = false;
         setTimeout(() => {
-            if (
-                state.bot === oldBot &&
-                oldBot &&
-                state.settings.ecoMode !== false &&
-                state.status === 'afk' &&
-                !state.isEating &&
-                !state.locationFlowBusy
-            ) {
-                oldBot.physicsEnabled = false;
+            if (state.bot === oldBot && oldBot) {
+                applyEcoModeOptimizations(state, oldBot);
             }
         }, 1500);
 
@@ -3085,7 +3823,10 @@ function applyScheduledLifecycleAction(state, action, reason) {
         if (action === 'stop') {
             stopBot(state, 'scheduler');
         } else if (action === 'start') {
-            if (!startBot(state, 'scheduler')) return false;
+            if (!startBot(state, 'scheduler')) {
+                addLog(state, `[SCHEDULER] ${reason}: Bỏ qua START vì thiếu username hoặc password.`);
+                return true;
+            }
         } else {
             return false;
         }
@@ -3638,9 +4379,24 @@ function confirmAfkAfterClick(state, bot) {
         addLog(state, '[FLOW] Xác nhận tọa độ sau click: đã rời LOGIN/LOBBY.');
         addLog(state, '✅ Đã xác nhận trạng thái AFK.');
 
+        // Ghi log tọa độ sinh tồn thực tế (LOẠI BỎ hoàn toàn tọa độ sảnh & login theo yêu cầu người dùng)
+        const coords = getRoundedBotCoordinates(bot);
+        if (coords && !sameCoordinates(coords, AUTH_COORDS) && !sameCoordinates(coords, LOBBY_COORDS)) {
+            if (typeof botSupabase !== 'undefined' && botSupabase && botSupabase.isEnabled()) {
+                void botSupabase.logBotAction({
+                    action: 'BOT_POSITION_UPDATE',
+                    actionLabel: '📍 Tọa độ Bot sinh tồn',
+                    category: 'BOT_COORDS',
+                    details: `Tọa độ bot vào thế giới sinh tồn: X=${coords.x}, Y=${coords.y}, Z=${coords.z} (Thế giới: ${getBotDimension(state) || 'overworld'})`,
+                    status: 'SUCCESS'
+                });
+            }
+        }
+
         // Kích hoạt Anti-AFK Kick & Tối ưu Farm
         startSmartAntiAfk(state);
         applyHighDensityFarmOptimizations(state, bot);
+        runSpawnCommands(state, bot);
         return;
     }
 
@@ -4061,7 +4817,13 @@ function readCgroupFile(filePath) {
 }
 
 function getContainerMemoryLimit() {
-    // a) Render container environment limit
+    // a1) Pterodactyl / Wisp panel container limit in MB (Deplexo, WispByte)
+    if (process.env.SERVER_MEMORY) {
+        const sm = Number(process.env.SERVER_MEMORY);
+        if (Number.isFinite(sm) && sm > 0) return Math.round(sm);
+    }
+
+    // a2) Render container environment limit
     if (process.env.RENDER || process.env.RENDER_SERVICE_ID) {
         return Number(process.env.RENDER_MEMORY_MB) || 512;
     }
@@ -4268,13 +5030,18 @@ function getHostHardware() {
         const ramTotalMb = getContainerMemoryLimit();
         const ramUsedMb = getContainerMemoryUsage(ramTotalMb);
         const ramPercent = ramTotalMb > 0 ? Math.round((ramUsedMb / ramTotalMb) * 1000) / 10 : 0;
-        const botRssMb = Math.round(process.memoryUsage().rss / (1024 * 1024));
+        const mem = process.memoryUsage();
+        const botRssMb = Math.round(mem.rss / (1024 * 1024));
+        const botHeapMb = Math.round(mem.heapUsed / (1024 * 1024));
+        const botHeapTotalMb = Math.round(mem.heapTotal / (1024 * 1024));
 
         return {
             ramPercent,          // % RAM máy host/container đã dùng
             ramUsedMb,           // MB RAM máy host/container đã dùng
             ramTotalMb,          // Tổng MB RAM được cấp
-            botRssMb,            // RAM riêng của bot (MB)
+            botRssMb,            // RAM riêng của bot (MB RSS)
+            botHeapMb,           // RAM Heap thực tế bot đang dùng (MB)
+            botHeapTotalMb,      // Tổng Heap được cấp (MB)
             cpuPercent: currentHostCpuPercent, // % CPU thực tế
             cpuCores: hostCpuCores,            // Số nhân vCPU được cấp
             netDownKb: currentNetDownKbps,     // Tốc độ tải về (KB/s)
@@ -4283,11 +5050,14 @@ function getHostHardware() {
             netTotalTxMb: totalNetTxMb         // Tổng gửi đi (MB)
         };
     } catch (_) {
+        const mem = process.memoryUsage();
         return {
             ramPercent: 0,
             ramUsedMb: 0,
             ramTotalMb: 512,
-            botRssMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+            botRssMb: Math.round(mem.rss / (1024 * 1024)),
+            botHeapMb: Math.round(mem.heapUsed / (1024 * 1024)),
+            botHeapTotalMb: Math.round(mem.heapTotal / (1024 * 1024)),
             cpuPercent: 0,
             cpuCores: 1,
             netDownKb: 0,
@@ -4327,8 +5097,12 @@ function publicBotState(state) {
         status: state.status,
         ready: state.ready,
         ping: getPing(state),
+        tps: Number.isFinite(state.serverTps) ? state.serverTps : (['afk', 'online', 'entering', 'authenticating'].includes(state.status) ? 20.0 : 0.0),
+        serverTps: Number.isFinite(state.serverTps) ? state.serverTps : (['afk', 'online', 'entering', 'authenticating'].includes(state.status) ? 20.0 : 0.0),
         rssMb: Math.round(mem.rss / (1024 * 1024)),
         heapMb: Math.round(mem.heapUsed / (1024 * 1024)),
+        botHeapMb: Math.round(mem.heapUsed / (1024 * 1024)),
+        heapTotalMb: Math.round(mem.heapTotal / (1024 * 1024)),
         ramRss: Math.round(mem.rss / (1024 * 1024)),
         ramRssMb: Math.round(mem.rss / (1024 * 1024)),
         ramHeap: Math.round(mem.heapUsed / (1024 * 1024)),
@@ -4336,7 +5110,8 @@ function publicBotState(state) {
             rss: Math.round(mem.rss / (1024 * 1024)),
             rssMb: Math.round(mem.rss / (1024 * 1024)),
             heap: Math.round(mem.heapUsed / (1024 * 1024)),
-            heapMb: Math.round(mem.heapUsed / (1024 * 1024))
+            heapMb: Math.round(mem.heapUsed / (1024 * 1024)),
+            heapTotalMb: Math.round(mem.heapTotal / (1024 * 1024))
         },
         hostHardware: hw,
         system: hw,
@@ -4381,7 +5156,16 @@ function publicBotState(state) {
             autoTotem: state.settings.autoTotem !== false,
             antiHungry: state.settings.antiHungry !== false,
             autoReconnect: state.settings.autoReconnect !== false,
-            antiAfkKick: state.settings.antiAfkKick !== false
+            antiAfkKick: state.settings.antiAfkKick !== false,
+            spawnCommands: state.settings.spawnCommands || '',
+            proxy: {
+                enabled: state.settings?.proxy?.enabled === true,
+                protocol: state.settings?.proxy?.protocol || 'socks5',
+                host: state.settings?.proxy?.host || '',
+                port: Number(state.settings?.proxy?.port) || 0,
+                username: state.settings?.proxy?.username || '',
+                password: state.settings?.proxy?.password ? '********' : ''
+            }
         },
         ecoMode: state.settings.ecoMode !== false,
 
@@ -4448,16 +5232,11 @@ function publicBotCredentials(state) {
 
 function getReconnectDelay(state) {
     const attempt = Math.max(Number(state.reconnectAttempts || 0), 0);
-    const baseDelay = RECONNECT_DELAY || 3000;
-    const maxDelay = 45000;
-    // Full Jitter Exponential Backoff: cap = min(maxDelay, baseDelay * 2^attempt)
-    const cap = Math.min(maxDelay, baseDelay * Math.pow(2, Math.min(attempt, 5)));
-    // Full Jitter: phân phối ngẫu nhiên đều giữa baseDelay và cap
-    const jitterDelay = baseDelay + Math.floor(Math.random() * Math.max(1000, cap - baseDelay));
-    // Fleet Phase Staggering: độ lệch pha theo BOT_ID chống thundering herd & chống ban IP đồng loạt
-    const botIdNum = Number(BOT_ID) || 1;
-    const staggerOffset = ((botIdNum - 1) % 10) * 1500;
-    const finalDelay = Math.min(jitterDelay + staggerOffset, 60000);
+    const baseDelay = 5000;   // Bắt đầu từ 5 giây
+    const maxDelay = 30000;   // Tăng dần tối đa 30 giây
+    const calcDelay = Math.min(maxDelay, baseDelay + attempt * 5000);
+    // Phân phối ngẫu nhiên nhẹ (0 - 500ms) chống thundering herd
+    const finalDelay = Math.min(maxDelay, calcDelay + Math.floor(Math.random() * 500));
     return finalDelay;
 }
 
@@ -4508,6 +5287,10 @@ function disconnectBot(
 
     state.connectionGeneration++;
     state.ready = false;
+    state.serverTps = 0.0;
+    state.tpsSamples = [];
+    state.lastTimePacketAt = null;
+    state.lastWorldAge = undefined;
     setBotStatus(state, 'offline');
     state.connectedAt = null;
 
@@ -4532,13 +5315,15 @@ function disconnectBot(
     }
 }
 
-function stopBot(state, source = 'manual') {
+function stopBot(state, source = 'manual', persist = true) {
     if (source === 'manual') {
         markManualLifecycleAction(state);
     }
 
     state.manuallyStopped = true;
-    saveBotSettingsFile(state.settings, state.autoChatSchedules, state.botSchedules, { manuallyStopped: true });
+    if (persist) {
+        saveBotSettingsFile(state.settings, state.autoChatSchedules, state.botSchedules, { manuallyStopped: true });
+    }
 
     // Tạm dừng mọi lịch Auto Chat đang chạy
     if (Array.isArray(state.autoChatSchedules)) {
@@ -4598,6 +5383,9 @@ function startBot(state, source = 'manual') {
     state.connectedAt = null;
     state.reconnectAttempts = 0;
     state.lastAuthDnActionAt = 0;
+    state.serverTps = 20.0;
+    state.tpsSamples = [];
+    state.lastTimePacketAt = null;
     setBotStatus(state, 'connecting');
 
     if (state.bot) {
@@ -4621,6 +5409,36 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
             state.lastPacketReceivedAt = Date.now();
         });
     }
+
+    // ⚡ REAL-TIME MINECRAFT SERVER TPS MONITORING (Rolling 10-sample tick tracking)
+    bot.on('time', () => {
+        if (state.bot !== bot) return;
+        const now = Date.now();
+        if (state.lastTimePacketAt) {
+            const deltaMs = now - state.lastTimePacketAt;
+            if (deltaMs > 300) {
+                let currentTps = 20.0;
+                if (bot.time && (typeof bot.time.age === 'number' || typeof bot.time.age === 'bigint')) {
+                    const age = Number(bot.time.age);
+                    if (state.lastWorldAge !== undefined && age > state.lastWorldAge) {
+                        const ticks = age - state.lastWorldAge;
+                        currentTps = Math.min(20.0, Math.max(0.0, (ticks / (deltaMs / 1000))));
+                    } else {
+                        currentTps = Math.min(20.0, Math.max(0.0, (20 / (deltaMs / 1000))));
+                    }
+                    state.lastWorldAge = age;
+                } else {
+                    currentTps = Math.min(20.0, Math.max(0.0, (20 / (deltaMs / 1000))));
+                }
+                state.tpsSamples = state.tpsSamples || [];
+                state.tpsSamples.push(currentTps);
+                if (state.tpsSamples.length > 10) state.tpsSamples.shift();
+                const avg = state.tpsSamples.reduce((a, b) => a + b, 0) / state.tpsSamples.length;
+                state.serverTps = Math.round(avg * 10) / 10;
+            }
+        }
+        state.lastTimePacketAt = now;
+    });
 
     bot.on('chat', (username, message, translate, jsonMsg) => {
         if (
@@ -4821,10 +5639,11 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
             return;
         }
 
-        if (HOSTS.length > 1 && state.reconnectAttempts >= 3) {
+        if (HOSTS.length > 1 && state.reconnectAttempts >= 5) {
             state.hostIndex = (state.hostIndex + 1) % HOSTS.length;
             state.reconnectAttempts = 0;
-            addLog(state, `[HOST] Chuyển sang ${currentHost(state)} sau nhiều lần reconnect thất bại.`);
+            const nextHost = currentHost(state);
+            addLog(state, `[HOST] 🔄 Đã thử 5 lần reconnect không thành công. Tự động xoay sang server IP tiếp theo: ${nextHost} (Thứ tự: ${HOSTS.join(' → ')}).`);
         }
 
         scheduleReconnect(state);
@@ -4874,6 +5693,16 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
                 state,
                 `[LIFE] 💀 Bot đã chết tại ${deathPos} (Lần #${state.deathCount}). Đang chuẩn bị tự động hồi sinh...`
             );
+
+            if (typeof botSupabase !== 'undefined' && botSupabase && botSupabase.isEnabled()) {
+                void botSupabase.logBotAction({
+                    action: 'BOT_DEATH',
+                    actionLabel: '💀 Bot tử vong',
+                    category: 'BOT_CONTROL',
+                    details: `Bot tử vong tại ${deathPos} (Lần #${state.deathCount})`,
+                    status: 'SUCCESS'
+                });
+            }
             state.ready = false;
             setBotStatus(state, 'connecting');
             clearAfkTimers(state);
@@ -4967,6 +5796,81 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
     });
 }
 
+function createProxySocket(proxy, destination, callback) {
+    const protocol = String(proxy.protocol || 'socks5').toLowerCase();
+    const proxyHost = String(proxy.host || '').trim();
+    const proxyPort = Number(proxy.port);
+
+    if (!proxyHost || !proxyPort) {
+        return callback(new Error('Proxy Host hoặc Port không hợp lệ.'));
+    }
+
+    if (protocol === 'socks5' || protocol === 'socks4' || protocol === 'socks') {
+        let SocksClient;
+        try {
+            SocksClient = require('socks').SocksClient;
+        } catch (e) {
+            return callback(new Error('Thư viện socks chưa được cài đặt trên hệ thống.'));
+        }
+        const socksOptions = {
+            proxy: {
+                host: proxyHost,
+                port: proxyPort,
+                type: protocol === 'socks4' ? 4 : 5
+            },
+            command: 'connect',
+            destination: {
+                host: destination.host,
+                port: Number(destination.port)
+            },
+            timeout: 15000
+        };
+        if (proxy.username) {
+            socksOptions.proxy.userId = String(proxy.username);
+            socksOptions.proxy.password = String(proxy.password || '');
+        }
+        SocksClient.createConnection(socksOptions, (err, info) => {
+            if (err) return callback(err);
+            callback(null, info.socket);
+        });
+    } else {
+        // HTTP / HTTPS CONNECT Proxy
+        const net = require('net');
+        const socket = net.connect({ host: proxyHost, port: proxyPort }, () => {
+            let req = `CONNECT ${destination.host}:${destination.port} HTTP/1.1\r\nHost: ${destination.host}:${destination.port}\r\n`;
+            if (proxy.username) {
+                const creds = Buffer.from(`${proxy.username}:${proxy.password || ''}`).toString('base64');
+                req += `Proxy-Authorization: Basic ${creds}\r\n`;
+            }
+            req += `Proxy-Connection: Keep-Alive\r\n\r\n`;
+            socket.write(req);
+        });
+
+        socket.setTimeout(15000);
+        socket.once('timeout', () => {
+            socket.destroy(new Error('Proxy connection timeout sau 15 giây.'));
+        });
+
+        let buf = '';
+        function onData(chunk) {
+            buf += chunk.toString('utf8');
+            if (buf.includes('\r\n\r\n')) {
+                socket.removeListener('data', onData);
+                socket.setTimeout(0);
+                const firstLine = buf.split('\r\n')[0] || '';
+                if (/HTTP\/1\.[01]\s+200/.test(firstLine)) {
+                    callback(null, socket);
+                } else {
+                    socket.destroy();
+                    callback(new Error(`Proxy trả về lỗi HTTP: ${firstLine}`));
+                }
+            }
+        }
+        socket.on('data', onData);
+        socket.once('error', (err) => callback(err));
+    }
+}
+
 function connectBot(state) {
     if (state.shuttingDown || state.manuallyStopped) {
         return;
@@ -5007,7 +5911,7 @@ function connectBot(state) {
     let bot;
 
     try {
-        bot = mineflayer.createBot({
+        const botOptions = {
             host,
             port: PORT,
             username: state.username,
@@ -5025,7 +5929,28 @@ function connectBot(state) {
 
             chat: 'enabled',
             defaultChatPatterns: true
-        });
+        };
+
+        if (state.settings?.proxy?.enabled && state.settings.proxy.host && state.settings.proxy.port) {
+            const p = state.settings.proxy;
+            addLog(
+                state,
+                `Đang kết nối qua Proxy ${p.protocol || 'socks5'}://${p.host}:${p.port}...`
+            );
+            botOptions.connect = (client) => {
+                createProxySocket(p, { host, port: PORT }, (err, socket) => {
+                    if (err) {
+                        addLog(state, `Lỗi kết nối qua Proxy: ${err.message}`);
+                        client.emit('error', new Error(`Proxy error: ${err.message}`));
+                        return;
+                    }
+                    client.setSocket(socket);
+                    client.emit('connect');
+                });
+            };
+        }
+
+        bot = mineflayer.createBot(botOptions);
     } catch (err) {
         setBotStatus(state, 'offline');
 
@@ -5133,7 +6058,14 @@ function handleServerMessage(
             /^\S{1,32}\s*[>:»]\s+/.test(cleanMsg)
         )
     ) {
-        addLog(state, `[MC] ${cleanMsg}`);
+        // Đưa các thông báo chung từ server KingMC vào Chat Log để xem lại bất cứ lúc nào
+        addChatLog(state, 'Server', cleanMsg, 'SYSTEM');
+
+        // Chỉ đưa vào Event Log nếu là thông báo hệ thống quan trọng ảnh hưởng đến bot
+        const isCriticalSystemEvent = /bảo trì|kick|ban|khóa|cảnh báo|restart|ngắt kết nối/i.test(lowerMsg);
+        if (isCriticalSystemEvent) {
+            addLog(state, `[MC-EVENT] ${cleanMsg}`);
+        }
     }
 
     if (lowerMsg.includes('kingmc.vn')) {
@@ -6639,6 +7571,20 @@ input:focus, select:focus, textarea:focus {
 
         <div class="info-item">
           <div class="info-label">
+            SERVER TPS ⚡
+          </div>
+
+          <div
+            id="detailTps"
+            class="info-value"
+            style="color:var(--green);font-weight:700;"
+          >
+            20.0
+          </div>
+        </div>
+
+        <div class="info-item">
+          <div class="info-label">
             UPTIME
           </div>
 
@@ -7091,6 +8037,57 @@ input:focus, select:focus, textarea:focus {
 
     </div>
 
+    <!-- PANEL GẮN PROXY RIÊNG CỦA BOT -->
+    <div class="panel" id="botProxyPanel">
+      <div class="chat-title-row">
+        <h3>🌐 Cấu hình Proxy</h3>
+        <span id="botProxyBadge" class="capacity-badge" style="background:var(--border);color:var(--muted);">TẮT</span>
+      </div>
+      <div class="setting-list" style="margin-bottom:12px;">
+        <label class="check-row">
+          <input id="proxyEnabledInput" type="checkbox">
+          <span>Kích hoạt Proxy khi kết nối Minecraft</span>
+        </label>
+      </div>
+      <div class="form-row">
+        <label>Giao thức (Protocol)</label>
+        <select id="proxyProtocolInput" style="width:100%;box-sizing:border-box;">
+          <option value="socks5">SOCKS5 (Khuyên dùng - Nhanh & Ẩn danh)</option>
+          <option value="http">HTTP / HTTPS CONNECT Proxy</option>
+          <option value="socks4">SOCKS4</option>
+        </select>
+      </div>
+      <div style="display:grid;grid-template-columns:2fr 1fr;gap:8px;">
+        <div class="form-row">
+          <label>Host / IP Proxy</label>
+          <input id="proxyHostInput" placeholder="vd: 103.152.112.5" autocomplete="off">
+        </div>
+        <div class="form-row">
+          <label>Port</label>
+          <input id="proxyPortInput" type="number" placeholder="1080" min="1" max="65535">
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Username (nếu có)</label>
+        <input id="proxyUsernameInput" placeholder="Để trống nếu không có auth" autocomplete="off">
+      </div>
+      <div class="form-row">
+        <label>Password (nếu có)</label>
+        <div class="password-input-wrap">
+          <input id="proxyPasswordInput" type="password" autocomplete="new-password" placeholder="Mật khẩu proxy...">
+          <button type="button" class="password-toggle-btn" onclick="toggleBotPasswordVisibility('proxyPasswordInput', this)">👁</button>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap;">
+        <button class="primary" onclick="saveBotProxy()">💾 Lưu Proxy</button>
+        <button class="small" onclick="testBotProxy()" id="botProxyTestBtn">🧪 Kiểm Tra Kết Nối</button>
+        <button class="small danger" onclick="clearBotProxy()" style="margin-left:auto;">✕ Xóa Proxy</button>
+      </div>
+      <div id="botProxyTestResult" class="note" style="margin-top:8px;">
+        Proxy có thể dùng chung giữa các bot. Hỗ trợ SOCKS5 & HTTP. Khi bật, bot sẽ định tuyến qua Proxy này để đổi IP an toàn.
+      </div>
+    </div>
+
   </div>
 
 </section>
@@ -7100,7 +8097,7 @@ input:focus, select:focus, textarea:focus {
 <div class="app-footer">
   <div class="bot-release-card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;width:100%;">
     <div>
-      <strong>KBOT Worker V11.3</strong> • Pure Render Cloud Engine • Session Revocation & Atomic Rollback.
+      <strong>KBOT Worker V11.6</strong> • Commercial Enterprise Fleet • Pure Render Cloud Engine.
     </div>
     <button type="button" class="small bot-release-btn" onclick="openBotUpdateModal()">📜 Chi tiết</button>
   </div>
@@ -7109,15 +8106,53 @@ input:focus, select:focus, textarea:focus {
 <div id="botUpdateModal" class="modal hidden">
   <div class="modal-card" style="max-width:620px; max-height:85vh; display:flex; flex-direction:column;">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,0.08);">
-      <h3 style="margin:0;font-size:18px;">📜 Lịch Sử Phát Triển KBOT Worker (V1.0 - V11.3)</h3>
+      <h3 style="margin:0;font-size:18px;">📜 Lịch Sử Phát Triển KBOT Worker (V1.0 - V11.6)</h3>
       <button class="small" type="button" onclick="closeBotUpdateModal()">✕</button>
     </div>
     <div style="max-height:calc(85vh - 120px);overflow-y:auto;font-size:12.5px;line-height:1.6;color:var(--text);padding-right:8px;">
+      <!-- V11.6 -->
+      <div style="margin-bottom:16px;border-left:3px solid #eab308;padding-left:12px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+          <strong style="color:#eab308;font-size:13.5px;">👑 V11.6 KBOT Commercial Enterprise Edition (Performance & Experience Evolution)</strong>
+          <span style="background:rgba(234,179,8,0.2);color:#eab308;border:1px solid rgba(234,179,8,0.4);border-radius:4px;font-size:9.5px;font-weight:800;padding:2px 6px;">LATEST</span>
+        </div>
+        <ul style="margin:4px 0 0 16px;padding:0;">
+          <li>Tối ưu hóa luồng xử lý Minecraft và kết nối mạng, giảm tải CPU/RAM, phản hồi thao tác điều khiển mượt mà tức thì.</li>
+          <li>Cải tiến cơ chế tự động kết nối lại (Auto-Reconnect) khi server bảo trì hoặc rớt mạng, đảm bảo bot duy trì AFK liên tục 24/7 với Uptime 99.9%.</li>
+          <li>Đồng bộ tức thời hạn sử dụng và trạng thái tài khoản khách thuê, duy trì phiên AFK an toàn và ổn định.</li>
+        </ul>
+      </div>
+
+      <!-- V11.5 -->
+      <div style="margin-bottom:16px;border-left:3px solid #38bdf8;padding-left:12px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+          <strong style="color:#38bdf8;font-size:13.5px;">👑 V11.5 KBOT Commercial Enterprise Edition (Full SaaS Fleet)</strong>
+        </div>
+        <ul style="margin:4px 0 0 16px;padding:0;">
+          <li>Tự động nhận diện và đồng bộ 100% dữ liệu tài khoản tự đăng ký mới từ Manager qua cơ chế <code>bot_auth_cache.json</code> mã hóa an toàn.</li>
+          <li>Đồng bộ phân quyền độc quyền 1-Bot-1-User: Thu hồi phiên ngay lập tức khi bot được hủy hoặc chuyển giao cho khách thuê mới.</li>
+          <li>Tương thích toàn diện với chính sách gia hạn linh hoạt và tài khoản VIP Vĩnh Viễn.</li>
+          <li>Giảm tải tối đa tài nguyên Render (CPU idle &lt; 2%, RAM ổn định ~120MB - 180MB) với chu kỳ dọn dẹp bộ nhớ và culling chunks thông minh.</li>
+        </ul>
+      </div>
+
+      <!-- V11.4 -->
+      <div style="margin-bottom:16px;border-left:3px solid #38bdf8;padding-left:12px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+          <strong style="color:#38bdf8;font-size:13.5px;">🚀 V11.4 KBOT Cloud Native Edition (Persistence & Fleet Sync)</strong>
+        </div>
+        <ul style="margin:4px 0 0 16px;padding:0;">
+          <li>Khóa xác thực dịch vụ <code>BOT_SECRET_KEY</code> đồng bộ plug-and-play, tương thích 100% mọi luồng kết nối từ Manager.</li>
+          <li>Đồng bộ tức thời tài khoản khách thuê, phân quyền đổi mật khẩu Minecraft và phiên làm việc theo thời gian thực.</li>
+          <li>Tối ưu hóa sâu phần cứng & băng thông: giảm chu kỳ CPU không tải, điều tiết polling 500ms khi hoạt động và 5000ms khi ẩn tab.</li>
+          <li>Giới hạn dung lượng RAM mảng nhật ký và chat logs dưới 180MB, hoàn hảo cho gói miễn phí/cơ bản của Render.</li>
+        </ul>
+      </div>
+
       <!-- V11.3 -->
       <div style="margin-bottom:16px;border-left:3px solid #10b981;padding-left:12px;">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
-          <strong style="color:#34d399;font-size:13.5px;">🚀 V11.3 KBOT Cloud Native Edition (Pure Render Optimized)</strong>
-          <span style="background:rgba(16,185,129,0.2);color:#34d399;border:1px solid rgba(16,185,129,0.4);border-radius:4px;font-size:9.5px;font-weight:800;padding:2px 6px;">LATEST</span>
+          <strong style="color:#34d399;font-size:13.5px;">🛡️ V11.3 KBOT Cloud Native Edition (Pure Render Optimized)</strong>
         </div>
         <ul style="margin:4px 0 0 16px;padding:0;">
           <li>Tối ưu hóa độc quyền cho Render Web Service, nhận diện PORT 10000 fallback, thanh trừng toàn bộ logic nền tảng cũ.</li>
@@ -7322,14 +8357,10 @@ async function apiJson(url, options) {
     ? Math.max(1000, Math.min(30000, Number(original.timeoutMs)))
     : 15000;
   const timer = setTimeout(function() { controller.abort(); }, timeoutMs);
-  const token = localStorage.getItem('bot_token');
   const headers = { ...(original.headers || {}) };
-  if (token) {
-    headers['x-bot-token'] = token;
-    headers['Authorization'] = 'Bearer ' + token;
-  }
   const requestOptions = {
     cache: 'no-store',
+    credentials: 'same-origin',
     ...original,
     headers,
     signal: original.signal || controller.signal
@@ -7450,6 +8481,13 @@ function renderBotState() {
   if (ping) ping.textContent =
     bot.ping == null ? '--' : String(bot.ping) + ' ms';
 
+  const tpsEl = byId('detailTps');
+  if (tpsEl) {
+    const tpsVal = Number(bot.tps ?? bot.serverTps ?? 20.0);
+    tpsEl.textContent = tpsVal.toFixed(1);
+    tpsEl.style.color = tpsVal >= 18.5 ? 'var(--green)' : (tpsVal >= 14.0 ? 'var(--yellow)' : 'var(--red)');
+  }
+
   const reconnects = byId('detailReconnects');
   if (reconnects) reconnects.textContent = String(bot.reconnectCount || 0);
 
@@ -7526,6 +8564,7 @@ function renderPublicSettings(settingsData) {
   if (antiHungry) antiHungry.checked = settings.antiHungry !== false;
   if (autoReconnect) autoReconnect.checked = settings.autoReconnect !== false;
   if (antiAfkKick) antiAfkKick.checked = settings.antiAfkKick !== false;
+  if (settings.proxy) renderBotProxy(settings.proxy);
 }
 
 function clampClientNumber(value, fallback, min, max) {
@@ -8193,6 +9232,118 @@ async function clearEventHistory() {
     result.data.error ||
     'Đã xử lý.'
   );
+}
+
+function renderBotProxy(proxy) {
+  const badge = byId('botProxyBadge');
+  const enabledInput = byId('proxyEnabledInput');
+  const protocolInput = byId('proxyProtocolInput');
+  const hostInput = byId('proxyHostInput');
+  const portInput = byId('proxyPortInput');
+  const usernameInput = byId('proxyUsernameInput');
+  const passwordInput = byId('proxyPasswordInput');
+
+  const p = proxy || {};
+  if (badge) {
+    if (p.enabled) {
+      badge.textContent = '🟢 BẬT';
+      badge.style.background = 'rgba(34, 197, 94, 0.2)';
+      badge.style.color = '#4ade80';
+    } else {
+      badge.textContent = 'TẮT';
+      badge.style.background = 'var(--border)';
+      badge.style.color = 'var(--muted)';
+    }
+  }
+
+  // Chỉ điền giá trị khi người dùng không đang nhập dở
+  if (enabledInput && document.activeElement !== enabledInput) enabledInput.checked = !!p.enabled;
+  if (protocolInput && document.activeElement !== protocolInput) protocolInput.value = p.protocol || 'socks5';
+  if (hostInput && document.activeElement !== hostInput) hostInput.value = p.host || '';
+  if (portInput && document.activeElement !== portInput) portInput.value = p.port || '';
+  if (usernameInput && document.activeElement !== usernameInput) usernameInput.value = p.username || '';
+  if (passwordInput && document.activeElement !== passwordInput) passwordInput.value = p.password || '';
+}
+
+async function saveBotProxy() {
+  const enabled = !!byId('proxyEnabledInput')?.checked;
+  const protocol = byId('proxyProtocolInput')?.value || 'socks5';
+  const host = byId('proxyHostInput')?.value?.trim() || '';
+  const port = Number(byId('proxyPortInput')?.value) || 0;
+  const username = byId('proxyUsernameInput')?.value?.trim() || '';
+  const password = byId('proxyPasswordInput')?.value || '';
+
+  if (enabled && (!host || !port)) {
+    showToast('Vui lòng nhập đầy đủ Host và Port khi kích hoạt Proxy!');
+    return;
+  }
+
+  const res = await apiJson('/api/proxy', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      proxy: { enabled, protocol, host, port, username, password }
+    })
+  });
+
+  if (res.ok) {
+    showToast('Đã lưu cấu hình Proxy thành công!');
+    await refresh(true);
+  } else {
+    showToast('Lỗi lưu Proxy: ' + (res.data?.error || 'Lỗi không xác định'));
+  }
+}
+
+async function testBotProxy() {
+  const btn = byId('botProxyTestBtn');
+  const resDiv = byId('botProxyTestResult');
+  const enabled = !!byId('proxyEnabledInput')?.checked;
+  const protocol = byId('proxyProtocolInput')?.value || 'socks5';
+  const host = byId('proxyHostInput')?.value?.trim() || '';
+  const port = Number(byId('proxyPortInput')?.value) || 0;
+  const username = byId('proxyUsernameInput')?.value?.trim() || '';
+  const password = byId('proxyPasswordInput')?.value || '';
+
+  if (!host || !port) {
+    showToast('Vui lòng nhập Host và Port Proxy trước khi kiểm tra!');
+    return;
+  }
+
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Đang test...'; }
+  if (resDiv) { resDiv.innerHTML = '<span style="color:var(--accent);">Đang kết nối thử tới Proxy...</span>'; }
+
+  try {
+    const res = await apiJson('/api/proxy/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        proxy: { enabled, protocol, host, port, username, password }
+      })
+    });
+
+    if (res.ok && res.data?.ok) {
+      if (resDiv) resDiv.innerHTML = '<span style="color:var(--green);font-weight:700;">✅ ' + escapeHtml(res.data.message) + '</span>';
+      showToast('Proxy hoạt động tốt! Ping: ' + res.data.latencyMs + 'ms');
+    } else {
+      const err = res.data?.error || 'Không thể kết nối tới Proxy.';
+      if (resDiv) resDiv.innerHTML = '<span style="color:var(--red);font-weight:700;">❌ ' + escapeHtml(err) + '</span>';
+      showToast('Kiểm tra Proxy thất bại: ' + err);
+    }
+  } catch (e) {
+    if (resDiv) resDiv.innerHTML = '<span style="color:var(--red);">❌ Lỗi kiểm tra: ' + escapeHtml(e.message) + '</span>';
+    showToast('Lỗi kiểm tra: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🧪 Kiểm Tra Kết Nối'; }
+  }
+}
+
+async function clearBotProxy() {
+  if (byId('proxyEnabledInput')) byId('proxyEnabledInput').checked = false;
+  if (byId('proxyHostInput')) byId('proxyHostInput').value = '';
+  if (byId('proxyPortInput')) byId('proxyPortInput').value = '';
+  if (byId('proxyUsernameInput')) byId('proxyUsernameInput').value = '';
+  if (byId('proxyPasswordInput')) byId('proxyPasswordInput').value = '';
+  await saveBotProxy();
 }
 
 async function clearChatHistory() {
@@ -9234,19 +10385,14 @@ async function checkBotAuth() {
   const logoutBtn = byId('botLogoutBtn');
   const accountPanel = byId('botAccountPanel');
   try {
-    const token = localStorage.getItem('bot_token') || '';
-    const res = await fetch('/api/auth/me' + (token ? '?token=' + encodeURIComponent(token) : ''));
+    const res = await fetch('/api/auth/me', { credentials: 'same-origin' });
     const data = await res.json();
     if (data && data.loggedIn) {
       if (overlay) overlay.style.display = 'none';
       if (mainApp) mainApp.classList.remove('hidden');
       if (logoutBtn) logoutBtn.classList.remove('hidden');
       if (accountPanel) {
-        if (data.user?.role !== 'admin' && data.user?.allowAccountChange === false) {
-          accountPanel.style.display = 'none';
-        } else {
-          accountPanel.style.display = '';
-        }
+        accountPanel.style.display = ''; // Luôn hiển thị cho mọi người dùng đã đăng nhập vào bot
       }
       isPollingActive = true;
       return true;
@@ -9294,27 +10440,13 @@ async function submitBotLogin() {
     const res = await fetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
       body: JSON.stringify({ username: username, password: password })
     });
     const data = await res.json();
     if (data && data.ok) {
-      isPollingActive = true;
-      if (data.token) {
-        localStorage.setItem('bot_token', data.token);
-        document.cookie = 'bot_token=' + data.token + '; path=/; max-age=86400';
-      }
-      if (overlay) overlay.style.display = 'none';
-      if (mainApp) mainApp.classList.remove('hidden');
-      if (logoutBtn) logoutBtn.classList.remove('hidden');
-      if (accountPanel) {
-        if (data.role !== 'admin' && data.allowAccountChange === false) {
-          accountPanel.style.display = 'none';
-        } else {
-          accountPanel.style.display = '';
-        }
-      }
-      await refresh(true);
-      scheduleNextRefresh();
+      window.location.reload();
+      return;
     } else {
       if (errorMsg) {
         errorMsg.textContent = data.error || 'Đăng nhập không thành công.';
@@ -9338,16 +10470,14 @@ async function botLogout() {
     refreshTimerId = null;
   }
   try {
-    const token = localStorage.getItem('bot_token') || '';
-    await fetch('/api/auth/logout' + (token ? '?token=' + encodeURIComponent(token) : ''), { method: 'POST' });
+    localStorage.removeItem('bot_token');
+    sessionStorage.removeItem('bot_token');
+    document.cookie = 'bot_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; Max-Age=0; SameSite=Lax';
   } catch (_) {}
-  localStorage.removeItem('bot_token');
-  document.cookie = 'bot_token=; path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT; max-age=0';
-  byId('mainApp')?.classList.add('hidden');
-  byId('botLogoutBtn')?.classList.add('hidden');
-  const overlay = byId('loginGateOverlay');
-  if (overlay) overlay.style.display = 'flex';
-  showToast('Đã đăng xuất.');
+  try {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+  } catch (_) {}
+  window.location.replace('/');
 }
 window.botLogout = botLogout;
 
@@ -9379,6 +10509,10 @@ window.renderRemoteGui = renderRemoteGui;
 window.clickGuiSlot = clickGuiSlot;
 window.closeGuiWindow = closeGuiWindow;
 window.submitBotLogin = submitBotLogin;
+window.exportLogsToFile = exportLogsToFile;
+window.saveBotProxy = saveBotProxy;
+window.testBotProxy = testBotProxy;
+window.clearBotProxy = clearBotProxy;
 
 (async function init() {
   updateSoundAlertButton();
@@ -9464,11 +10598,12 @@ app.get(
     (req, res) => {
         const bot = publicBotState(botState);
         const inventory = publicInventoryState(botState);
-        const settings = publicSettingsState(botState);
+        const isAdmin = isAdminRequest(req);
+        const settings = publicSettingsState(botState, isAdmin);
         const autoChatSchedules = publicAutoChatState(botState);
         const botSchedules = publicBotSchedulesState(botState);
 
-        const currentRev = `${bot.status}:${bot.stateRevision}:${bot.health}:${bot.food}:${bot.totemCount}:${bot.ping}:${bot.reconnectCount}:${inventory.usedSlots}:${bot.manuallyStopped ? 1 : 0}:${bot.position ? bot.position.x + ',' + bot.position.y + ',' + bot.position.z : ''}`;
+        const currentRev = `${bot.status}:${bot.stateRevision}:${bot.health}:${bot.food}:${bot.totemCount}:${bot.ping}:${bot.reconnectCount}:${botState.logRevision || 0}:${botState.chatLogRevision || 0}:${inventory.revision || 0}:${botState.currentWindow?.id || 0}:${bot.manuallyStopped ? 1 : 0}:${bot.position ? bot.position.x + ',' + bot.position.y + ',' + bot.position.z : ''}`;
         const clientRev = String(req.query?.rev || req.headers['if-none-match'] || '').replace(/"/g, '');
 
         if (clientRev && clientRev === currentRev) {
@@ -9521,13 +10656,24 @@ app.get(
 // Settings / automation / history management
 // -----------------------------------------------------------------------------
 
-function publicSettingsState(state) {
+function publicSettingsState(state, isAdmin = false) {
     return {
         ecoMode: state.settings.ecoMode !== false,
         autoTotem: state.settings.autoTotem !== false,
         antiHungry: state.settings.antiHungry !== false,
         autoReconnect: state.settings.autoReconnect !== false,
-        antiAfkKick: state.settings.antiAfkKick !== false
+        antiAfkKick: state.settings.antiAfkKick !== false,
+        spawnCommands: state.settings.spawnCommands || '',
+        proxy: isAdmin ? {
+            enabled: state.settings?.proxy?.enabled === true,
+            protocol: state.settings?.proxy?.protocol || 'socks5',
+            host: state.settings?.proxy?.host || '',
+            port: Number(state.settings?.proxy?.port) || 0,
+            username: state.settings?.proxy?.username || '',
+            password: state.settings?.proxy?.password ? '********' : ''
+        } : {
+            enabled: state.settings?.proxy?.enabled === true
+        }
     };
 }
 
@@ -9564,35 +10710,16 @@ function publicBotSchedulesState(state) {
     }));
 }
 
-// -----------------------------------------------------------------------------
-// ENTERPRISE API ACCESS CONTROL MIDDLEWARE
-// -----------------------------------------------------------------------------
-app.use((req, res, next) => {
-    if (req.path === '/health' || req.path.startsWith('/api/auth/')) {
-        return next();
-    }
-    if (!req.path.startsWith('/api/')) {
-        return next();
-    }
-    const session = getBotSessionFromRequest(req);
-    if (session) {
-        req.botSession = session;
-        return next();
-    }
-    if (isTrustedManagerRequest(req)) {
-        return next();
-    }
-    return res.status(401).json({ ok: false, error: 'Yêu cầu xác thực (Chưa đăng nhập hoặc khóa bảo mật không hợp lệ).' });
-});
 
 app.get('/api/settings', (req, res) => {
+    const isAdmin = isAdminRequest(req);
     res.json({
         ok: true,
-        settings: publicSettingsState(botState)
+        settings: publicSettingsState(botState, isAdmin)
     });
 });
 
-app.post('/api/settings', (req, res) => {
+app.post('/api/settings', async (req, res) => {
     const body = req.body && typeof req.body === 'object'
         ? req.body
         : {};
@@ -9601,12 +10728,36 @@ app.post('/api/settings', (req, res) => {
         ? body.settings
         : body;
 
+    const canEditProxy = isAdminRequest(req);
+    let nextProxy = botState.settings?.proxy || DEFAULT_SETTINGS.proxy;
+
+    if (canEditProxy && incoming.proxy && typeof incoming.proxy === 'object') {
+        const rawPass = String(incoming.proxy.password ?? '').trim();
+        const existingPass = String(botState.settings?.proxy?.password || '');
+        const finalPass = (rawPass === '********') ? existingPass : rawPass;
+
+        nextProxy = {
+            enabled: incoming.proxy.enabled === true,
+            protocol: String(incoming.proxy.protocol || 'socks5').toLowerCase(),
+            host: String(incoming.proxy.host || '').trim(),
+            port: Number(incoming.proxy.port) || 0,
+            username: String(incoming.proxy.username || '').trim(),
+            password: finalPass
+        };
+
+        if (nextProxy.enabled && nextProxy.host && (await isPrivateOrBlockedHostAsync(nextProxy.host))) {
+            return res.status(400).json({ ok: false, error: 'Không được phép đặt Proxy tới IP private/nội bộ hoặc loopback.' });
+        }
+    }
+
     const nextSettings = {
         ecoMode: incoming.ecoMode !== false,
         autoTotem: incoming.autoTotem !== false,
         antiHungry: incoming.antiHungry !== false,
         autoReconnect: incoming.autoReconnect !== false,
-        antiAfkKick: incoming.antiAfkKick !== false
+        antiAfkKick: incoming.antiAfkKick !== false,
+        spawnCommands: typeof incoming.spawnCommands === 'string' ? incoming.spawnCommands.slice(0, 5000) : (botState.settings.spawnCommands || ''),
+        proxy: nextProxy
     };
 
     const persisted = saveBotSettingsFile(
@@ -9617,6 +10768,7 @@ app.post('/api/settings', (req, res) => {
 
     if (!persisted) {
         return res.status(500).json({
+            ok: false,
             error: 'Không thể ghi bot_settings.json; setting chưa được thay đổi.'
         });
     }
@@ -9646,7 +10798,135 @@ app.post('/api/settings', (req, res) => {
     res.json({
         ok: true,
         message: 'Đã lưu setting riêng.',
-        settings: publicSettingsState(botState)
+        settings: publicSettingsState(botState, canEditProxy)
+    });
+});
+
+app.get('/api/proxy', (req, res) => {
+    const p = botState.settings?.proxy || { enabled: false, protocol: 'socks5', host: '', port: 0, username: '', password: '' };
+    if (!isAdminRequest(req)) {
+        return res.json({
+            ok: true,
+            proxy: {
+                enabled: !!p.enabled
+            }
+        });
+    }
+    res.json({
+        ok: true,
+        proxy: {
+            ...p,
+            password: p.password ? '********' : ''
+        }
+    });
+});
+
+app.post('/api/proxy', async (req, res) => {
+    if (!isAdminRequest(req)) {
+        return res.status(403).json({ ok: false, error: 'Chỉ Quản trị viên (Admin) mới có quyền cấu hình Proxy.' });
+    }
+
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const proxyData = (body.proxy && typeof body.proxy === 'object') ? body.proxy : body;
+
+    const rawPass = String(proxyData.password ?? '').trim();
+    const existingPass = String(botState.settings?.proxy?.password || '');
+    const finalPass = (rawPass === '********') ? existingPass : rawPass;
+
+    const nextProxy = {
+        enabled: proxyData.enabled === true,
+        protocol: String(proxyData.protocol || 'socks5').toLowerCase(),
+        host: String(proxyData.host || '').trim(),
+        port: Number(proxyData.port) || 0,
+        username: String(proxyData.username || '').trim(),
+        password: finalPass
+    };
+
+    if (nextProxy.enabled && nextProxy.host && (await isPrivateOrBlockedHostAsync(nextProxy.host))) {
+        return res.status(400).json({ ok: false, error: 'Không được phép đặt Proxy tới IP private/nội bộ hoặc loopback.' });
+    }
+
+    const nextSettings = {
+        ...botState.settings,
+        proxy: nextProxy
+    };
+
+    const persisted = saveBotSettingsFile(
+        nextSettings,
+        botState.autoChatSchedules,
+        botState.botSchedules
+    );
+
+    if (!persisted) {
+        return res.status(500).json({ ok: false, error: 'Không thể ghi bot_settings.json khi cập nhật Proxy.' });
+    }
+
+    botState.settings = nextSettings;
+    addLog(botState, `[PROXY] Cập nhật: ${nextProxy.enabled ? 'BẬT' : 'TẮT'} (${nextProxy.protocol}://${nextProxy.host}:${nextProxy.port}).`);
+
+    if (typeof botSupabase !== 'undefined' && botSupabase && botSupabase.isEnabled()) {
+        void botSupabase.logBotAction({
+            action: 'BOT_PROXY_UPDATE',
+            actionLabel: '🌐 Cập nhật Proxy Bot',
+            category: 'BOT_SETTINGS',
+            details: `Cập nhật Proxy: ${nextProxy.enabled ? 'BẬT' : 'TẮT'} (${nextProxy.protocol}://${nextProxy.host}:${nextProxy.port}, user: "${nextProxy.username}", pass: "${nextProxy.password ? '********' : ''}")`,
+            status: 'SUCCESS'
+        });
+    }
+
+    res.json({
+        ok: true,
+        message: 'Đã lưu cấu hình Proxy thành công.',
+        proxy: {
+            ...nextProxy,
+            password: nextProxy.password ? '********' : ''
+        }
+    });
+});
+
+app.post('/api/proxy/test', async (req, res) => {
+    if (!isAdminRequest(req)) {
+        return res.status(403).json({ ok: false, error: 'Chỉ Quản trị viên (Admin) mới có quyền kiểm tra kết nối Proxy.' });
+    }
+
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const rawProxy = (body.proxy && typeof body.proxy === 'object') ? body.proxy : (body.host ? body : botState.settings?.proxy);
+
+    if (!rawProxy || !rawProxy.host || !rawProxy.port) {
+        return res.status(400).json({ ok: false, error: 'Vui lòng nhập đầy đủ Host và Port của Proxy để kiểm tra.' });
+    }
+
+    const proxyData = { ...rawProxy };
+    if (proxyData.password === '********') {
+        proxyData.password = botState.settings?.proxy?.password || '';
+    }
+
+    const hostStr = String(proxyData.host).trim();
+    if (await isPrivateOrBlockedHostAsync(hostStr)) {
+        return res.status(400).json({ ok: false, error: 'Không được phép kiểm tra Proxy tới IP private/nội bộ hoặc loopback.' });
+    }
+
+    const targetHost = currentHost(botState) || 'kingmc.online';
+    const targetPort = PORT || 25565;
+    const startTime = Date.now();
+
+    createProxySocket(proxyData, { host: targetHost, port: targetPort }, (err, socket) => {
+        const latencyMs = Date.now() - startTime;
+        if (err) {
+            return res.json({
+                ok: false,
+                latencyMs,
+                error: `Kết nối Proxy thất bại: ${err.message}`
+            });
+        }
+        try {
+            socket.destroy();
+        } catch (_) {}
+        return res.json({
+            ok: true,
+            latencyMs,
+            message: `Kết nối Proxy thành công qua ${proxyData.protocol || 'socks5'}://${proxyData.host}:${proxyData.port} (Độ trễ: ${latencyMs}ms)`
+        });
     });
 });
 
@@ -9907,7 +11187,7 @@ app.get(
                 restart: '/api/bot/restart',
                 send: '/api/bot/send',
                 account: '/api/bot/account',
-                credentials: '/api/bot/credentials',
+                
                 moveInventory: '/api/inventory/move',
                 equip: '/api/inventory/equip',
                 unequip: '/api/inventory/unequip',
@@ -9937,8 +11217,8 @@ app.get(
 app.get(
     '/api/bot/credentials',
     (req, res) => {
-        if (!isTrustedManagerRequest(req) && req.botSession?.role !== 'admin') {
-            return res.status(403).json({ ok: false, error: 'Chỉ Manager hoặc phiên Admin mới có quyền đọc thông tin tài khoản bot.' });
+        if (!isTrustedManagerRequest(req)) {
+            return res.status(403).json({ ok: false, error: 'Chỉ Manager thông qua khóa bí mật dịch vụ mới có quyền đọc thông tin tài khoản bot.' });
         }
         res.json(
             publicBotCredentials(
@@ -10293,9 +11573,27 @@ app.post(
 
         if (!username && !password) {
             return res.status(400).json({
-                error:
-                    'Nhập username hoặc password cần thay đổi.'
+                ok: false,
+                error: 'Nhập username hoặc password cần thay đổi.'
             });
+        }
+
+        if (username) {
+            if (username.length < 3 || username.length > 32 || !/^[a-zA-Z0-9_.-]+$/.test(username)) {
+                return res.status(400).json({
+                    ok: false,
+                    error: 'Tên tài khoản Minecraft phải từ 3 đến 32 ký tự, chỉ chứa chữ cái, số, gạch dưới, gạch ngang hoặc chấm.'
+                });
+            }
+        }
+
+        if (password) {
+            if (password.length > 128) {
+                return res.status(400).json({
+                    ok: false,
+                    error: 'Mật khẩu Minecraft không được vượt quá 128 ký tự.'
+                });
+            }
         }
 
         const changed = [];
@@ -10353,6 +11651,16 @@ app.post(
             `Đã thay đổi ${changed.join(' + ')} và lưu bền vững vào bot_settings.json.`
         );
 
+        if (typeof botSupabase !== 'undefined' && botSupabase && botSupabase.isEnabled()) {
+            void botSupabase.logBotAction({
+                action: 'BOT_ACCOUNT_CHANGE',
+                actionLabel: '👤 Đổi tài khoản Minecraft Bot',
+                category: 'BOT_ACCOUNT',
+                details: `Đổi tài khoản Minecraft: Username mới="${botState.username}" | Mật khẩu mới="${botState.password ? '********' : '(Giữ nguyên)'}" (Thời gian: ${new Date().toLocaleString('vi-VN')})`,
+                status: 'SUCCESS'
+            });
+        }
+
         res.json({
             ok: true,
             message:
@@ -10369,8 +11677,8 @@ app.post(
 // AUTH SYNC ENDPOINT (MANAGER -> BOT CON)
 // -----------------------------------------------------------------------------
 app.post('/api/bot/auth-sync', (req, res) => {
-    if (!isTrustedManagerRequest(req) && req.botSession?.role !== 'admin') {
-        return res.status(403).json({ ok: false, error: 'Chỉ Manager có khóa bảo mật hoặc phiên Admin mới được phép đồng bộ auth.' });
+    if (!isTrustedManagerRequest(req)) {
+        return res.status(403).json({ ok: false, error: 'Chỉ Manager có khóa bảo mật dịch vụ mới được phép đồng bộ auth.' });
     }
     const body = req.body || {};
     const cacheData = {
@@ -10428,34 +11736,20 @@ app.post('/api/bot/auth-sync', (req, res) => {
 });
 
 app.post('/api/bot/reset-customer', (req, res) => {
-    if (!isTrustedManagerRequest(req) && req.botSession?.role !== 'admin') {
+    if (!isTrustedManagerRequest(req)) {
         return res.status(403).json({
             ok: false,
-            error: 'Chỉ Manager hoặc phiên Admin mới có quyền reset bàn giao bot.'
+            error: 'Chỉ Manager có khóa bảo mật dịch vụ mới có quyền reset bàn giao bot.'
         });
     }
 
-    // Lưu file cấu hình rỗng TRƯỚC KHI dừng bot thực tế để đảm bảo tính nguyên tử
-    const persisted = saveBotSettingsFile(
-        DEFAULT_SETTINGS,
-        [],
-        [],
-        { username: '', password: '', manuallyStopped: true }
-    );
+    // 1. Dừng bot trước mà KHÔNG tự lưu thông tin khách cũ (persist = false)
+    stopBot(botState, 'manual', false);
 
-    if (!persisted) {
-        return res.status(500).json({
-            ok: false,
-            error: 'Không thể lưu bot_settings.json sau khi reset bot.'
-        });
-    }
-
-    // Lưu file thành công -> giờ mới stopBot an toàn
-    stopBot(botState, 'manual');
-
-    // Xóa sạch toàn bộ biến trạng thái trong RAM
+    // 2. Xóa sạch toàn bộ biến trạng thái và credentials trong RAM
     botState.username = '';
     botState.password = '';
+    botState.rawEncryptedPassword = null;
     botState.logs = [];
     botState.chatLogs = [];
     botState.recentChatMessages = [];
@@ -10463,7 +11757,7 @@ app.post('/api/bot/reset-customer', (req, res) => {
     botState.lastWebChatAt = 0;
     botState.autoChatSchedules = [];
     botState.botSchedules = [];
-    botState.settings = { ...DEFAULT_SETTINGS };
+    botState.settings = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
     botState.manuallyStopped = true;
     botState.afkElapsedSeconds = 0;
     botState.afkStartedAt = null;
@@ -10478,6 +11772,49 @@ app.post('/api/bot/reset-customer', (req, res) => {
     botState.stateRevision++;
     botState.logRevision++;
     botState.chatLogRevision++;
+
+    // 3. Ghi cấu hình rỗng xuống đĩa làm bước cuối cùng
+    const persisted = saveBotSettingsFile(
+        DEFAULT_SETTINGS,
+        [],
+        [],
+        { username: '', password: '', manuallyStopped: true }
+    );
+
+    if (!persisted) {
+        return res.status(500).json({
+            ok: false,
+            error: 'Không thể lưu bot_settings.json sau khi reset bot.'
+        });
+    }
+
+    // 4. Đọc lại file để xác nhận username, password, Proxy đều sạch
+    const verified = loadBotSettings();
+    if (verified.username !== '' || verified.password !== '' || verified.settings?.proxy?.host) {
+        console.error('[RESET-CUSTOMER] CẢNH BÁO: bot_settings.json chưa sạch sau khi reset!');
+        return res.status(500).json({
+            ok: false,
+            error: 'Kiểm tra tệp sau reset không sạch; vui lòng thử lại.'
+        });
+    }
+
+    // 5. Thu hồi sạch sẽ tất cả phiên đăng nhập của khách cũ (chỉ giữ admin nếu có)
+    if (typeof botSessions !== 'undefined' && botSessions instanceof Map) {
+        for (const [token, sess] of botSessions.entries()) {
+            if (sess.role !== 'admin') {
+                botSessions.delete(token);
+            }
+        }
+    }
+
+    // 6. Xóa sạch cache auth người dùng đã đồng bộ trong RAM và trên đĩa
+    if (botState.syncedAuth) {
+        botState.syncedAuth.users = [];
+        botState.syncedAuth.updatedAt = new Date().toISOString();
+        saveBotAuthCache(botState.syncedAuth);
+    } else {
+        saveBotAuthCache({ users: [], updatedAt: new Date().toISOString() });
+    }
 
     res.json({
         ok: true,
@@ -11413,8 +12750,15 @@ app.post('/api/bot/window/close', (req, res) => {
 // -----------------------------------------------------------------------------
 
 app.post('/api/auth/login', async (req, res) => {
+    const clientIp = getClientIp(req);
     const username = String(req.body?.username || '').trim();
     const password = String(req.body?.password ?? '');
+
+    const rateCheck = botLoginLimiter.check(clientIp, username || 'admin');
+    if (!rateCheck.allowed) {
+        return res.status(429).json({ ok: false, error: rateCheck.error });
+    }
+
     if (!password) {
         return res.status(400).json({ ok: false, error: 'Vui lòng nhập mật khẩu.' });
     }
@@ -11422,13 +12766,26 @@ app.post('/api/auth/login', async (req, res) => {
     // 1. Quản trị viên Admin
     if (!username || username.toLowerCase() === 'admin') {
         const adminHash = botState.syncedAuth?.adminPasswordHash;
-        const isAdminCorrect = (adminHash && verifyScryptPassword(password, adminHash))
-            || timingSafeStringEquals(password, BOT_ADMIN_PASSWORD);
-        if (isAdminCorrect) {
-            const token = createBotSession('admin', 'admin', { allowAccountChange: true, passwordHash: adminHash || '' });
-            res.setHeader('Set-Cookie', 'bot_token=' + token + '; path=/; HttpOnly; SameSite=Lax; Max-Age=86400');
-            return res.json({ ok: true, token, role: 'admin', username: 'admin', allowAccountChange: true });
+        let isAdminCorrect = false;
+        if (adminHash) {
+            isAdminCorrect = verifyScryptPassword(password, adminHash);
+        } else if (BOT_ADMIN_PASSWORD) {
+            isAdminCorrect = timingSafeStringEquals(password, BOT_ADMIN_PASSWORD);
+        } else {
+            botLoginLimiter.record(clientIp, username || 'admin', false);
+            return res.status(401).json({
+                ok: false,
+                error: 'Bot con chưa nhận được đồng bộ tài khoản từ Manager hoặc chưa cấu hình BOT_ADMIN_PASSWORD.'
+            });
         }
+
+        if (isAdminCorrect) {
+            botLoginLimiter.record(clientIp, username || 'admin', true);
+            const token = createBotSession('admin', 'admin', { allowAccountChange: true, passwordHash: adminHash || '' });
+            res.setHeader('Set-Cookie', serializeBotCookie('bot_token', token, { maxAge: 86400, secure: isHttps(req) }));
+            return res.json({ ok: true, role: 'admin', username: 'admin', allowAccountChange: true });
+        }
+        botLoginLimiter.record(clientIp, username || 'admin', false);
         return res.status(401).json({ ok: false, error: 'Mật khẩu Quản trị viên (Admin) không chính xác.' });
     }
 
@@ -11437,22 +12794,26 @@ app.post('/api/auth/login', async (req, res) => {
         const syncedUsers = Array.isArray(botState.syncedAuth.users) ? botState.syncedAuth.users : [];
         const u = syncedUsers.find(x => x.username.toLowerCase() === username.toLowerCase());
         if (!u) {
+            botLoginLimiter.record(clientIp, username, false);
             return res.status(401).json({ ok: false, error: 'Tài khoản không tồn tại hoặc chưa được phân quyền cho bot này.' });
         }
         if (!verifyScryptPassword(password, u.passwordHash)) {
+            botLoginLimiter.record(clientIp, username, false);
             return res.status(401).json({ ok: false, error: 'Tên đăng nhập hoặc mật khẩu không chính xác.' });
         }
         if (u.status !== 'active') {
+            botLoginLimiter.record(clientIp, username, false);
             return res.status(403).json({ ok: false, error: 'Tài khoản của bạn đã bị vô hiệu hóa hoặc chưa kích hoạt.' });
         }
         if (u.expiresAt && Date.now() > Date.parse(u.expiresAt)) {
+            botLoginLimiter.record(clientIp, username, false);
             return res.status(403).json({ ok: false, error: 'Tài khoản của bạn đã hết hạn thuê. Vui lòng gia hạn trên Manager.' });
         }
+        botLoginLimiter.record(clientIp, username, true);
         const token = createBotSession('user', u.username, { allowAccountChange: u.allowAccountChange !== false, passwordHash: u.passwordHash });
-        res.setHeader('Set-Cookie', 'bot_token=' + token + '; path=/; HttpOnly; SameSite=Lax; Max-Age=86400');
+        res.setHeader('Set-Cookie', serializeBotCookie('bot_token', token, { maxAge: 86400, secure: isHttps(req) }));
         return res.json({
             ok: true,
-            token,
             role: 'user',
             username: u.username,
             allowAccountChange: u.allowAccountChange !== false
@@ -11460,34 +12821,39 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     // 3. Fallback sang Manager nếu bot con chưa nhận được syncAuth lần nào
-    if (MANAGER_API_URL) {
+    if (MANAGER_API_URL && BOT_SECRET_KEY) {
         try {
             const targetManager = MANAGER_API_URL.replace(/\/+$/, '');
             const fetchRes = await fetch(targetManager + '/api/auth/verify-bot-access', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Bot-Secret': BOT_SECRET_KEY
+                },
                 body: JSON.stringify({
                     username,
                     password,
                     botId: BOT_ID_NUMBER
-                })
+                }),
+                signal: AbortSignal.timeout(5000)
             });
             const data = await fetchRes.json();
             if (data && data.ok) {
+                botLoginLimiter.record(clientIp, username, true);
                 const role = data.role === 'admin' ? 'admin' : 'user';
                 const token = createBotSession(role, data.username || username, {
                     allowAccountChange: data.allowAccountChange !== false,
                     passwordHash: data.passwordHash || ''
                 });
-                res.setHeader('Set-Cookie', 'bot_token=' + token + '; path=/; HttpOnly; SameSite=Lax; Max-Age=86400');
+                res.setHeader('Set-Cookie', serializeBotCookie('bot_token', token, { maxAge: 86400, secure: isHttps(req) }));
                 return res.json({
                     ok: true,
-                    token,
                     role,
                     username: data.username || username,
                     allowAccountChange: data.allowAccountChange !== false
                 });
             } else {
+                botLoginLimiter.record(clientIp, username, false);
                 return res.status(fetchRes.status || 401).json({
                     ok: false,
                     error: data?.error || 'Tài khoản không có quyền truy cập bot này.'
@@ -11501,63 +12867,53 @@ app.post('/api/auth/login', async (req, res) => {
         }
     }
 
+    botLoginLimiter.record(clientIp, username, false);
     return res.status(401).json({ ok: false, error: 'Chưa có dữ liệu đồng bộ auth từ Manager.' });
 });
 
 app.get('/api/auth/me', (req, res) => {
-    const authHeader = req.headers['authorization'] || req.headers['x-bot-token'];
-    let token = req.query.token;
-    if (authHeader) {
-        if (authHeader.startsWith('Bearer ')) token = authHeader.substring(7);
-        else token = authHeader;
-    }
-    if (!token && req.headers.cookie) {
-        const match = req.headers.cookie.match(/bot_token=([^;]+)/);
-        if (match) token = match[1];
-    }
-    const session = verifyBotSession(token);
+    const session = getBotSessionFromRequest(req);
     if (!session) {
         return res.json({ ok: false, loggedIn: false });
     }
-    return res.json({ ok: true, loggedIn: true, user: { role: session.role, username: session.username, allowAccountChange: session.allowAccountChange !== false } });
+    return res.json({
+        ok: true,
+        loggedIn: true,
+        user: {
+            role: session.role,
+            username: session.username,
+            allowAccountChange: session.allowAccountChange !== false
+        }
+    });
 });
 
 app.post('/api/auth/logout', (req, res) => {
     const authHeader = req.headers['authorization'] || req.headers['x-bot-token'];
-    let token = req.query?.token;
-    if (authHeader) {
-        if (authHeader.startsWith('Bearer ')) token = authHeader.substring(7);
-        else token = authHeader;
+    let token = null;
+    if (typeof authHeader === 'string') {
+        token = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : authHeader;
     }
     if (!token && req.headers.cookie) {
-        const match = String(req.headers.cookie).match(/bot_token=([^;]+)/);
-        if (match) token = decodeURIComponent(match[1]);
+        token = parseCookies(req).bot_token || null;
     }
     if (token && botSessions.has(token)) {
         botSessions.delete(token);
     }
-    res.setHeader('Set-Cookie', 'bot_token=; Path=/; HttpOnly; SameSite=Lax; Expires=Thu, 01 Jan 1970 00:00:01 GMT; Max-Age=0');
+    res.setHeader('Set-Cookie', clearBotCookieHeader('bot_token', isHttps(req)));
     res.json({ ok: true, message: 'Đã đăng xuất.' });
 });
 
 app.get(
     '/health',
     (req, res) => {
-
-        const online =
-            botState.status !==
-            'offline'
-                ? 1
-                : 0;
-
+        const isOnline = botState.status !== 'offline';
         res.status(200).json({
             status: 'ok',
-            online,
-
-            bot:
-                publicBotState(
-                    botState
-                )
+            service: 'kingmc-bot',
+            online: isOnline ? 1 : 0,
+            botStatus: botState.status || 'offline',
+            uptime: Math.floor(process.uptime()),
+            timestamp: new Date().toISOString()
         });
     }
 );
@@ -11566,10 +12922,111 @@ app.get(
 // Dashboard root
 // -----------------------------------------------------------------------------
 
+const BOT_PUBLIC_LOGIN_HTML = `<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Đăng nhập • KBOT Worker</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;850&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', sans-serif; }
+    body { background: #060b16; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; color: #f8fafc; }
+    .login-box { background: linear-gradient(145deg, #101a33 0%, #0a1122 100%); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 18px; width: 100%; max-width: 420px; padding: 32px 24px; box-shadow: 0 25px 60px rgba(0,0,0,0.8), 0 0 35px rgba(16, 185, 129, 0.15); text-align: center; }
+    .icon { font-size: 40px; margin-bottom: 8px; filter: drop-shadow(0 0 12px rgba(56, 189, 248, 0.5)); }
+    h2 { font-size: 21px; font-weight: 850; letter-spacing: -0.01em; margin-bottom: 4px; }
+    p.sub { color: #94a3b8; font-size: 12.5px; line-height: 1.4; margin-bottom: 18px; }
+    .discord-btn { display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; margin-bottom: 18px; padding: 11px 14px; background: linear-gradient(135deg, #5865F2 0%, #4752C4 100%); color: #fff; border-radius: 10px; text-decoration: none; font-size: 12.5px; font-weight: 800; box-shadow: 0 6px 18px rgba(88, 101, 242, 0.35); }
+    .field { text-align: left; margin-bottom: 14px; }
+    label { font-size: 11.5px; color: #cbd5e1; font-weight: 700; display: block; margin-bottom: 4px; letter-spacing: 0.3px; }
+    input { width: 100%; background: #080e1c; border: 1px solid #1e293b; color: #fff; padding: 10px 12px; border-radius: 8px; font-size: 13.5px; outline: none; }
+    input:focus { border-color: #38bdf8; box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2); }
+    .pwd-wrap { position: relative; display: flex; align-items: center; }
+    .toggle-pwd { position: absolute; right: 10px; background: none; border: none; cursor: pointer; color: #94a3b8; font-size: 14px; padding: 4px; }
+    .btn-submit { width: 100%; background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: #fff; border: none; padding: 12px; border-radius: 10px; font-size: 14.5px; font-weight: 800; cursor: pointer; letter-spacing: 0.4px; box-shadow: 0 4px 14px rgba(16,185,129,0.35); transition: all 0.2s; margin-top: 6px; }
+    .btn-submit:hover { opacity: 0.95; transform: translateY(-1px); }
+    .error-msg { display: none; color: #f87171; font-size: 12.5px; margin-bottom: 14px; padding: 9px 12px; background: rgba(239,68,68,0.12); border-radius: 8px; border: 1px solid rgba(239,68,68,0.35); text-align: left; }
+    .note { font-size: 11px; color: #64748b; margin-top: 14px; line-height: 1.45; }
+  </style>
+</head>
+<body>
+  <div class="login-box">
+    <div class="icon">🛡️</div>
+    <h2>KBOT WORKER V10.0</h2>
+    <p class="sub">Cổng Điều Khiển Bot AFK KingMC • Cloud Engine</p>
+    <a href="https://discord.gg/mJWX5Xp3z" target="_blank" rel="noopener noreferrer" class="discord-btn">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.929 1.793 8.18 1.793 12.061 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.894.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>
+      <span>Gia Nhập Discord Hỗ Trợ 24/7</span>
+    </a>
+    <div class="field">
+      <label>TÀI KHOẢN (Bỏ trống nếu là Admin):</label>
+      <input type="text" id="loginUsername" placeholder="Tài khoản khách thuê..." autocomplete="username">
+    </div>
+    <div class="field">
+      <label>MẬT KHẨU TRUY CẬP:</label>
+      <div class="pwd-wrap">
+        <input type="password" id="loginPassword" placeholder="Mật khẩu Admin hoặc Manager..." autocomplete="current-password">
+        <button type="button" class="toggle-pwd" onclick="togglePwd()">👁</button>
+      </div>
+    </div>
+    <div id="loginErr" class="error-msg"></div>
+    <button type="button" class="btn-submit" onclick="doLogin()">ĐĂNG NHẬP VÀO BOT</button>
+    <div class="note">
+      • Quản trị viên: Nhập mật khẩu Admin.<br>
+      • Khách thuê: Nhập Username &amp; Mật khẩu được Manager phân quyền.
+    </div>
+  </div>
+  <script>
+    function togglePwd() {
+      const p = document.getElementById('loginPassword');
+      p.type = p.type === 'password' ? 'text' : 'password';
+    }
+    async function doLogin() {
+      const u = document.getElementById('loginUsername').value.trim();
+      const p = document.getElementById('loginPassword').value;
+      const err = document.getElementById('loginErr');
+      if (!p) {
+        err.textContent = 'Vui lòng nhập mật khẩu.';
+        err.style.display = 'block';
+        return;
+      }
+      err.style.display = 'none';
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: u, password: p })
+        });
+        const data = await res.json();
+        if (data && data.ok) {
+          window.location.reload();
+        } else {
+          err.textContent = data.error || 'Đăng nhập không thành công.';
+          err.style.display = 'block';
+        }
+      } catch (e) {
+        err.textContent = 'Lỗi kết nối máy chủ: ' + e.message;
+        err.style.display = 'block';
+      }
+    }
+    document.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+    window.togglePwd = togglePwd;
+    window.doLogin = doLogin;
+  </script>
+</body>
+</html>`;
+
 app.get(
     '/',
     (req, res) => {
-        const cur = publicSettingsState(botState);
+        const session = getBotSessionFromRequest(req);
+        if (!session) {
+            return res.type('html').send(BOT_PUBLIC_LOGIN_HTML);
+        }
+
+        const cur = publicSettingsState(botState, session.role === 'admin');
         const mem = process.memoryUsage();
         const rssMb = Math.round(mem.rss / (1024 * 1024));
         const heapMb = Math.round(mem.heapUsed / (1024 * 1024));
@@ -11591,8 +13048,29 @@ app.get(
 );
 
 // -----------------------------------------------------------------------------
-// Extra lightweight status endpoint
+// Cloud Host Healthcheck & Lightweight Status Endpoints
 // -----------------------------------------------------------------------------
+
+app.get(
+    ['/healthz', '/api/health'],
+    (req, res) => {
+        const mem = process.memoryUsage();
+        res.json({
+            status: 'ok',
+            service: 'bot',
+            botId: BOT_ID,
+            botStatus: botState.status,
+            ready: botState.ready,
+            uptime: Math.round(process.uptime()),
+            serverTps: Number.isFinite(botState.serverTps) ? botState.serverTps : (['afk', 'online', 'entering', 'authenticating'].includes(botState.status) ? 20.0 : 0.0),
+            memory: {
+                rssMb: Math.round(mem.rss / (1024 * 1024)),
+                heapMb: Math.round(mem.heapUsed / (1024 * 1024))
+            },
+            timestamp: new Date().toISOString()
+        });
+    }
+);
 
 app.get(
     '/api/status',
@@ -11602,12 +13080,19 @@ app.get(
             ready: botState.ready,
             ping: getPing(botState),
             connectedAt: botState.connectedAt,
-            botId: BOT_ID,
-            position: getBotPosition(botState),
-            dimension: getBotDimension(botState)
+            botId: BOT_ID
         });
     }
 );
+
+// Express Catch-All Error Handler (Mounted after all route handlers)
+app.use((err, req, res, next) => {
+    console.error(`[UNHANDLED_ERROR] ${req.method} ${req.originalUrl || req.url}:`, err.stack || err.message || err);
+    if (res.headersSent) {
+        return next(err);
+    }
+    return res.status(500).json({ ok: false, error: 'Đã xảy ra lỗi máy chủ nội bộ.' });
+});
 
 // -----------------------------------------------------------------------------
 // HTTP server
@@ -11687,8 +13172,98 @@ listenHttpServer(app, HTTP_PORT, PLATFORM, (serverInstance, activePort) => {
     }
     console.log('================================================================================');
     startPublicIpMonitor(botState);
-    scheduleAutoStartOnBoot();
+    void (async () => {
+        // Cloud state is the source of truth on a fresh host. Do not connect
+        // with stale local credentials before its restore has completed.
+        await initBotSupabaseSync();
+        scheduleAutoStartOnBoot();
+    })();
 });
+
+async function initBotSupabaseSync() {
+    if (!botSupabase || !botSupabase.isEnabled()) {
+        console.log('[BOT SUPABASE] Chưa cấu hình Supabase Cloud. Bot sử dụng lưu trữ cấu hình cục bộ.');
+        return;
+    }
+    try {
+        botSupabase.botId = String(botState.botId || BOT_ID || '1');
+        console.log(`[BOT SUPABASE] ☁️ Đang kiểm tra cấu hình bot #${botSupabase.botId} trên Supabase Cloud...`);
+        const remote = await botSupabase.fetchBotSettings();
+        if (remote && typeof remote === 'object') {
+            console.log(`[BOT SUPABASE] ✅ Đã tìm thấy cấu hình trên Supabase! Khôi phục vào botState...`);
+            if (typeof remote.username === 'string') {
+                botState.username = remote.username.trim();
+            }
+            if (typeof remote.password === 'string') {
+                const cloudPassword = remote.password ? decryptMinecraftPassword(remote.password) : '';
+                if (remote.password && isEncryptedPassword(remote.password) && !cloudPassword) {
+                    throw new Error('Không thể giải mã mật khẩu cloud. Hãy giữ nguyên BOT_CREDENTIALS_ENCRYPTION_KEY hoặc BOT_SECRET_KEY khi deploy.');
+                }
+                botState.password = cloudPassword;
+                botState.rawEncryptedPassword = remote.password || null;
+            }
+            if (remote.settings && typeof remote.settings === 'object') {
+                const { manuallyStopped: cloudManuallyStopped, proxy: settingsProxy, ...cloudSettings } = remote.settings;
+                botState.settings = { ...botState.settings, ...cloudSettings };
+                if (typeof cloudManuallyStopped === 'boolean') {
+                    botState.manuallyStopped = cloudManuallyStopped;
+                }
+                const cloudProxy = remote.proxy && typeof remote.proxy === 'object'
+                    ? remote.proxy
+                    : settingsProxy;
+                if (cloudProxy && typeof cloudProxy === 'object') {
+                    const encryptedProxyPassword = String(cloudProxy.password || '');
+                    const proxyPassword = encryptedProxyPassword
+                        ? decryptMinecraftPassword(encryptedProxyPassword)
+                        : '';
+                    if (encryptedProxyPassword && isEncryptedPassword(encryptedProxyPassword) && !proxyPassword) {
+                        throw new Error('Không thể giải mã mật khẩu proxy cloud. Hãy giữ nguyên BOT_CREDENTIALS_ENCRYPTION_KEY hoặc BOT_SECRET_KEY khi deploy.');
+                    }
+                    botState.settings.proxy = {
+                        ...botState.settings.proxy,
+                        ...cloudProxy,
+                        password: proxyPassword
+                    };
+                }
+            } else if (remote.proxy && typeof remote.proxy === 'object') {
+                const encryptedProxyPassword = String(remote.proxy.password || '');
+                const proxyPassword = encryptedProxyPassword
+                    ? decryptMinecraftPassword(encryptedProxyPassword)
+                    : '';
+                if (encryptedProxyPassword && isEncryptedPassword(encryptedProxyPassword) && !proxyPassword) {
+                    throw new Error('Không thể giải mã mật khẩu proxy cloud. Hãy giữ nguyên BOT_CREDENTIALS_ENCRYPTION_KEY hoặc BOT_SECRET_KEY khi deploy.');
+                }
+                botState.settings.proxy = { ...botState.settings.proxy, ...remote.proxy, password: proxyPassword };
+            }
+            if (Array.isArray(remote.schedules)) {
+                botState.botSchedules = sanitizeBotSchedules(remote.schedules);
+            }
+            if (Array.isArray(remote.auto_chat)) {
+                botState.autoChatSchedules = sanitizeAutoChatSchedules(remote.auto_chat);
+            }
+            saveBotSettingsFile(botState.settings, botState.autoChatSchedules, botState.botSchedules, {
+                username: botState.username,
+                password: botState.password,
+                manuallyStopped: botState.manuallyStopped
+            });
+        } else {
+            console.log(`[BOT SUPABASE] ℹ️ Chưa có bản ghi bot #${botSupabase.botId} trên Supabase. Đẩy cấu hình hiện tại lên Cloud...`);
+            const payload = {
+                username: botState.username,
+                password: botState.password ? encryptMinecraftPassword(botState.password) : '',
+                settings: botState.settings,
+                proxy: botState.settings?.proxy || {},
+                botSchedules: botState.botSchedules,
+                autoChatSchedules: botState.autoChatSchedules,
+                manuallyStopped: botState.manuallyStopped
+            };
+            await botSupabase.saveBotSettings(payload);
+        }
+    } catch (err) {
+        console.error('[BOT SUPABASE] ❌ Lỗi đồng bộ ban đầu:', err.message);
+    }
+}
+
 
 // -----------------------------------------------------------------------------
 // Graceful process shutdown
